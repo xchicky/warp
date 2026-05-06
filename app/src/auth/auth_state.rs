@@ -201,6 +201,7 @@ impl AuthState {
             linked_at: persisted.linked_at,
             personal_object_limits: persisted.personal_object_limits,
             principal_type: PrincipalType::default(),
+            global_skills: Vec::new(),
         };
         *self.user.write() = Some(user);
 
@@ -527,6 +528,15 @@ impl AuthState {
     /// Returns whether the authenticated principal is a service account.
     pub fn is_service_account(&self) -> bool {
         matches!(self.principal_type(), Some(PrincipalType::ServiceAccount))
+    }
+
+    /// Returns the cached global skill specs for the current user.
+    pub fn global_skills(&self) -> Vec<String> {
+        self.user
+            .read()
+            .as_ref()
+            .map(|user| user.global_skills.clone())
+            .unwrap_or_default()
     }
 
     /// Returns the owner type of the currently-authenticated API key.
