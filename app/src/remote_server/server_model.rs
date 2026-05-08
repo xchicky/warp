@@ -1715,7 +1715,7 @@ impl ServerModel {
                     self.diff_states
                         .read_state_and_metadata(key, DiffState::Loading, ctx);
 
-                let snapshot = diff_state_proto::build_diff_state_snapshot(
+                let snapshot = diff_state_proto::build_diff_state_snapshot_with_content(
                     &repo_path_str,
                     &key.mode,
                     metadata.as_ref(),
@@ -1842,7 +1842,7 @@ impl ServerModel {
                     me.diff_states
                         .read_state_and_metadata(&diff_model_key, DiffState::Loaded, ctx);
 
-                let snapshot = diff_state_proto::build_diff_state_snapshot(
+                let snapshot = diff_state_proto::build_diff_state_snapshot_with_content(
                     &diff_model_key.repo_path.to_string(),
                     &diff_model_key.mode,
                     metadata.as_ref(),
