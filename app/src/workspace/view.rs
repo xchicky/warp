@@ -54,6 +54,7 @@ use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::handoff::touched_repos::{
     derive_touched_workspace, extract_paths_from_conversation, pick_handoff_overlap_env,
+    resolve_pwd_repo, TouchedWorkspace,
 };
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::handoff::PendingCloudLaunch;
@@ -13413,6 +13414,8 @@ impl Workspace {
         let server_api_provider = ServerApiProvider::as_ref(ctx);
         let ai_client = server_api_provider.get_ai_client();
         let http = server_api_provider.get_http_client();
+        // Capture the source terminal's pwd for pwd-based environment overlap.
+        let source_pwd = source_view.as_ref(ctx).active_session_path_if_local(ctx);
         // Derive touched repos and upload the initial snapshot off the UI thread.
         ctx.spawn(
             async move {
@@ -13427,20 +13430,30 @@ impl Workspace {
                     http.as_ref(),
                 )
                 .await;
-                (workspace, upload_result)
+                let pwd_repo = match source_pwd {
+                    Some(pwd) => resolve_pwd_repo(pwd).await,
+                    None => None,
+                };
+                (workspace, upload_result, pwd_repo)
             },
-            move |_workspace, (derived_workspace, upload_result), ctx| {
+            move |_workspace, (derived_workspace, upload_result, pwd_repo), ctx| {
                 async_model_handle.update(ctx, |model, model_ctx| {
                     if !model.is_local_to_cloud_handoff() {
                         return;
                     }
                     if !model.pending_handoff_has_explicit_environment() {
-                        let mut envs = CloudAmbientAgentEnvironment::get_all(model_ctx);
-                        sort_environments_by_recency(&mut envs);
-                        if let Some(overlap_env) =
-                            pick_handoff_overlap_env(&derived_workspace, envs)
-                        {
-                            model.set_environment_id(Some(overlap_env), model_ctx);
+                        if let Some(repo) = pwd_repo {
+                            let pwd_workspace = TouchedWorkspace {
+                                repos: vec![repo],
+                                orphan_files: vec![],
+                            };
+                            let mut envs = CloudAmbientAgentEnvironment::get_all(model_ctx);
+                            sort_environments_by_recency(&mut envs);
+                            if let Some(overlap_env) =
+                                pick_handoff_overlap_env(&pwd_workspace, envs)
+                            {
+                                model.set_environment_id(Some(overlap_env), model_ctx);
+                            }
                         }
                     }
                     model.set_pending_handoff_workspace(derived_workspace, model_ctx);
