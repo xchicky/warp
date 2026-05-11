@@ -6,12 +6,12 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use warp_core::SessionId;
 use warp_core::channel::ChannelState;
 use warp_core::safe_error;
-use warp_core::SessionId;
 use warp_util::standardized_path::StandardizedPath;
-use warpui::platform::TerminationMode;
 use warpui::r#async::{Spawnable, SpawnableOutput, SpawnedFutureHandle};
+use warpui::platform::TerminationMode;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use crate::code::global_buffer_model::{GlobalBufferModel, GlobalBufferModelEvent};
@@ -21,17 +21,18 @@ use warp_util::content_version::ContentVersion;
 use warp_util::file::FileId;
 
 use super::proto::{
-    client_message, delete_file_response, resolve_conflict_response, run_command_response,
-    save_buffer_response, server_message, write_file_response, Abort, Authenticate, BufferEdit,
-    BufferUpdatedPush, ClientMessage, CloseBuffer, CodebaseIndexStatus, CodebaseIndexStatusState,
-    CodebaseIndexStatusUpdated, CodebaseIndexStatusesSnapshot, DeleteFile, DeleteFileResponse,
-    DeleteFileSuccess, DropCodebaseIndex, ErrorCode, ErrorResponse, FailedFileRead,
-    FileContextProto, FileOperationError, IndexCodebase, Initialize, InitializeResponse,
-    NavigatedToDirectory, NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse,
-    ReadFileContextResponse, ResolveConflict, ResolveConflictResponse, ResolveConflictSuccess,
-    RunCommandError, RunCommandErrorCode, RunCommandRequest, RunCommandResponse, RunCommandSuccess,
-    SaveBuffer, SaveBufferResponse, SaveBufferSuccess, ServerMessage, SessionBootstrapped,
-    TextEdit, WriteFile, WriteFileResponse, WriteFileSuccess,
+    Abort, Authenticate, BufferEdit, BufferUpdatedPush, ClientMessage, CloseBuffer,
+    CodebaseIndexStatus, CodebaseIndexStatusState, CodebaseIndexStatusUpdated,
+    CodebaseIndexStatusesSnapshot, DeleteFile, DeleteFileResponse, DeleteFileSuccess,
+    DropCodebaseIndex, ErrorCode, ErrorResponse, FailedFileRead, FileContextProto,
+    FileOperationError, IndexCodebase, Initialize, InitializeResponse, NavigatedToDirectory,
+    NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse, ReadFileContextResponse,
+    ResolveConflict, ResolveConflictResponse, ResolveConflictSuccess, RunCommandError,
+    RunCommandErrorCode, RunCommandRequest, RunCommandResponse, RunCommandSuccess, SaveBuffer,
+    SaveBufferResponse, SaveBufferSuccess, ServerMessage, SessionBootstrapped, TextEdit, WriteFile,
+    WriteFileResponse, WriteFileSuccess, client_message, delete_file_response,
+    resolve_conflict_response, run_command_response, save_buffer_response, server_message,
+    write_file_response,
 };
 use super::server_buffer_tracker::{PendingBufferRequestKind, ServerBufferTracker};
 
@@ -42,8 +43,9 @@ pub const GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10 
 pub type ConnectionId = uuid::Uuid;
 use super::protocol::RequestId;
 use crate::ai::agent::FileLocations;
-use crate::ai::blocklist::{read_local_file_context, ReadFileContextResult};
+use crate::ai::blocklist::{ReadFileContextResult, read_local_file_context};
 use crate::auth::auth_state::{AuthState, AuthStateProvider};
+use crate::features::FeatureFlag;
 use crate::terminal::model::session::command_executor::{
     ExecuteCommandOptions, LocalCommandExecutor,
 };
@@ -667,7 +669,19 @@ impl ServerModel {
     }
 
     fn push_codebase_index_statuses_snapshot(&self, conn_id: ConnectionId) {
+        if !FeatureFlag::RemoteCodebaseIndexing.is_enabled() {
+            log::info!(
+                "[Remote codebase indexing] Daemon skipping bootstrap codebase index statuses snapshot because remote indexing is disabled: conn_id={conn_id}"
+            );
+            return;
+        }
         let snapshot = self.codebase_index_statuses_snapshot();
+        if snapshot.statuses.is_empty() {
+            log::info!(
+                "[Remote codebase indexing] Daemon skipping empty bootstrap codebase index statuses snapshot: conn_id={conn_id}"
+            );
+            return;
+        }
         let status_count = snapshot.statuses.len();
         log::info!(
             "[Remote codebase indexing] Daemon pushing bootstrap codebase index statuses snapshot: conn_id={conn_id} bootstrap_status_count={status_count}"
@@ -697,6 +711,16 @@ impl ServerModel {
             auth_token,
         } = msg;
         let repo_path_for_log = repo_path.clone();
+        if !FeatureFlag::RemoteCodebaseIndexing.is_enabled() {
+            log::info!(
+                "[Remote codebase indexing] Daemon rejecting IndexCodebase because remote indexing is disabled: request_id={request_id} conn_id={conn_id} repo_path={repo_path_for_log}"
+            );
+            return HandlerOutcome::Sync(server_message::Message::CodebaseIndexStatusUpdated(
+                CodebaseIndexStatusUpdated {
+                    status: Some(not_enabled_codebase_index_status(repo_path)),
+                },
+            ));
+        }
         if auth_token.is_empty() {
             return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
                 code: ErrorCode::InvalidRequest.into(),
@@ -748,6 +772,17 @@ impl ServerModel {
             repo_path,
             auth_token,
         } = msg;
+        let repo_path_for_log = repo_path.clone();
+        if !FeatureFlag::RemoteCodebaseIndexing.is_enabled() {
+            log::info!(
+                "[Remote codebase indexing] Daemon rejecting DropCodebaseIndex because remote indexing is disabled: request_id={request_id} conn_id={conn_id} repo_path={repo_path_for_log}"
+            );
+            return HandlerOutcome::Sync(server_message::Message::CodebaseIndexStatusUpdated(
+                CodebaseIndexStatusUpdated {
+                    status: Some(not_enabled_codebase_index_status(repo_path)),
+                },
+            ));
+        }
         if auth_token.is_empty() {
             return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
                 code: ErrorCode::InvalidRequest.into(),
@@ -1666,6 +1701,9 @@ fn current_epoch_millis() -> u64 {
 
 fn queued_codebase_index_status(repo_path: String) -> CodebaseIndexStatus {
     base_codebase_index_status(repo_path, CodebaseIndexStatusState::Queued)
+}
+fn not_enabled_codebase_index_status(repo_path: String) -> CodebaseIndexStatus {
+    base_codebase_index_status(repo_path, CodebaseIndexStatusState::NotEnabled)
 }
 
 fn disabled_codebase_index_status(repo_path: String) -> CodebaseIndexStatus {
