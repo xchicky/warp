@@ -30,12 +30,13 @@ use super::proto::{
     BufferUpdatedPush, ClientMessage, CloseBuffer, CodebaseIndexStatus, CodebaseIndexStatusState,
     CodebaseIndexStatusUpdated, CodebaseIndexStatusesSnapshot, DeleteFile, DeleteFileResponse,
     DeleteFileSuccess, DropCodebaseIndex, ErrorCode, ErrorResponse, FailedFileRead,
-    FileContextProto, FileOperationError, IndexCodebase, Initialize, InitializeResponse,
-    NavigatedToDirectory, NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse,
-    ReadFileContextResponse, ResolveConflict, ResolveConflictResponse, ResolveConflictSuccess,
-    RunCommandError, RunCommandErrorCode, RunCommandRequest, RunCommandResponse, RunCommandSuccess,
-    SaveBuffer, SaveBufferResponse, SaveBufferSuccess, ServerMessage, SessionBootstrapped,
-    TextEdit, WriteFile, WriteFileResponse, WriteFileSuccess,
+    FileContextProto, FileOperationError, GetFragmentMetadataFromHash,
+    GetFragmentMetadataFromHashResponse, IndexCodebase, Initialize, InitializeResponse,
+    MissingFragmentMetadata, NavigatedToDirectory, NavigatedToDirectoryResponse, OpenBuffer,
+    OpenBufferResponse, ReadFileContextResponse, ResolveConflict, ResolveConflictResponse,
+    ResolveConflictSuccess, RunCommandError, RunCommandErrorCode, RunCommandRequest,
+    RunCommandResponse, RunCommandSuccess, SaveBuffer, SaveBufferResponse, SaveBufferSuccess,
+    ServerMessage, SessionBootstrapped, TextEdit, WriteFile, WriteFileResponse, WriteFileSuccess,
 };
 use super::server_buffer_tracker::{PendingBufferRequestKind, ServerBufferTracker};
 
@@ -642,6 +643,9 @@ impl ServerModel {
             Some(client_message::Message::DropCodebaseIndex(msg)) => {
                 self.handle_drop_codebase_index(msg, &request_id, conn_id, ctx)
             }
+            Some(client_message::Message::GetFragmentMetadataFromHash(msg)) => {
+                self.handle_get_fragment_metadata_from_hash(msg, &request_id, conn_id)
+            }
             None => {
                 log::warn!(
                     "Received ClientMessage with no message variant (request_id={request_id})"
@@ -888,6 +892,39 @@ impl ServerModel {
                 )),
             },
         ))
+    }
+
+    fn handle_get_fragment_metadata_from_hash(
+        &self,
+        msg: GetFragmentMetadataFromHash,
+        request_id: &RequestId,
+        conn_id: ConnectionId,
+    ) -> HandlerOutcome {
+        log::info!(
+            "[Remote codebase indexing] Daemon handling GetFragmentMetadataFromHash placeholder: \
+             request_id={request_id} conn_id={conn_id} repo_path={} root_hash={} hash_count={}",
+            msg.repo_path,
+            msg.root_hash,
+            msg.content_hashes.len()
+        );
+        HandlerOutcome::Sync(
+            server_message::Message::GetFragmentMetadataFromHashResponse(
+                GetFragmentMetadataFromHashResponse {
+                    fragments: Vec::new(),
+                    missing_hashes: msg
+                        .content_hashes
+                        .into_iter()
+                        .map(|content_hash| MissingFragmentMetadata {
+                            content_hash,
+                            error: Some(FileOperationError {
+                                message: "Remote fragment metadata lookup is not available yet"
+                                    .to_string(),
+                            }),
+                        })
+                        .collect(),
+                },
+            ),
+        )
     }
 
     /// Routes a server message to its destination.
@@ -1792,6 +1829,7 @@ fn base_codebase_index_status(
         progress_completed: None,
         progress_total: None,
         failure_message: None,
+        root_hash: None,
     }
 }
 
@@ -1809,6 +1847,7 @@ fn codebase_index_status_to_proto(
         progress_completed,
         progress_total,
         failure_message: failure_message_from_codebase_index_status(status),
+        root_hash: status.root_hash().map(ToString::to_string),
     }
 }
 

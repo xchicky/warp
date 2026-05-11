@@ -15,7 +15,8 @@ use warpui::r#async::{executor, FutureExt as _};
 
 use crate::proto::{
     client_message, server_message, Abort, Authenticate, BufferEdit, ClientMessage, CloseBuffer,
-    DeleteFile, DropCodebaseIndex, ErrorCode, IndexCodebase, Initialize, InitializeResponse,
+    DeleteFile, DropCodebaseIndex, ErrorCode, GetFragmentMetadataFromHash,
+    GetFragmentMetadataFromHashResponse, IndexCodebase, Initialize, InitializeResponse,
     LoadRepoMetadataDirectoryResponse, NavigatedToDirectoryResponse, OpenBuffer,
     OpenBufferResponse, ReadFileContextRequest, ReadFileContextResponse, RunCommandRequest,
     RunCommandResponse, ServerMessage, SessionBootstrapped, TextEdit, WriteFile,
@@ -318,6 +319,38 @@ impl RemoteServerClient {
             }
             other => {
                 log::error!("Unexpected response variant for DropCodebaseIndex: {other:?}");
+                Err(ClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Maps backend content hashes to server-local fragment metadata for a synced repo snapshot.
+    pub async fn get_fragment_metadata_from_hash(
+        &self,
+        repo_path: String,
+        root_hash: String,
+        content_hashes: Vec<String>,
+    ) -> Result<GetFragmentMetadataFromHashResponse, ClientError> {
+        let request_id = RequestId::new();
+        let msg = ClientMessage {
+            request_id: request_id.to_string(),
+            message: Some(client_message::Message::GetFragmentMetadataFromHash(
+                GetFragmentMetadataFromHash {
+                    repo_path,
+                    root_hash,
+                    content_hashes,
+                },
+            )),
+        };
+
+        let response = self.send_request(request_id, msg).await?;
+
+        match response.message {
+            Some(server_message::Message::GetFragmentMetadataFromHashResponse(resp)) => Ok(resp),
+            other => {
+                log::error!(
+                    "Unexpected response variant for GetFragmentMetadataFromHash: {other:?}"
+                );
                 Err(ClientError::UnexpectedResponse)
             }
         }
