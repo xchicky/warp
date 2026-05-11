@@ -467,9 +467,10 @@ impl LaunchMode {
             LaunchMode::CommandLine { command, .. } => {
                 matches!(command, CliCommand::Agent(AgentCommand::Run { .. }))
             }
-            LaunchMode::App { .. }
-            | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon { .. } => true,
+            LaunchMode::RemoteServerDaemon { .. } => {
+                FeatureFlag::RemoteCodebaseIndexing.is_enabled()
+            }
+            LaunchMode::App { .. } | LaunchMode::Test { .. } => true,
             LaunchMode::RemoteServerProxy => false,
         }
     }
@@ -2583,6 +2584,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::PredictAMQueries,
         #[cfg(feature = "full_source_code_embedding")]
         FeatureFlag::FullSourceCodeEmbedding,
+        #[cfg(feature = "remote_codebase_indexing")]
+        FeatureFlag::RemoteCodebaseIndexing,
         #[cfg(feature = "use_tantivy_search")]
         FeatureFlag::UseTantivySearch,
         #[cfg(feature = "grep_tool")]
