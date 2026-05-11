@@ -1581,7 +1581,7 @@ pub enum AmbientAgentViewModelEvent {
     AuthSecretSelected,
 }
 
-fn should_disable_snapshot(ctx: &AppContext) -> bool {
+pub(crate) fn should_disable_snapshot(ctx: &AppContext) -> bool {
     let privacy = PrivacySettings::as_ref(ctx);
     if !privacy.is_cloud_conversation_storage_enabled {
         return true;
