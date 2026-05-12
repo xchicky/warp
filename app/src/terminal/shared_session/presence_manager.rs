@@ -97,7 +97,7 @@ const PRESET_COLORS: &[ColorU] = &[
 ];
 
 /// Helper struct containing participant info and anything else necessary for rendering
-/// for an present participant.
+/// for a present participant.
 #[derive(Clone)]
 pub struct Participant {
     pub info: ParticipantInfo,

@@ -1821,18 +1821,26 @@ impl TerminalView {
             .map(|manager| {
                 let manager = manager.as_ref(ctx);
                 if is_sharer {
-                    let one_viewer = manager.present_viewer_count() == 1;
-                    one_viewer
+                    // Dedup by firebase_uid so stale reconnect copies
+                    // don't block sizing when it's really one person.
+                    let mut viewers = manager.get_present_viewers();
+                    let Some(first) = viewers.next() else {
+                        return false;
+                    };
+                    let first_uid = &first.info.profile_data.firebase_uid;
+                    let all_same_person =
+                        viewers.all(|v| v.info.profile_data.firebase_uid == *first_uid);
+                    all_same_person
                         && (skip_uid_check
-                            || manager.get_present_viewers().all(|v| {
-                                v.info.profile_data.firebase_uid
-                                    == manager.firebase_uid().as_string()
-                            }))
+                            || *first_uid == manager.firebase_uid().as_string())
                 } else {
-                    // We are a viewer — we must be the only viewer and the sharer must be us.
-                    // (present_viewer_count() excludes ourselves)
-                    let only_viewer = manager.present_viewer_count() == 0;
-                    only_viewer
+                    // No other distinct user should be viewing.
+                    // Stale copies of our own connection share our UID.
+                    let no_other_user = manager.get_present_viewers().all(|v| {
+                        v.info.profile_data.firebase_uid
+                            == manager.firebase_uid().as_string()
+                    });
+                    no_other_user
                         && (skip_uid_check
                             || manager.get_sharer().is_some_and(|s| {
                                 s.info.profile_data.firebase_uid
