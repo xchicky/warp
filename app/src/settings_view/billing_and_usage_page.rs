@@ -3210,13 +3210,11 @@ impl UsageWidget {
                 "Upgrade to the Build plan",
                 upgrade_url,
             )];
-            if UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app) {
-                fragments.push(FormattedTextFragment::plain_text(" or "));
-                fragments.push(FormattedTextFragment::hyperlink_action(
-                    "bring your own key",
-                    BillingAndUsagePageAction::NavigateToByokSettings,
-                ));
-            }
+            fragments.push(FormattedTextFragment::plain_text(" or "));
+            fragments.push(FormattedTextFragment::hyperlink_action(
+                "bring your own key",
+                BillingAndUsagePageAction::NavigateToByokSettings,
+            ));
             fragments.push(FormattedTextFragment::plain_text(
                 " for more credits and access to more models.",
             ));

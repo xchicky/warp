@@ -1,5 +1,6 @@
 pub(crate) mod conversation;
 pub(crate) mod conversation_yaml;
+pub(crate) mod local;
 pub(crate) mod todos;
 
 pub(crate) mod api;

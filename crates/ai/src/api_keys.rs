@@ -12,6 +12,14 @@ pub enum ApiKeyManagerEvent {
     KeysUpdated,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiKeyProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    OpenRouter,
+}
+
 /// User-provided API keys for AI providers.
 ///
 /// These are used for "Bring Your Own API Key" functionality, allowing
@@ -22,6 +30,10 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_model: Option<String>,
+    pub anthropic_base_url: Option<String>,
+    pub anthropic_model: Option<String>,
 }
 
 impl ApiKeys {
@@ -31,6 +43,32 @@ impl ApiKeys {
             || self.google.is_some()
             || self.open_router.is_some()
     }
+
+    pub fn has_any_local_api_key(&self) -> bool {
+        self.has_any_key()
+    }
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_model_id(value: &str) -> bool {
+    const MAX_MODEL_ID_LEN: usize = 128;
+
+    !value.is_empty()
+        && value.len() <= MAX_MODEL_ID_LEN
+        && !value.starts_with("sk-")
+        && !value.starts_with("AIza")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
+}
+
+fn normalized_model_id(value: Option<String>) -> Option<String> {
+    non_empty_trimmed(value).filter(|value| valid_model_id(value))
 }
 
 /// Controls how AWS credentials are refreshed by [`ApiKeyManager`].
@@ -70,25 +108,63 @@ impl ApiKeyManager {
     }
 
     pub fn set_google_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
-        self.keys.google = key;
+        self.keys.google = non_empty_trimmed(key);
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_anthropic_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
-        self.keys.anthropic = key;
+        self.keys.anthropic = non_empty_trimmed(key);
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_openai_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
-        self.keys.openai = key;
+        self.keys.openai = non_empty_trimmed(key);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_openai_base_url(&mut self, base_url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.openai_base_url = non_empty_trimmed(base_url);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_openai_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
+        let model = normalized_model_id(model);
+        self.keys.openai_model = if model == self.keys.anthropic_model {
+            None
+        } else {
+            model
+        };
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_anthropic_base_url(
+        &mut self,
+        base_url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.anthropic_base_url = non_empty_trimmed(base_url);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_anthropic_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
+        let model = normalized_model_id(model);
+        self.keys.anthropic_model = if model == self.keys.openai_model {
+            None
+        } else {
+            model
+        };
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
-        self.keys.open_router = key;
+        self.keys.open_router = non_empty_trimmed(key);
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
@@ -121,20 +197,23 @@ impl ApiKeyManager {
         &self,
         include_byo_keys: bool,
         include_aws_bedrock_credentials: bool,
+        providers: &[ApiKeyProvider],
     ) -> Option<api::request::settings::ApiKeys> {
-        let anthropic = include_byo_keys
+        let include_provider_key =
+            |candidate_provider| include_byo_keys && providers.contains(&candidate_provider);
+        let anthropic = include_provider_key(ApiKeyProvider::Anthropic)
             .then(|| self.keys.anthropic.clone())
             .flatten()
             .unwrap_or_default();
-        let openai = include_byo_keys
+        let openai = include_provider_key(ApiKeyProvider::OpenAI)
             .then(|| self.keys.openai.clone())
             .flatten()
             .unwrap_or_default();
-        let google = include_byo_keys
+        let google = include_provider_key(ApiKeyProvider::Google)
             .then(|| self.keys.google.clone())
             .flatten()
             .unwrap_or_default();
-        let open_router = include_byo_keys
+        let open_router = include_provider_key(ApiKeyProvider::OpenRouter)
             .then(|| self.keys.open_router.clone())
             .flatten()
             .unwrap_or_default();
@@ -217,3 +296,59 @@ impl Entity for ApiKeyManager {
 }
 
 impl SingletonEntity for ApiKeyManager {}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_model_id, ApiKeyManager, ApiKeyProvider, AwsCredentialsState};
+
+    #[test]
+    fn normalized_model_id_accepts_common_model_ids() {
+        assert_eq!(
+            normalized_model_id(Some("  claude-sonnet-4-5  ".to_string())),
+            Some("claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(
+            normalized_model_id(Some("openai/gpt-4o:latest".to_string())),
+            Some("openai/gpt-4o:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn normalized_model_id_rejects_key_like_or_unsafe_values() {
+        assert_eq!(normalized_model_id(Some("sk-test".to_string())), None);
+        assert_eq!(normalized_model_id(Some("AIza-test".to_string())), None);
+        assert_eq!(
+            normalized_model_id(Some(
+                "model
+name"
+                    .to_string()
+            )),
+            None
+        );
+        assert_eq!(normalized_model_id(Some("a".repeat(129))), None);
+    }
+
+    #[test]
+    fn api_keys_for_request_only_includes_matching_provider_key() {
+        let manager = ApiKeyManager {
+            keys: super::ApiKeys {
+                openai: Some("openai-key".to_string()),
+                anthropic: Some("anthropic-key".to_string()),
+                google: Some("google-key".to_string()),
+                open_router: Some("open-router-key".to_string()),
+                ..Default::default()
+            },
+            aws_credentials_state: AwsCredentialsState::Missing,
+            aws_credentials_refresh_strategy: Default::default(),
+        };
+
+        let keys = manager
+            .api_keys_for_request(true, false, &[ApiKeyProvider::Anthropic])
+            .expect("expected matching provider key");
+
+        assert_eq!(keys.anthropic, "anthropic-key");
+        assert!(keys.openai.is_empty());
+        assert!(keys.google.is_empty());
+        assert!(keys.open_router.is_empty());
+    }
+}

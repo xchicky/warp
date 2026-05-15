@@ -25,17 +25,14 @@ use super::execution_profiles::profiles::AIExecutionProfilesModel;
 
 pub use ai::LLMId;
 
-/// Checks if a user's' API key is being used for the given provider.
-/// Returns `true` if BYO API key is enabled and a key exists for the provider.
+/// Checks if a user's API key is being used for the given provider.
 pub fn is_using_api_key_for_provider(provider: &LLMProvider, app: &AppContext) -> bool {
-    let api_keys = UserWorkspaces::as_ref(app)
-        .is_byo_api_key_enabled(app)
-        .then(|| ApiKeyManager::as_ref(app).keys().clone());
+    let api_keys = ApiKeyManager::as_ref(app).keys();
 
     match provider {
-        LLMProvider::OpenAI => api_keys.is_some_and(|keys| keys.openai.is_some()),
-        LLMProvider::Anthropic => api_keys.is_some_and(|keys| keys.anthropic.is_some()),
-        LLMProvider::Google => api_keys.is_some_and(|keys| keys.google.is_some()),
+        LLMProvider::OpenAI => api_keys.openai.is_some(),
+        LLMProvider::Anthropic => api_keys.anthropic.is_some(),
+        LLMProvider::Google => api_keys.google.is_some(),
         _ => false,
     }
 }
@@ -127,6 +124,7 @@ impl LLMProvider {
 pub enum LLMModelHost {
     DirectApi,
     AwsBedrock,
+    CustomEndpoint,
     #[serde(other)]
     Unknown,
 }
@@ -531,6 +529,114 @@ impl Default for ModelsByFeature {
     }
 }
 
+fn custom_llm_info(display_prefix: &str, model: &str, provider: LLMProvider) -> LLMInfo {
+    let mut host_configs = HashMap::new();
+    host_configs.insert(
+        LLMModelHost::DirectApi,
+        RoutingHostConfig {
+            enabled: true,
+            model_routing_host: LLMModelHost::DirectApi,
+        },
+    );
+
+    LLMInfo {
+        display_name: format!("{display_prefix}: {model}"),
+        base_model_name: model.to_string(),
+        id: model.to_string().into(),
+        reasoning_level: None,
+        usage_metadata: LLMUsageMetadata {
+            request_multiplier: 1,
+            credit_multiplier: None,
+        },
+        description: None,
+        disable_reason: None,
+        vision_supported: true,
+        spec: None,
+        provider,
+        host_configs,
+        discount_percentage: None,
+        context_window: LLMContextWindow {
+            is_configurable: true,
+            min: 1,
+            max: 128_000,
+            default_max: 128_000,
+        },
+    }
+}
+
+fn is_custom_model_info(info: &LLMInfo) -> bool {
+    info.display_name.starts_with("Custom OpenAI:")
+        || info.display_name.starts_with("Custom Anthropic:")
+        || info.display_name.starts_with("Local OpenAI:")
+        || info.display_name.starts_with("Local Anthropic:")
+}
+
+fn remove_custom_choices(available: &mut AvailableLLMs) {
+    let default_was_custom = available
+        .info_for_id(&available.default_id)
+        .is_some_and(is_custom_model_info);
+    available
+        .choices
+        .retain(|choice| !is_custom_model_info(choice));
+    if default_was_custom {
+        if let Some(first_choice) = available.choices.first() {
+            available.default_id = first_choice.id.clone();
+        }
+    }
+}
+
+fn remove_custom_models(models: &mut ModelsByFeature) {
+    remove_custom_choices(&mut models.agent_mode);
+    remove_custom_choices(&mut models.coding);
+    if let Some(cli_agent) = &mut models.cli_agent {
+        remove_custom_choices(cli_agent);
+    }
+}
+
+fn without_custom_models(models: &ModelsByFeature) -> ModelsByFeature {
+    let mut models = models.clone();
+    remove_custom_models(&mut models);
+    models
+}
+
+fn add_custom_choice(available: &mut AvailableLLMs, llm: LLMInfo) {
+    if !available.choices.iter().any(|choice| choice.id == llm.id) {
+        available.choices.push(llm);
+    }
+}
+
+fn add_custom_default_choice(available: &mut AvailableLLMs, llm: LLMInfo) {
+    available.default_id = llm.id.clone();
+    add_custom_choice(available, llm);
+}
+
+fn add_custom_models(models: &mut ModelsByFeature, api_keys: &ai::api_keys::ApiKeys) {
+    remove_custom_models(models);
+
+    let custom_models = [
+        api_keys
+            .openai
+            .as_ref()
+            .zip(api_keys.openai_base_url.as_ref())
+            .and_then(|_| api_keys.openai_model.as_deref())
+            .map(|model| custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)),
+        api_keys
+            .anthropic
+            .as_ref()
+            .zip(api_keys.anthropic_base_url.as_ref())
+            .and_then(|_| api_keys.anthropic_model.as_deref())
+            .map(|model| custom_llm_info("Local Anthropic", model, LLMProvider::Anthropic)),
+    ];
+
+    for llm in custom_models.into_iter().flatten() {
+        if llm.display_name.starts_with("Local OpenAI:") {
+            add_custom_default_choice(&mut models.agent_mode, llm);
+        } else {
+            add_custom_choice(&mut models.agent_mode, llm);
+        }
+    }
+}
+
 enum UpdatePopupVisibilityState {
     WaitingToBeShown,
     Visible(EntityId),
@@ -556,7 +662,8 @@ pub struct LLMPreferences {
 
 impl LLMPreferences {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let models_by_feature = get_cached_models(ctx).unwrap_or_default();
+        let mut models_by_feature = get_cached_models(ctx).unwrap_or_default();
+        add_custom_models(&mut models_by_feature, ApiKeyManager::as_ref(ctx).keys());
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -588,7 +695,9 @@ impl LLMPreferences {
         ctx.subscribe_to_model(
             &ApiKeyManager::handle(ctx),
             |me, _event: &ApiKeyManagerEvent, ctx| {
+                add_custom_models(&mut me.models_by_feature, ApiKeyManager::as_ref(ctx).keys());
                 me.reconcile_disabled_model_preferences(ctx);
+                ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
             },
         );
 
@@ -916,7 +1025,7 @@ impl LLMPreferences {
             async move { ai_api_client.get_feature_model_choices().await },
             |me, result, ctx| match result {
                 Ok(update) => {
-                    if update != me.models_by_feature {
+                    if update != without_custom_models(&me.models_by_feature) {
                         me.on_server_update(update, ctx);
                     }
                 }
@@ -934,7 +1043,7 @@ impl LLMPreferences {
             async move { ai_api_client.get_free_available_models(None).await },
             |me, result, ctx| match result {
                 Ok(update) => {
-                    if update != me.models_by_feature {
+                    if update != without_custom_models(&me.models_by_feature) {
                         me.on_server_update(update, ctx);
                     }
                 }
@@ -963,12 +1072,15 @@ impl LLMPreferences {
         }
     }
 
-    fn on_server_update(&mut self, update: ModelsByFeature, ctx: &mut ModelContext<Self>) {
+    fn on_server_update(&mut self, mut update: ModelsByFeature, ctx: &mut ModelContext<Self>) {
         let has_existing_persisted_config = get_cached_models(ctx).is_some();
+        add_custom_models(&mut update, ApiKeyManager::as_ref(ctx).keys());
 
         let old = std::mem::replace(&mut self.models_by_feature, update);
 
-        match serde_json::to_string(&self.models_by_feature) {
+        let cacheable_models = without_custom_models(&self.models_by_feature);
+
+        match serde_json::to_string(&cacheable_models) {
             Ok(serialized_update) => {
                 if let Err(e) = ctx
                     .private_user_preferences()

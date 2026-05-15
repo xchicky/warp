@@ -376,7 +376,7 @@ impl AIRequestUsageModel {
     /// 3. user has bonus grants (either team grants or user grants)
     /// 4. user's team plan has pay-as-you-go enabled (enterprise only)
     /// 5. user's team is on enterprise with bonus grants auto-reload enable (enterprise only)
-    /// 6. user has BYOK enabled and has provided at least one API key
+    /// 6. user has provided at least one local API key
     /// Use this method as the starting point for AI availability checking.
     pub fn has_any_ai_remaining(&self, ctx: &AppContext) -> bool {
         let current_workspace = UserWorkspaces::as_ref(ctx).current_workspace();
@@ -397,17 +397,14 @@ impl AIRequestUsageModel {
         let is_enterprise_auto_reload_enabled = current_workspace
             .is_some_and(|w| w.billing_metadata.is_enterprise_auto_reload_enabled());
 
-        // If you have provided your own API key,
-        // it doesn't matter if you are out of warp-provided requests.
-        let has_byo_api_key = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx)
-            && ApiKeyManager::as_ref(ctx).keys().has_any_key();
+        let has_custom_provider_config = ApiKeyManager::as_ref(ctx).keys().has_any_local_api_key();
 
         has_base_plan_ai_requests
             || (user_bonus_credits || workspace_bonus_credits)
             || workspace_has_overages
             || is_payg_enabled
             || is_enterprise_auto_reload_enabled
-            || has_byo_api_key
+            || has_custom_provider_config
     }
 
     pub fn requests_used(&self) -> usize {

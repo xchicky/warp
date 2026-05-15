@@ -6308,35 +6308,38 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
 
 struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
+    openai_base_url_editor: ViewHandle<EditorView>,
+    openai_model_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
+    anthropic_base_url_editor: ViewHandle<EditorView>,
+    anthropic_model_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
-    upgrade_highlight_index: HighlightedHyperlink,
 }
 
 impl ApiKeysWidget {
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
-        let workspace_handle = UserWorkspaces::handle(ctx);
         let is_any_ai_enabled = ai_settings.is_any_ai_enabled(ctx);
-        let is_byo_enabled = workspace_handle.as_ref(ctx).is_byo_api_key_enabled(ctx);
 
         let ApiKeys {
             openai: openai_key,
             anthropic: anthropic_key,
             google: google_key,
+            openai_base_url,
+            openai_model,
+            anthropic_base_url,
+            anthropic_model,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
-        // A helper macro to create and configure an API key editor.  This avoids a lot
-        // of code duplication and ensures consistency between the editors.
         macro_rules! create_api_key_editor {
-            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
+            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal, $is_password:expr) => {
                 let $editor = ctx.add_typed_action_view(move |ctx| {
                     let appearance = Appearance::handle(ctx).as_ref(ctx);
                     let options = SingleLineEditorOptions {
-                        is_password: true,
+                        is_password: $is_password,
                         text: TextOptions {
                             font_size_override: Some(appearance.ui_font_size()),
                             font_family_override: Some(appearance.monospace_font_family()),
@@ -6358,7 +6361,7 @@ impl ApiKeysWidget {
                 });
                 AISettingsPageView::update_editor_interaction_state(
                     $editor.clone(),
-                    is_any_ai_enabled && is_byo_enabled,
+                    is_any_ai_enabled,
                     ctx,
                 );
                 ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
@@ -6371,56 +6374,77 @@ impl ApiKeysWidget {
                     }
                 });
                 let editor_clone = $editor.clone();
-                ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
-                    if let UserWorkspacesEvent::TeamsChanged = event {
-                        let is_any_ai_enabled =
-                            AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
-                        let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled(ctx);
-                        let is_enabled = is_any_ai_enabled && is_byo_enabled;
-                        let has_key = !editor_clone.as_ref(ctx).is_empty(ctx);
-
-                        // If BYO is disabled, clear the API key from the editor and storage
-                        if !is_byo_enabled && has_key {
-                            editor_clone.update(ctx, |editor, ctx| {
-                                editor.set_buffer_text("", ctx);
-                            });
-                            ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                                model.$set_func(None, ctx);
-                            });
-                        }
-
-                        AISettingsPageView::update_editor_interaction_state(
-                            editor_clone.clone(),
-                            is_enabled,
-                            ctx,
-                        );
-                        ctx.notify();
-                    }
+                ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, settings, _event, ctx| {
+                    AISettingsPageView::update_editor_interaction_state(
+                        editor_clone.clone(),
+                        settings.as_ref(ctx).is_any_ai_enabled(ctx),
+                        ctx,
+                    );
+                    ctx.notify();
                 })
             };
         }
 
-        create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
+        create_api_key_editor!(
+            openai_api_key_editor,
+            openai_key,
+            set_openai_key,
+            "sk-...",
+            true
+        );
+        create_api_key_editor!(
+            openai_base_url_editor,
+            openai_base_url,
+            set_openai_base_url,
+            "http://localhost:11434/v1",
+            false
+        );
+        create_api_key_editor!(
+            openai_model_editor,
+            openai_model,
+            set_openai_model,
+            "gpt-4o",
+            false
+        );
         create_api_key_editor!(
             anthropic_api_key_editor,
             anthropic_key,
             set_anthropic_key,
-            "sk-ant-..."
+            "sk-ant-...",
+            true
+        );
+        create_api_key_editor!(
+            anthropic_base_url_editor,
+            anthropic_base_url,
+            set_anthropic_base_url,
+            "https://api.anthropic.com",
+            false
+        );
+        create_api_key_editor!(
+            anthropic_model_editor,
+            anthropic_model,
+            set_anthropic_model,
+            "claude-sonnet-4-5",
+            false
         );
         create_api_key_editor!(
             google_api_key_editor,
             google_key,
             set_google_key,
-            "AIzaSy..."
+            "AIzaSy...",
+            true
         );
 
         Self {
             openai_api_key_editor,
+            openai_base_url_editor,
+            openai_model_editor,
             anthropic_api_key_editor,
+            anthropic_base_url_editor,
+            anthropic_model_editor,
             google_api_key_editor,
 
             can_use_warp_credits_with_byok: Default::default(),
-            upgrade_highlight_index: Default::default(),
         }
     }
 
@@ -6495,8 +6519,36 @@ impl ApiKeysWidget {
         ));
         column.add_child(render_api_key_input(
             appearance,
+            "OpenAI-compatible Base URL",
+            self.openai_base_url_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "OpenAI-compatible Model",
+            self.openai_model_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
             "Anthropic API Key",
             self.anthropic_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Anthropic-compatible Base URL",
+            self.anthropic_base_url_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Anthropic-compatible Model",
+            self.anthropic_model_editor.clone(),
             is_enabled,
             app,
         ));
@@ -6507,85 +6559,6 @@ impl ApiKeysWidget {
             is_enabled,
             app,
         ));
-
-        // Show upgrade CTA if BYOK is not enabled
-        if !is_byo_enabled {
-            let auth_state = AuthStateProvider::as_ref(app).get();
-            let upgrade_text_fragments = if let Some(team) =
-                UserWorkspaces::as_ref(app).current_team()
-            {
-                // Enterprise teams don't have a self-serve upgrade path; route them
-                // to sales to enable BYOK on their existing plan.
-                if team.billing_metadata.customer_type == CustomerType::Enterprise {
-                    vec![
-                        FormattedTextFragment::hyperlink("Contact sales", "mailto:sales@warp.dev"),
-                        FormattedTextFragment::plain_text(
-                            " to enable bringing your own API keys on your Enterprise plan.",
-                        ),
-                    ]
-                } else {
-                    let current_user_email = auth_state.user_email().unwrap_or_default();
-                    let has_admin_permissions = team.has_admin_permissions(&current_user_email);
-                    let upgrade_url = UserWorkspaces::upgrade_link_for_team(team.uid);
-                    if has_admin_permissions {
-                        vec![
-                            FormattedTextFragment::hyperlink(
-                                "Upgrade to the Build plan",
-                                upgrade_url,
-                            ),
-                            FormattedTextFragment::plain_text(" to use your own API keys."),
-                        ]
-                    } else {
-                        vec![FormattedTextFragment::plain_text(
-                            "Ask your team's admin to upgrade to the Build plan to use your own API keys.",
-                        )]
-                    }
-                }
-            } else if FeatureFlag::SoloUserByok.is_enabled()
-                && auth_state.is_anonymous_or_logged_out()
-            {
-                vec![
-                    FormattedTextFragment::hyperlink_action(
-                        "Create an account",
-                        AISettingsPageAction::SignupAnonymousUser,
-                    ),
-                    FormattedTextFragment::plain_text(" to use your own API keys."),
-                ]
-            } else {
-                let user_id = auth_state.user_id().unwrap_or_default();
-                let upgrade_url = UserWorkspaces::upgrade_link(user_id);
-                vec![
-                    FormattedTextFragment::hyperlink("Upgrade to the Build plan", upgrade_url),
-                    FormattedTextFragment::plain_text(" to use your own API keys."),
-                ]
-            };
-
-            let upgrade_text_element = FormattedTextElement::new(
-                FormattedText::new([FormattedTextLine::Line(upgrade_text_fragments)]),
-                appearance.ui_font_size(),
-                appearance.ui_font_family(),
-                appearance.ui_font_family(),
-                blended_colors::text_sub(appearance.theme(), appearance.theme().surface_1()),
-                self.upgrade_highlight_index.clone(),
-            )
-            .with_hyperlink_font_color(appearance.theme().accent().into_solid())
-            .register_default_click_handlers_with_action_support(|hyperlink_lens, event, ctx| {
-                match hyperlink_lens {
-                    HyperlinkLens::Url(url) => {
-                        ctx.open_url(url);
-                    }
-                    HyperlinkLens::Action(action_ref) => {
-                        if let Some(action) =
-                            action_ref.as_any().downcast_ref::<AISettingsPageAction>()
-                        {
-                            event.dispatch_typed_action(action.clone());
-                        }
-                    }
-                }
-            });
-
-            column.add_child(Container::new(upgrade_text_element.finish()).finish());
-        }
 
         column.finish()
     }
@@ -6635,8 +6608,6 @@ impl SettingsWidget for ApiKeysWidget {
     ) -> Box<dyn Element> {
         let ai_settings = AISettings::as_ref(app);
         let is_any_ai_enabled = ai_settings.is_any_ai_enabled(app);
-        let is_byo_enabled = UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app);
-
         let mut column = Flex::column()
             .with_child(render_separator(appearance))
             .with_child(
@@ -6648,15 +6619,13 @@ impl SettingsWidget for ApiKeysWidget {
                 .with_padding_bottom(HEADER_PADDING)
                 .finish(),
             )
-            .with_child(self.render_api_keys_section(appearance, app, is_byo_enabled));
+            .with_child(self.render_api_keys_section(appearance, app, true));
 
-        if is_byo_enabled {
-            column.add_child(
-                Container::new(self.render_can_use_warp_credits_with_byok_toggle(view, app))
-                    .with_margin_top(16.)
-                    .finish(),
-            );
-        }
+        column.add_child(
+            Container::new(self.render_can_use_warp_credits_with_byok_toggle(view, app))
+                .with_margin_top(16.)
+                .finish(),
+        );
 
         Container::new(column.finish())
             .with_margin_bottom(HEADER_PADDING)

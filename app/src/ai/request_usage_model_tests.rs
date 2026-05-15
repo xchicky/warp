@@ -524,6 +524,54 @@ fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
 }
 
 #[test]
+fn test_has_any_ai_remaining_true_with_local_key_and_byok_policy_disabled() {
+    App::test((), |mut app| async move {
+        let (_uid, mut workspace) = create_test_workspace();
+        workspace.billing_metadata.tier.byo_api_key_policy =
+            Some(ByoApiKeyPolicy { enabled: false });
+
+        add_user_workspaces_with_workspace(&mut app, workspace);
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_openai_key(Some("test-key".to_string()), ctx);
+        });
+
+        request_usage_model.update(&mut app, |model, ctx| {
+            model.request_limit_info = RequestLimitInfo::new_for_test(10, 10);
+            model.bonus_grants.clear();
+
+            assert!(
+                model.has_any_ai_remaining(ctx),
+                "expected local API key to bypass BYOK billing policy and exhausted Warp credits",
+            );
+        });
+    });
+}
+
+#[test]
+fn test_has_any_ai_remaining_true_with_local_key_and_no_workspace_without_feature_flag() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_anthropic_key(Some("test-key".to_string()), ctx);
+        });
+
+        request_usage_model.update(&mut app, |model, ctx| {
+            model.request_limit_info = RequestLimitInfo::new_for_test(10, 10);
+            model.bonus_grants.clear();
+
+            assert!(
+                model.has_any_ai_remaining(ctx),
+                "expected local API key to bypass exhausted Warp credits without workspace billing state",
+            );
+        });
+    });
+}
+
+#[test]
 fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
     App::test((), |mut app| async move {
         // Create a workspace with BYOK enabled but no key provided.
@@ -574,7 +622,7 @@ fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
 }
 
 #[test]
-fn test_byo_api_key_disabled_for_anonymous_firebase_user() {
+fn test_local_api_key_bypasses_anonymous_byo_policy() {
     App::test((), |mut app| async move {
         let _guard = FeatureFlag::SoloUserByok.override_enabled(true);
 
@@ -588,7 +636,7 @@ fn test_byo_api_key_disabled_for_anonymous_firebase_user() {
         app.read(|ctx| {
             assert!(
                 !UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx),
-                "expected is_byo_api_key_enabled to be false for anonymous Firebase users even with SoloUserByok enabled",
+                "expected workspace BYOK policy to remain false for anonymous Firebase users",
             );
         });
 
@@ -597,8 +645,8 @@ fn test_byo_api_key_disabled_for_anonymous_firebase_user() {
             model.bonus_grants.clear();
 
             assert!(
-                !model.has_any_ai_remaining(ctx),
-                "expected has_any_ai_remaining to be false for anonymous Firebase user even with BYO key and SoloUserByok enabled",
+                model.has_any_ai_remaining(ctx),
+                "expected local API key to bypass anonymous workspace BYOK policy and exhausted Warp credits",
             );
         });
     });

@@ -4,7 +4,7 @@ mod convert_to;
 mod r#impl;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
-use ai::api_keys::ApiKeyManager;
+use ai::api_keys::{ApiKeyManager, ApiKeyProvider};
 pub use convert_from::{
     user_inputs_from_messages, ConversionParams, ConvertAPIMessageToClientOutputMessage,
     MaybeAIAgentOutputMessage, MessageToAIAgentOutputMessageError,
@@ -24,7 +24,10 @@ use warp_core::features::FeatureFlag;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::{
-    ai::{blocklist::SessionContext, llms::LLMId},
+    ai::{
+        blocklist::SessionContext,
+        llms::{LLMId, LLMPreferences, LLMProvider},
+    },
     server::server_api::AIApiError,
 };
 
@@ -118,6 +121,7 @@ pub struct RequestParams {
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
     pub allow_use_of_warp_credits_with_byok: bool,
+    pub local_direct_config: Option<super::local::LocalDirectConfig>,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
     pub web_search_enabled: bool,
@@ -235,10 +239,58 @@ impl RequestParams {
         let should_redact_secrets = get_secret_obfuscation_mode(app).should_redact_secret();
 
         let user_workspaces = UserWorkspaces::as_ref(app);
-        let api_keys = ApiKeyManager::as_ref(app).api_keys_for_request(
-            user_workspaces.is_byo_api_key_enabled(app),
+        let include_byo_keys = user_workspaces.is_byo_api_key_enabled(app);
+        let mut model_providers = Vec::new();
+        let llm_preferences = LLMPreferences::as_ref(app);
+        for model_id in [
+            &request_input.model_id,
+            &request_input.coding_model_id,
+            &request_input.cli_agent_model_id,
+            &request_input.computer_use_model_id,
+        ] {
+            let Some(provider) =
+                llm_preferences
+                    .get_llm_info(model_id)
+                    .and_then(|info| match &info.provider {
+                        LLMProvider::Anthropic => Some(ApiKeyProvider::Anthropic),
+                        LLMProvider::OpenAI => Some(ApiKeyProvider::OpenAI),
+                        LLMProvider::Google => Some(ApiKeyProvider::Google),
+                        LLMProvider::Xai | LLMProvider::Unknown => None,
+                    })
+            else {
+                continue;
+            };
+            if !model_providers.contains(&provider) {
+                model_providers.push(provider);
+            }
+        }
+        let api_key_manager = ApiKeyManager::as_ref(app);
+        let api_keys = api_key_manager.api_keys_for_request(
+            include_byo_keys,
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
+            &model_providers,
         );
+        let local_direct_config = api_key_manager.keys().openai.as_ref().and_then(|api_key| {
+            api_key_manager
+                .keys()
+                .openai_base_url
+                .as_ref()
+                .and_then(|base_url| {
+                    api_key_manager
+                        .keys()
+                        .openai_model
+                        .as_ref()
+                        .and_then(|model| {
+                            (request_input.model_id.as_str() == model).then(|| {
+                                super::local::LocalDirectConfig {
+                                    api_key: api_key.clone(),
+                                    base_url: base_url.clone(),
+                                    model: model.clone(),
+                                }
+                            })
+                        })
+                })
+        });
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
 
@@ -322,6 +374,7 @@ impl RequestParams {
             should_redact_secrets,
             api_keys,
             allow_use_of_warp_credits_with_byok,
+            local_direct_config,
             autonomy_level,
             isolation_level,
             web_search_enabled,

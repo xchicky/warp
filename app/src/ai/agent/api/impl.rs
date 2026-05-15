@@ -1,6 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{ai::agent::redaction, terminal::model::session::SessionType};
+use crate::{
+    ai::agent::{
+        local::{generate_openai_compatible_output, LocalDirectConfig},
+        redaction,
+    },
+    terminal::model::session::SessionType,
+};
 use futures_util::StreamExt;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
@@ -14,6 +20,17 @@ pub async fn generate_multi_agent_output(
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    if params.should_redact_secrets {
+        redaction::redact_inputs(&mut params.input);
+    }
+
+    if let Some(local_config) = local_direct_config_for_request(&params) {
+        return Ok(Box::pin(
+            generate_openai_compatible_output(local_config, params.input, params.tasks)
+                .take_until(cancellation_rx),
+        ));
+    }
+
     let supported_tools = params
         .supported_tools_override
         .take()
@@ -45,10 +62,6 @@ pub async fn generate_multi_agent_output(
                 )),
             },
         );
-    }
-
-    if params.should_redact_secrets {
-        redaction::redact_inputs(&mut params.input);
     }
 
     let mut api_keys = params.api_keys;
@@ -148,6 +161,18 @@ pub async fn generate_multi_agent_output(
             Ok(Box::pin(rx))
         }
     }
+}
+
+fn local_direct_config_for_request(params: &RequestParams) -> Option<LocalDirectConfig> {
+    if !params
+        .input
+        .iter()
+        .any(|input| input.user_query().is_some())
+    {
+        return None;
+    }
+
+    params.local_direct_config.clone()
 }
 
 fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {

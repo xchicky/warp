@@ -122,3 +122,20 @@ fn llm_info_round_trip_serializes_and_deserializes() {
 
     assert_eq!(info, round_tripped);
 }
+
+#[test]
+fn add_custom_models_makes_local_openai_the_default_agent_model() {
+    let mut models = ModelsByFeature::default();
+    let api_keys = ai::api_keys::ApiKeys {
+        openai: Some("local-key".to_string()),
+        openai_base_url: Some("http://localhost:11434/v1".to_string()),
+        openai_model: Some("qwen2.5-coder".to_string()),
+        ..Default::default()
+    };
+
+    add_custom_models(&mut models, &api_keys);
+
+    let default = models.agent_mode.default_llm_info();
+    assert_eq!(default.id, LLMId::from("qwen2.5-coder"));
+    assert_eq!(default.display_name, "Local OpenAI: qwen2.5-coder");
+}
