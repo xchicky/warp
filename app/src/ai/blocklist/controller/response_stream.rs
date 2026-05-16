@@ -275,9 +275,11 @@ impl ResponseStream {
                 let network_status = NetworkStatus::as_ref(ctx);
                 let is_online = network_status.is_online();
                 let is_retryable = e.is_retryable();
+                let is_local_direct_request = self.params.local_direct_config.is_some();
 
                 let should_retry = !self.has_received_client_actions
                     && is_retryable
+                    && !is_local_direct_request
                     && self.retry_count < MAX_RETRIES
                     && is_online;
 
@@ -301,6 +303,7 @@ impl ResponseStream {
                 // should resume the conversation after the stream completes.
                 let should_attempt_resume = self.has_received_client_actions
                     && is_retryable
+                    && !is_local_direct_request
                     && self.can_attempt_resume_on_error;
                 if should_attempt_resume {
                     self.should_resume_conversation_after_stream_finished = true;
