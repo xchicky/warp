@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -107,6 +107,8 @@ struct OpenAIStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
     tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
 }
 
@@ -127,6 +129,7 @@ struct OpenAIStreamToolCallFunctionDelta {
 #[derive(Debug, PartialEq, Eq)]
 enum OpenAIStreamEvent {
     Delta(String),
+    ReasoningDelta(String),
     ToolCallDelta(OpenAIStreamToolCallDelta),
     Done,
 }
@@ -185,6 +188,8 @@ pub fn generate_openai_compatible_output(
         };
         let cwd = local_tool_cwd(&input);
         let mut received_token = false;
+        let mut reasoning_message_id: Option<String> = None;
+        let mut reasoning_started_at: Option<Instant> = None;
         let mut tool_result_summaries = Vec::new();
         let mut suggested_shell_commands = HashSet::new();
 
@@ -230,6 +235,26 @@ pub fn generate_openai_compatible_output(
                                 token,
                             ));
                         }
+                        OpenAIStreamEvent::ReasoningDelta(token) => {
+                            if let Some(reasoning_id) = &reasoning_message_id {
+                                yield Ok(append_agent_reasoning_content(
+                                    &task_id,
+                                    &request_id,
+                                    reasoning_id,
+                                    token,
+                                ));
+                            } else {
+                                reasoning_started_at = Some(Instant::now());
+                                let reasoning_id = Uuid::new_v4().to_string();
+                                yield Ok(add_agent_reasoning_message(
+                                    &task_id,
+                                    &request_id,
+                                    &reasoning_id,
+                                    token,
+                                ));
+                                reasoning_message_id = Some(reasoning_id);
+                            }
+                        }
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
                         }
@@ -265,6 +290,26 @@ pub fn generate_openai_compatible_output(
                                 token,
                             ));
                         }
+                        OpenAIStreamEvent::ReasoningDelta(token) => {
+                            if let Some(reasoning_id) = &reasoning_message_id {
+                                yield Ok(append_agent_reasoning_content(
+                                    &task_id,
+                                    &request_id,
+                                    reasoning_id,
+                                    token,
+                                ));
+                            } else {
+                                reasoning_started_at = Some(Instant::now());
+                                let reasoning_id = Uuid::new_v4().to_string();
+                                yield Ok(add_agent_reasoning_message(
+                                    &task_id,
+                                    &request_id,
+                                    &reasoning_id,
+                                    token,
+                                ));
+                                reasoning_message_id = Some(reasoning_id);
+                            }
+                        }
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
                         }
@@ -275,6 +320,14 @@ pub fn generate_openai_compatible_output(
 
             let tool_calls = tool_call_accumulator.into_tool_calls();
             if tool_calls.is_empty() {
+                if let (Some(reasoning_id), Some(started_at)) = (&reasoning_message_id, reasoning_started_at) {
+                    yield Ok(finish_agent_reasoning_message(
+                        &task_id,
+                        &request_id,
+                        reasoning_id,
+                        started_at.elapsed(),
+                    ));
+                }
                 match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
                     EmptyLocalProviderResponseResolution::Finish => {
                         yield Ok(stream_finished_done());
@@ -363,6 +416,26 @@ pub fn generate_openai_compatible_output(
                             token,
                         ));
                     }
+                    OpenAIStreamEvent::ReasoningDelta(token) => {
+                        if let Some(reasoning_id) = &reasoning_message_id {
+                            yield Ok(append_agent_reasoning_content(
+                                &task_id,
+                                &request_id,
+                                reasoning_id,
+                                token,
+                            ));
+                        } else {
+                            reasoning_started_at = Some(Instant::now());
+                            let reasoning_id = Uuid::new_v4().to_string();
+                            yield Ok(add_agent_reasoning_message(
+                                &task_id,
+                                &request_id,
+                                &reasoning_id,
+                                token,
+                            ));
+                            reasoning_message_id = Some(reasoning_id);
+                        }
+                    }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
                     OpenAIStreamEvent::Done => {
                         stream_done = true;
@@ -396,10 +469,39 @@ pub fn generate_openai_compatible_output(
                             token,
                         ));
                     }
+                    OpenAIStreamEvent::ReasoningDelta(token) => {
+                        if let Some(reasoning_id) = &reasoning_message_id {
+                            yield Ok(append_agent_reasoning_content(
+                                &task_id,
+                                &request_id,
+                                reasoning_id,
+                                token,
+                            ));
+                        } else {
+                            reasoning_started_at = Some(Instant::now());
+                            let reasoning_id = Uuid::new_v4().to_string();
+                            yield Ok(add_agent_reasoning_message(
+                                &task_id,
+                                &request_id,
+                                &reasoning_id,
+                                token,
+                            ));
+                            reasoning_message_id = Some(reasoning_id);
+                        }
+                    }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
                     OpenAIStreamEvent::Done => break,
                 }
             }
+        }
+
+        if let (Some(reasoning_id), Some(started_at)) = (&reasoning_message_id, reasoning_started_at) {
+            yield Ok(finish_agent_reasoning_message(
+                &task_id,
+                &request_id,
+                reasoning_id,
+                started_at.elapsed(),
+            ));
         }
 
         if finalize_received_token {
@@ -1533,6 +1635,14 @@ fn drain_sse_events(pending: &mut String) -> anyhow::Result<Vec<OpenAIStreamEven
             continue;
         };
         for choice in event.choices {
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .or(choice.delta.reasoning)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                events.push(OpenAIStreamEvent::ReasoningDelta(reasoning));
+            }
             if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                 events.push(OpenAIStreamEvent::Delta(content));
             }
@@ -1650,6 +1760,124 @@ fn append_agent_output_message_content(
                             }),
                             mask: Some(prost_types::FieldMask {
                                 paths: vec!["agent_output.text".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn add_agent_reasoning_message(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    reasoning: String,
+) -> api::ResponseEvent {
+    let now = Local::now();
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.to_string(),
+                            messages: vec![api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: Some(prost_types::Timestamp {
+                                    seconds: now.timestamp(),
+                                    nanos: now.timestamp_subsec_nanos() as i32,
+                                }),
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning,
+                                        finished_duration: None,
+                                    },
+                                )),
+                            }],
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn append_agent_reasoning_content(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    reasoning: String,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AppendToMessageContent(
+                        api::client_action::AppendToMessageContent {
+                            task_id: task_id.to_string(),
+                            message: Some(api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: None,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning,
+                                        finished_duration: None,
+                                    },
+                                )),
+                            }),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_reasoning.reasoning".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn finish_agent_reasoning_message(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    duration: Duration,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::UpdateTaskMessage(
+                        api::client_action::UpdateTaskMessage {
+                            task_id: task_id.to_string(),
+                            message: Some(api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: None,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning: String::new(),
+                                        finished_duration: Some(prost_types::Duration {
+                                            seconds: duration.as_secs() as i64,
+                                            nanos: duration.subsec_nanos() as i32,
+                                        }),
+                                    },
+                                )),
+                            }),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_reasoning.finished_duration".to_string()],
                             }),
                         },
                     )),
@@ -1818,6 +2046,34 @@ mod tests {
         let events = drain_sse_events(&mut pending).unwrap();
 
         assert!(events.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_sse_events_extracts_reasoning_content() {
+        let mut pending =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n".to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(
+            events,
+            vec![OpenAIStreamEvent::ReasoningDelta("hmm".to_string())]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_sse_events_extracts_reasoning_alias() {
+        let mut pending =
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n".to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(
+            events,
+            vec![OpenAIStreamEvent::ReasoningDelta("thinking".to_string())]
+        );
         assert!(pending.is_empty());
     }
 
