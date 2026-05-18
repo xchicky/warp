@@ -768,6 +768,21 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
                 }),
             },
         },
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "list_directory",
+                description: "List files and directories under a local directory. Use only for read-only inspection.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Optional directory path, absolute or relative to cwd. Defaults to cwd." },
+                        "max_depth": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Optional traversal depth. Defaults to 1 and is clamped to 1..=3." },
+                        "max_entries": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Optional maximum entries to return. Defaults to 200 and is clamped to 1..=2000." }
+                    }
+                }),
+            },
+        },
     ]
 }
 
@@ -780,6 +795,7 @@ fn execute_local_tool(
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd),
         "grep" => execute_grep_tool(&tool_call.function.arguments, cwd),
         "glob" => execute_glob_tool(&tool_call.function.arguments, cwd),
+        "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd),
         "suggest_shell_command" => execute_suggest_shell_command_tool(
             &tool_call.function.arguments,
             suggested_shell_commands,
@@ -932,6 +948,13 @@ fn local_tool_result_stats(tool_name: &str, result: &str) -> String {
                 .filter(|line| !line.trim().is_empty())
                 .count();
             format!("{files} files")
+        }
+        "list_directory" => {
+            let entries = result
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            format!("{entries} entries")
         }
         "suggest_shell_command" => "suggested; not executed".to_string(),
         _ => format!("{} chars", result.chars().count()),
@@ -1129,6 +1152,68 @@ fn execute_glob_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<Stri
         "No files matched.".to_string()
     } else {
         results.join("\n")
+    })
+}
+
+fn execute_list_directory_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid list_directory arguments"))?;
+    let path = optional_string_arg(&args, "path").unwrap_or(".");
+    let root = resolve_local_tool_path(path, cwd)?;
+    let metadata = fs::metadata(&root)
+        .map_err(|_| anyhow!("Directory is not readable: {}", root.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!("Path is not a directory: {}", root.display()));
+    }
+
+    let max_depth = optional_usize_arg(&args, "max_depth")
+        .unwrap_or(1)
+        .clamp(1, 3);
+    let max_entries = optional_usize_arg(&args, "max_entries")
+        .unwrap_or(200)
+        .clamp(1, 2000);
+    let skipped_directories = [".git", "node_modules", "target"];
+    let mut entries = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&root)
+        .max_depth(max_depth)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !skipped_directories.iter().any(|name| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|entry_name| entry_name == *name)
+                })
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if !file_type.is_file() && !file_type.is_dir() {
+            continue;
+        }
+        let kind = if file_type.is_dir() { "dir" } else { "file" };
+        let path = entry
+            .path()
+            .strip_prefix(&root)
+            .ok()
+            .unwrap_or_else(|| entry.path());
+        entries.push(format!("{kind}: {}", path.display()));
+        if entries.len() >= max_entries {
+            break;
+        }
+    }
+    entries.sort();
+
+    Ok(if entries.is_empty() {
+        "No entries found.".to_string()
+    } else {
+        entries.join("\n")
     })
 }
 
@@ -1918,11 +2003,11 @@ fn stream_finished_done() -> api::ResponseEvent {
 mod tests {
     use super::{
         chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
-        execute_glob_tool, execute_grep_tool, execute_local_tool, execute_read_file_tool,
-        execute_suggest_shell_command_tool, fallback_tool_results_message, local_read_only_tools,
-        local_tool_display_summary, local_tool_result_stats, local_tool_result_summary,
-        openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
-        EmptyLocalProviderResponseResolution, OpenAIChatRequest, OpenAIChatToolCall,
+        execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
+        execute_read_file_tool, execute_suggest_shell_command_tool, fallback_tool_results_message,
+        local_read_only_tools, local_tool_display_summary, local_tool_result_stats,
+        local_tool_result_summary, openai_message, openai_messages_from_inputs_and_tasks,
+        root_task_id, EmptyLocalProviderResponseResolution, OpenAIChatRequest, OpenAIChatToolCall,
         OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
         LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
         MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
@@ -2115,7 +2200,13 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["read_file", "grep", "glob", "suggest_shell_command"]
+            vec![
+                "read_file",
+                "grep",
+                "glob",
+                "suggest_shell_command",
+                "list_directory"
+            ]
         );
     }
 
@@ -2172,6 +2263,10 @@ mod tests {
         assert!(!super::tool_calls_require_finalize(&[tool_call(
             "read_file",
             r#"{"path":"Cargo.toml"}"#,
+        )]));
+        assert!(!super::tool_calls_require_finalize(&[tool_call(
+            "list_directory",
+            r#"{"path":"."}"#,
         )]));
     }
 
@@ -2416,6 +2511,26 @@ mod tests {
 
         assert!(result.contains("main.rs"));
         assert!(!result.contains("README.md"));
+    }
+
+    #[test]
+    fn list_directory_tool_lists_entries_and_skips_large_dirs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("src")).unwrap();
+        std::fs::write(temp_dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir(temp_dir.path().join("target")).unwrap();
+        std::fs::write(temp_dir.path().join("target/ignored.txt"), "ignored").unwrap();
+
+        let result = execute_list_directory_tool(
+            r#"{"path":".","max_depth":3,"max_entries":2000}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert!(result.contains("dir: src"));
+        assert!(result.contains("file: src/main.rs"));
+        assert!(!result.contains("target"));
+        assert!(!result.contains("ignored.txt"));
     }
 
     #[test]
