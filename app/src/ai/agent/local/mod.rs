@@ -1,3 +1,5 @@
+mod tool_card;
+
 use std::{
     collections::HashSet,
     fmt, fs,
@@ -16,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
+
+use self::tool_card::structured_tool_card_events;
 
 use crate::{
     ai::agent::{
@@ -146,7 +150,6 @@ const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
 const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
 const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
-const MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS: usize = 1024;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. You may inspect files with read-only tools. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
@@ -386,12 +389,23 @@ pub fn generate_openai_compatible_output(
             for (tool_call, result) in tool_results {
                 log_local_tool_result(&tool_call, &result);
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
-                yield Ok(append_agent_output_message_content(
+                if tool_call.function.name == "suggest_shell_command" {
+                    yield Ok(append_agent_output_message_content(
+                        &task_id,
+                        &request_id,
+                        &message_id,
+                        local_shell_command_display_summary(&tool_call.function.arguments, &result),
+                    ));
+                } else if let Some(events) = structured_tool_card_events(
                     &task_id,
                     &request_id,
-                    &message_id,
-                    local_tool_display_summary(&tool_call, &result),
-                ));
+                    &tool_call,
+                    &result,
+                ) {
+                    for event in events {
+                        yield Ok(event);
+                    }
+                }
                 messages.push(openai_tool_message(tool_call.id, result));
             }
 
@@ -891,32 +905,11 @@ fn local_tool_result_summary(tool_call: &OpenAIChatToolCall, result: &str) -> St
     )
 }
 
-fn local_tool_display_summary(tool_call: &OpenAIChatToolCall, result: &str) -> String {
-    if tool_call.function.name == "suggest_shell_command" {
-        return local_shell_command_display_summary(&tool_call.function.arguments, result);
-    }
-
-    let arguments = truncate_message_content_from_start(
-        &tool_call.function.arguments,
-        MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
-    );
-    let preview =
-        truncate_message_content_from_start(result, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS);
-    let stats = local_tool_result_stats(&tool_call.function.name, result);
-    format!(
-        "\n\n> Local tool: {}\n> Arguments: `{}`\n> Result: {}\n> Preview:\n> ```\n{}\n> ```\n\n",
-        tool_call.function.name,
-        escape_markdown_inline_code(&arguments),
-        stats,
-        quote_markdown_preview(&preview)
-    )
-}
-
 fn local_shell_command_display_summary(arguments: &str, result: &str) -> String {
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
         return format!(
             "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
-            local_tool_result_stats("suggest_shell_command", result)
+            shell_command_result_summary(result)
         );
     };
     let command = args
@@ -937,7 +930,7 @@ fn local_shell_command_display_summary(arguments: &str, result: &str) -> String 
     if command.is_empty() || result.starts_with("Tool error:") {
         return format!(
             "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
-            local_tool_result_stats("suggest_shell_command", result)
+            shell_command_result_summary(result)
         );
     }
 
@@ -947,53 +940,11 @@ fn local_shell_command_display_summary(arguments: &str, result: &str) -> String 
     )
 }
 
-fn local_tool_result_stats(tool_name: &str, result: &str) -> String {
+fn shell_command_result_summary(result: &str) -> String {
     if let Some(error) = result.strip_prefix("Tool error:") {
         return format!("error: {}", error.trim());
     }
-
-    match tool_name {
-        "read_file" => {
-            let line_count = result.lines().count().saturating_sub(1);
-            format!("read {line_count} lines / {} chars", result.chars().count())
-        }
-        "grep" => {
-            let matches = result
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            let file_count = result
-                .lines()
-                .filter_map(|line| line.split_once(':').map(|(file, _)| file))
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            format!("{matches} matches / {file_count} files")
-        }
-        "glob" => {
-            let files = result
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            format!("{files} files")
-        }
-        "list_directory" => {
-            let entries = result
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            format!("{entries} entries")
-        }
-        "suggest_shell_command" => "suggested; not executed".to_string(),
-        _ => format!("{} chars", result.chars().count()),
-    }
-}
-
-fn escape_markdown_inline_code(text: &str) -> String {
-    text.replace('`', "\\`")
-}
-
-fn quote_markdown_preview(text: &str) -> String {
-    text.lines().collect::<Vec<_>>().join("\n> ")
+    "suggested; not executed".to_string()
 }
 
 fn fallback_tool_results_message(tool_result_summaries: &[String]) -> Option<String> {
@@ -2032,14 +1983,14 @@ mod tests {
         chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
         execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
         execute_read_file_tool, execute_suggest_shell_command_tool, fallback_tool_results_message,
-        local_read_only_tools, local_tool_display_summary, local_tool_result_stats,
-        local_tool_result_summary, openai_message, openai_messages_from_inputs_and_tasks,
-        root_task_id, EmptyLocalProviderResponseResolution, OpenAIChatRequest, OpenAIChatToolCall,
-        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
-        LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
-        MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
-        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
+        local_read_only_tools, local_tool_result_summary, openai_message,
+        openai_messages_from_inputs_and_tasks, root_task_id, EmptyLocalProviderResponseResolution,
+        OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
+        OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
+        MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
+        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
     };
+    use crate::ai::agent::local::tool_card::test_tool_card_events;
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
     use std::{
@@ -2425,66 +2376,132 @@ mod tests {
     }
 
     #[test]
-    fn local_tool_display_summary_formats_read_file_stats_and_preview() {
-        let tool_call = tool_call("read_file", "{\"path\":\"Cargo.toml\"}");
-        let result = "File: Cargo.toml\n1: [workspace]\n2: members = []";
-
-        let summary = local_tool_display_summary(&tool_call, result);
-
-        assert!(summary.contains("> Local tool: read_file"));
-        assert!(summary.contains("Arguments: `{"));
-        assert!(summary.contains("read 2 lines"));
-        assert!(summary.contains("1: [workspace]"));
-    }
-
-    #[test]
-    fn local_tool_display_summary_formats_shell_command_suggestion() {
+    fn execute_grep_tool_emits_tool_call_and_result_messages() {
         let tool_call = tool_call(
-            "suggest_shell_command",
-            "{\"command\":\"git status\",\"rationale\":\"inspect repo\",\"is_read_only\":true,\"is_risky\":false,\"expected_output\":\"status\"}",
+            "grep",
+            r#"{"query":"alpha","path":"src","case_sensitive":true}"#,
         );
+        let result = "/repo/src/a.rs:3: alpha\n/repo/src/a.rs:7: alpha";
 
-        let summary = local_tool_display_summary(
-            &tool_call,
-            "Shell command was suggested to the user but was not executed.",
-        );
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
 
-        assert!(summary.contains("> Local tool: suggest_shell_command"));
-        assert!(summary.contains("```bash\ngit status\n```"));
-        assert!(summary.contains("Rationale: inspect repo"));
-        assert!(summary.contains("Run this manually"));
+        assert_eq!(events.len(), 2);
+        let api::response_event::Type::ClientActions(actions) = events[0].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCall(tool_call_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call message");
+        };
+        assert_eq!(tool_call_message.tool_call_id, "call_1");
+        let Some(api::message::tool_call::Tool::Grep(grep)) = tool_call_message.tool.as_ref()
+        else {
+            panic!("expected grep tool call");
+        };
+        assert_eq!(grep.queries, vec!["alpha"]);
+        assert_eq!(grep.path, "src");
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        assert_eq!(result_message.tool_call_id, "call_1");
+        let Some(api::message::tool_call_result::Result::Grep(grep_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected grep result");
+        };
+        let Some(api::grep_result::Result::Success(success)) = grep_result.result.as_ref() else {
+            panic!("expected grep success");
+        };
+        assert_eq!(success.matched_files.len(), 1);
+        assert_eq!(success.matched_files[0].file_path, "/repo/src/a.rs");
+        assert_eq!(success.matched_files[0].matched_lines.len(), 2);
+        assert_eq!(success.matched_files[0].matched_lines[0].line_number, 3);
     }
 
     #[test]
-    fn local_tool_result_stats_formats_grep_and_glob_counts() {
-        assert_eq!(
-            local_tool_result_stats("grep", "src/a.rs:1: alpha\nsrc/b.rs:2: alpha"),
-            "2 matches / 2 files"
-        );
-        assert_eq!(
-            local_tool_result_stats("glob", "src/a.rs\nsrc/b.rs\n"),
-            "2 files"
-        );
+    fn execute_read_file_tool_emits_text_files_success() {
+        let tool_call = tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        let result = "File: /repo/Cargo.toml\n1: [workspace]";
+
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        let Some(api::message::tool_call_result::Result::ReadFiles(read_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected read files result");
+        };
+        let Some(api::read_files_result::Result::TextFilesSuccess(success)) =
+            read_result.result.as_ref()
+        else {
+            panic!("expected text files success");
+        };
+        assert_eq!(success.files[0].file_path, "/repo/Cargo.toml");
+        assert_eq!(success.files[0].content, "1: [workspace]");
     }
 
     #[test]
-    fn local_tool_display_summary_formats_errors() {
-        let tool_call = tool_call("read_file", "{\"path\":\"missing\"}");
+    fn execute_grep_tool_emits_error_on_invalid_regex() {
+        let tool_call = tool_call("grep", r#"{"query":"["}"#);
+        let result = "Tool error: Invalid grep arguments";
 
-        let summary = local_tool_display_summary(&tool_call, "Tool error: File is not readable");
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
 
-        assert!(summary.contains("Result: error: File is not readable"));
-    }
-
-    #[test]
-    fn local_tool_display_summary_truncates_preview() {
-        let tool_call = tool_call("grep", "{\"query\":\"alpha\"}");
-        let result = "x".repeat(MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 100);
-
-        let summary = local_tool_display_summary(&tool_call, &result);
-
-        assert!(summary.contains("> Local tool: grep"));
-        assert!(summary.chars().count() < MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 300);
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        let Some(api::message::tool_call_result::Result::Grep(grep_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected grep result");
+        };
+        let Some(api::grep_result::Result::Error(error)) = grep_result.result.as_ref() else {
+            panic!("expected grep error");
+        };
+        assert_eq!(error.message, "Invalid grep arguments");
     }
 
     #[test]
