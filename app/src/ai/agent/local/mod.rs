@@ -1,4 +1,11 @@
-use std::{fmt, fs, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt, fs,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use async_stream::stream;
@@ -6,6 +13,7 @@ use chrono::Local;
 use futures_lite::Stream;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
@@ -38,12 +46,52 @@ struct OpenAIChatRequest {
     model: String,
     messages: Vec<OpenAIChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OpenAIChatTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestMode {
+    ToolUse,
+    Finalize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct OpenAIChatMessage {
     role: &'static str,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAIChatToolCall>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatToolCall {
+    id: String,
+    r#type: &'static str,
+    function: OpenAIChatToolCallFunction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatTool {
+    r#type: &'static str,
+    function: OpenAIChatToolFunction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatToolFunction {
+    name: &'static str,
+    description: &'static str,
+    parameters: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,11 +107,27 @@ struct OpenAIStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamDelta {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct OpenAIStreamToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    r#type: Option<String>,
+    function: Option<OpenAIStreamToolCallFunctionDelta>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct OpenAIStreamToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum OpenAIStreamEvent {
     Delta(String),
+    ToolCallDelta(OpenAIStreamToolCallDelta),
     Done,
 }
 
@@ -72,8 +136,15 @@ const MAX_LOCAL_DIRECT_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOCAL_DIRECT_HISTORY_MESSAGES: usize = 20;
 const MAX_LOCAL_DIRECT_MESSAGE_CHARS: usize = 32 * 1024;
 const MAX_LOCAL_DIRECT_FILE_ATTACHMENT_BYTES: u64 = 256 * 1024;
-const LOCAL_DIRECT_SYSTEM_PROMPT: &str =
-    "You are a helpful local coding assistant running inside Warp.";
+const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 5;
+const MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS: usize = 512 * 1024;
+const MAX_LOCAL_DIRECT_TOOL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
+const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
+const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
+const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
+const MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS: usize = 1024;
+const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. You may inspect files with read-only tools. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
@@ -105,84 +176,256 @@ pub fn generate_openai_compatible_output(
             String::new(),
         ));
 
-        match request_openai_compatible_completion(&config, &input, &tasks).await {
-            Ok(response) => {
-                let mut body = response.bytes_stream();
-                let mut pending = String::new();
-                let mut bytes_read = 0u64;
-                let mut received_token = false;
-                let mut stream_done = false;
+        let mut messages = match openai_messages_from_inputs_and_tasks(&input, &tasks) {
+            Ok(messages) => messages,
+            Err(error) => {
+                yield Err(Arc::new(AIApiError::Other(error)));
+                return;
+            }
+        };
+        let cwd = local_tool_cwd(&input);
+        let mut received_token = false;
+        let mut tool_result_summaries = Vec::new();
+        let mut suggested_shell_commands = HashSet::new();
 
-                while let Some(chunk) = body.next().await {
-                    let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            yield Err(Arc::new(AIApiError::Other(error)));
-                            return;
+        for round in 0..MAX_LOCAL_DIRECT_TOOL_ROUNDS {
+            log::debug!("Starting local direct tool loop round {}", round + 1);
+            let response = match request_openai_compatible_completion(
+                &config,
+                messages.clone(),
+                RequestMode::ToolUse,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Err(Arc::new(AIApiError::Other(error)));
+                    return;
+                }
+            };
+
+            let mut body = response.bytes_stream();
+            let mut pending = String::new();
+            let mut bytes_read = 0u64;
+            let mut stream_done = false;
+            let mut tool_call_accumulator = OpenAIToolCallAccumulator::default();
+
+            while let Some(chunk) = body.next().await {
+                let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        yield Err(Arc::new(AIApiError::Other(error)));
+                        return;
+                    }
+                };
+
+                for event in events {
+                    match event {
+                        OpenAIStreamEvent::Delta(token) => {
+                            received_token = true;
+                            yield Ok(append_agent_output_message_content(
+                                &task_id,
+                                &request_id,
+                                &message_id,
+                                token,
+                            ));
                         }
-                    };
-
-                    for event in events {
-                        match event {
-                            OpenAIStreamEvent::Delta(token) => {
-                                received_token = true;
-                                yield Ok(append_agent_output_message_content(
-                                    &task_id,
-                                    &request_id,
-                                    &message_id,
-                                    token,
-                                ));
-                            }
-                            OpenAIStreamEvent::Done => {
-                                stream_done = true;
-                                break;
-                            }
+                        OpenAIStreamEvent::ToolCallDelta(delta) => {
+                            tool_call_accumulator.push(delta);
+                        }
+                        OpenAIStreamEvent::Done => {
+                            stream_done = true;
+                            break;
                         }
                     }
+                }
 
-                    if stream_done {
+                if stream_done {
+                    break;
+                }
+            }
+
+            if !stream_done && !pending.is_empty() {
+                pending.push('\n');
+                let events = match drain_sse_events(&mut pending) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        yield Err(Arc::new(AIApiError::Other(error)));
+                        return;
+                    }
+                };
+                for event in events {
+                    match event {
+                        OpenAIStreamEvent::Delta(token) => {
+                            received_token = true;
+                            yield Ok(append_agent_output_message_content(
+                                &task_id,
+                                &request_id,
+                                &message_id,
+                                token,
+                            ));
+                        }
+                        OpenAIStreamEvent::ToolCallDelta(delta) => {
+                            tool_call_accumulator.push(delta);
+                        }
+                        OpenAIStreamEvent::Done => break,
+                    }
+                }
+            }
+
+            let tool_calls = tool_call_accumulator.into_tool_calls();
+            if tool_calls.is_empty() {
+                match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
+                    EmptyLocalProviderResponseResolution::Finish => {
+                        yield Ok(stream_finished_done());
+                        return;
+                    }
+                    EmptyLocalProviderResponseResolution::Fallback(fallback) => {
+                        log::info!(
+                            "Local direct provider returned empty final answer after tool results; emitting fallback summary"
+                        );
+                        yield Ok(append_agent_output_message_content(
+                            &task_id,
+                            &request_id,
+                            &message_id,
+                            fallback,
+                        ));
+                        yield Ok(stream_finished_done());
+                        return;
+                    }
+                    EmptyLocalProviderResponseResolution::Error => {
+                        yield Err(Arc::new(AIApiError::Other(anyhow!(
+                            "Local direct provider returned an empty response"
+                        ))));
+                        return;
+                    }
+                }
+            }
+
+            messages.push(openai_assistant_tool_call_message(tool_calls.clone()));
+            let should_finalize = tool_calls_require_finalize(&tool_calls);
+
+            for tool_call in tool_calls {
+                let result = execute_local_tool(&tool_call, cwd.as_deref(), &mut suggested_shell_commands);
+                log_local_tool_result(&tool_call, &result);
+                tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
+                yield Ok(append_agent_output_message_content(
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    local_tool_display_summary(&tool_call, &result),
+                ));
+                messages.push(openai_tool_message(tool_call.id, result));
+            }
+
+            if should_finalize {
+                break;
+            }
+        }
+
+        let response = match request_openai_compatible_completion(
+            &config,
+            messages,
+            RequestMode::Finalize,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                yield Err(Arc::new(AIApiError::Other(error)));
+                return;
+            }
+        };
+
+        let mut body = response.bytes_stream();
+        let mut pending = String::new();
+        let mut bytes_read = 0u64;
+        let mut stream_done = false;
+        let mut finalize_received_token = false;
+
+        while let Some(chunk) = body.next().await {
+            let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
+                Ok(events) => events,
+                Err(error) => {
+                    yield Err(Arc::new(AIApiError::Other(error)));
+                    return;
+                }
+            };
+
+            for event in events {
+                match event {
+                    OpenAIStreamEvent::Delta(token) => {
+                        finalize_received_token = true;
+                        yield Ok(append_agent_output_message_content(
+                            &task_id,
+                            &request_id,
+                            &message_id,
+                            token,
+                        ));
+                    }
+                    OpenAIStreamEvent::ToolCallDelta(_) => {}
+                    OpenAIStreamEvent::Done => {
+                        stream_done = true;
                         break;
                     }
                 }
-
-                if !stream_done && !pending.is_empty() {
-                    pending.push('\n');
-                    let events = match drain_sse_events(&mut pending) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            yield Err(Arc::new(AIApiError::Other(error)));
-                            return;
-                        }
-                    };
-                    for event in events {
-                        match event {
-                            OpenAIStreamEvent::Delta(token) => {
-                                received_token = true;
-                                yield Ok(append_agent_output_message_content(
-                                    &task_id,
-                                    &request_id,
-                                    &message_id,
-                                    token,
-                                ));
-                            }
-                            OpenAIStreamEvent::Done => break,
-                        }
-                    }
-                }
-
-                if !received_token {
-                    yield Err(Arc::new(AIApiError::Other(anyhow!(
-                        "Local direct provider returned an empty response"
-                    ))));
-                    return;
-                }
-
-                yield Ok(stream_finished_done());
             }
-            Err(error) => {
-                yield Err(Arc::new(AIApiError::Other(error)));
+
+            if stream_done {
+                break;
             }
         }
+
+        if !stream_done && !pending.is_empty() {
+            pending.push('\n');
+            let events = match drain_sse_events(&mut pending) {
+                Ok(events) => events,
+                Err(error) => {
+                    yield Err(Arc::new(AIApiError::Other(error)));
+                    return;
+                }
+            };
+            for event in events {
+                match event {
+                    OpenAIStreamEvent::Delta(token) => {
+                        finalize_received_token = true;
+                        yield Ok(append_agent_output_message_content(
+                            &task_id,
+                            &request_id,
+                            &message_id,
+                            token,
+                        ));
+                    }
+                    OpenAIStreamEvent::ToolCallDelta(_) => {}
+                    OpenAIStreamEvent::Done => break,
+                }
+            }
+        }
+
+        if finalize_received_token {
+            yield Ok(stream_finished_done());
+            return;
+        }
+
+        match fallback_tool_results_message(&tool_result_summaries) {
+            Some(fallback) => {
+                yield Ok(append_agent_output_message_content(
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    fallback,
+                ));
+            }
+            None => {
+                yield Ok(append_agent_output_message_content(
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    "I suggested commands but did not run anything; tell me what to do next.".to_string(),
+                ));
+            }
+        }
+        yield Ok(stream_finished_done());
     })
 }
 
@@ -196,13 +439,21 @@ fn root_task_id(tasks: &[api::Task]) -> Option<String> {
 
 async fn request_openai_compatible_completion(
     config: &LocalDirectConfig,
-    input: &[AIAgentInput],
-    tasks: &[api::Task],
+    messages: Vec<OpenAIChatMessage>,
+    mode: RequestMode,
 ) -> anyhow::Result<reqwest::Response> {
     let request = OpenAIChatRequest {
         model: config.model.clone(),
-        messages: openai_messages_from_inputs_and_tasks(input, tasks)?,
+        messages,
         stream: true,
+        tools: match mode {
+            RequestMode::ToolUse => local_read_only_tools(),
+            RequestMode::Finalize => Vec::new(),
+        },
+        tool_choice: match mode {
+            RequestMode::ToolUse => None,
+            RequestMode::Finalize => Some("none"),
+        },
     };
 
     let endpoint = chat_completions_url(&config.base_url);
@@ -227,14 +478,17 @@ async fn request_openai_compatible_completion(
     Ok(response)
 }
 
+fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
+    tool_calls
+        .iter()
+        .any(|call| call.function.name == "suggest_shell_command")
+}
+
 fn openai_messages_from_inputs_and_tasks(
     input: &[AIAgentInput],
     tasks: &[api::Task],
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
-    let mut messages = vec![OpenAIChatMessage {
-        role: "system",
-        content: LOCAL_DIRECT_SYSTEM_PROMPT.to_string(),
-    }];
+    let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
 
     append_history_messages(&mut messages, tasks);
 
@@ -256,15 +510,656 @@ fn openai_messages_from_inputs_and_tasks(
         .last()
         .is_none_or(|message| message.role != "user" || message.content != user_query)
     {
-        messages.push(OpenAIChatMessage {
-            role: "user",
-            content: user_query,
-        });
+        messages.push(openai_message("user", user_query));
     }
 
     truncate_messages_to_char_budget(&mut messages, MAX_LOCAL_DIRECT_MESSAGE_CHARS);
 
     Ok(messages)
+}
+
+fn openai_message(role: &'static str, content: impl Into<String>) -> OpenAIChatMessage {
+    OpenAIChatMessage {
+        role,
+        content: content.into(),
+        tool_call_id: None,
+        tool_calls: None,
+    }
+}
+
+fn openai_tool_message(tool_call_id: String, content: String) -> OpenAIChatMessage {
+    OpenAIChatMessage {
+        role: "tool",
+        content,
+        tool_call_id: Some(tool_call_id),
+        tool_calls: None,
+    }
+}
+
+fn openai_assistant_tool_call_message(tool_calls: Vec<OpenAIChatToolCall>) -> OpenAIChatMessage {
+    OpenAIChatMessage {
+        role: "assistant",
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: Some(tool_calls),
+    }
+}
+
+#[derive(Default)]
+struct OpenAIToolCallAccumulator {
+    calls: Vec<OpenAIToolCallBuilder>,
+}
+
+#[derive(Default)]
+struct OpenAIToolCallBuilder {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl OpenAIToolCallAccumulator {
+    fn push(&mut self, delta: OpenAIStreamToolCallDelta) {
+        while self.calls.len() <= delta.index {
+            self.calls.push(OpenAIToolCallBuilder::default());
+        }
+        let call = &mut self.calls[delta.index];
+        if let Some(id) = delta.id {
+            call.id = Some(id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                call.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                call.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    fn into_tool_calls(self) -> Vec<OpenAIChatToolCall> {
+        self.calls
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                if call.name.is_empty() {
+                    return None;
+                }
+                Some(OpenAIChatToolCall {
+                    id: call
+                        .id
+                        .unwrap_or_else(|| format!("local_tool_call_{index}")),
+                    r#type: "function",
+                    function: OpenAIChatToolCallFunction {
+                        name: call.name,
+                        arguments: call.arguments,
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
+fn local_read_only_tools() -> Vec<OpenAIChatTool> {
+    vec![
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "read_file",
+                description: "Read a UTF-8 text file from the local filesystem. Use only for read-only inspection.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path, or path relative to the current terminal cwd." },
+                        "start_line": { "type": "integer", "minimum": 1, "description": "Optional 1-based first line to include." },
+                        "end_line": { "type": "integer", "minimum": 1, "description": "Optional 1-based last line to include." }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "grep",
+                description: "Search UTF-8 text files under a file or directory. Returns bounded matching lines.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Literal text to search for." },
+                        "path": { "type": "string", "description": "Optional file or directory path, absolute or relative to cwd. Defaults to cwd." },
+                        "case_sensitive": { "type": "boolean", "description": "Whether matching should be case-sensitive. Defaults to false." }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "glob",
+                description: "List files under a directory whose path contains or wildcard-matches a simple pattern.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Simple file pattern. Supports '*' and '?' wildcards, or literal substring matching." },
+                        "path": { "type": "string", "description": "Optional directory path, absolute or relative to cwd. Defaults to cwd." }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        },
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "suggest_shell_command",
+                description: "Suggest a shell command for the user to run manually. The command is not executed automatically.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The shell command to suggest to the user." },
+                        "rationale": { "type": "string", "description": "Why this command would help." },
+                        "is_read_only": { "type": "boolean", "description": "Whether the command is expected to be read-only." },
+                        "is_risky": { "type": "boolean", "description": "Whether the command may be risky or have side effects." },
+                        "expected_output": { "type": "string", "description": "What output would be useful to continue." }
+                    },
+                    "required": ["command"]
+                }),
+            },
+        },
+    ]
+}
+
+fn execute_local_tool(
+    tool_call: &OpenAIChatToolCall,
+    cwd: Option<&Path>,
+    suggested_shell_commands: &mut HashSet<String>,
+) -> String {
+    let result = match tool_call.function.name.as_str() {
+        "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd),
+        "grep" => execute_grep_tool(&tool_call.function.arguments, cwd),
+        "glob" => execute_glob_tool(&tool_call.function.arguments, cwd),
+        "suggest_shell_command" => execute_suggest_shell_command_tool(
+            &tool_call.function.arguments,
+            suggested_shell_commands,
+        ),
+        name => Err(anyhow!("Unknown local tool: {name}")),
+    };
+
+    let text = match result {
+        Ok(text) => text,
+        Err(error) => format!("Tool error: {error}"),
+    };
+    truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyLocalProviderResponseResolution {
+    Finish,
+    Fallback(String),
+    Error,
+}
+
+fn empty_local_provider_response_resolution(
+    received_token: bool,
+    tool_result_summaries: &[String],
+) -> EmptyLocalProviderResponseResolution {
+    if received_token {
+        return EmptyLocalProviderResponseResolution::Finish;
+    }
+    fallback_tool_results_message(tool_result_summaries)
+        .map(EmptyLocalProviderResponseResolution::Fallback)
+        .unwrap_or(EmptyLocalProviderResponseResolution::Error)
+}
+
+fn log_local_tool_result(tool_call: &OpenAIChatToolCall, result: &str) {
+    log::debug!(
+        "Local direct read-only tool completed: name={}, result_chars={}",
+        tool_call.function.name,
+        result.chars().count()
+    );
+}
+
+fn truncate_message_content_from_start(content: &str, max_chars: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return content.to_string();
+    }
+
+    let end_index = content
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len());
+    content[..end_index].to_string()
+}
+
+fn local_tool_result_summary(tool_call: &OpenAIChatToolCall, result: &str) -> String {
+    let arguments = truncate_message_content_from_start(
+        &tool_call.function.arguments,
+        MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
+    );
+    let result =
+        truncate_message_content_from_start(result, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS);
+    format!(
+        "Tool: {}\nArguments:\n{}\nResult:\n{}",
+        tool_call.function.name, arguments, result
+    )
+}
+
+fn local_tool_display_summary(tool_call: &OpenAIChatToolCall, result: &str) -> String {
+    if tool_call.function.name == "suggest_shell_command" {
+        return local_shell_command_display_summary(&tool_call.function.arguments, result);
+    }
+
+    let arguments = truncate_message_content_from_start(
+        &tool_call.function.arguments,
+        MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
+    );
+    let preview =
+        truncate_message_content_from_start(result, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS);
+    let stats = local_tool_result_stats(&tool_call.function.name, result);
+    format!(
+        "\n\n> Local tool: {}\n> Arguments: `{}`\n> Result: {}\n> Preview:\n> ```\n{}\n> ```\n\n",
+        tool_call.function.name,
+        escape_markdown_inline_code(&arguments),
+        stats,
+        quote_markdown_preview(&preview)
+    )
+}
+
+fn local_shell_command_display_summary(arguments: &str, result: &str) -> String {
+    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+        return format!(
+            "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
+            local_tool_result_stats("suggest_shell_command", result)
+        );
+    };
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let rationale = optional_string_arg(&args, "rationale").unwrap_or("No rationale provided.");
+    let expected_output = optional_string_arg(&args, "expected_output")
+        .unwrap_or("Run this manually if you want me to use its output.");
+    let is_read_only = optional_bool_arg(&args, "is_read_only")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_risky = optional_bool_arg(&args, "is_risky")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if command.is_empty() || result.starts_with("Tool error:") {
+        return format!(
+            "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
+            local_tool_result_stats("suggest_shell_command", result)
+        );
+    }
+
+    format!(
+        "\n\n> Local tool: suggest_shell_command\n> Rationale: {}\n> Read-only: {} | Risky: {}\n> Command:\n```bash\n{}\n```\n> Expected output: {}\n> Run this manually if you want me to use its output.\n\n",
+        rationale, is_read_only, is_risky, command, expected_output
+    )
+}
+
+fn local_tool_result_stats(tool_name: &str, result: &str) -> String {
+    if let Some(error) = result.strip_prefix("Tool error:") {
+        return format!("error: {}", error.trim());
+    }
+
+    match tool_name {
+        "read_file" => {
+            let line_count = result.lines().count().saturating_sub(1);
+            format!("read {line_count} lines / {} chars", result.chars().count())
+        }
+        "grep" => {
+            let matches = result
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            let file_count = result
+                .lines()
+                .filter_map(|line| line.split_once(':').map(|(file, _)| file))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            format!("{matches} matches / {file_count} files")
+        }
+        "glob" => {
+            let files = result
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            format!("{files} files")
+        }
+        "suggest_shell_command" => "suggested; not executed".to_string(),
+        _ => format!("{} chars", result.chars().count()),
+    }
+}
+
+fn escape_markdown_inline_code(text: &str) -> String {
+    text.replace('`', "\\`")
+}
+
+fn quote_markdown_preview(text: &str) -> String {
+    text.lines().collect::<Vec<_>>().join("\n> ")
+}
+
+fn fallback_tool_results_message(tool_result_summaries: &[String]) -> Option<String> {
+    if tool_result_summaries.is_empty() {
+        return None;
+    }
+
+    let mut message = String::from(
+        "The local provider returned no final answer after the read-only tool results. Here are the tool results I was able to collect:\n\n",
+    );
+    for summary in tool_result_summaries.iter().rev() {
+        let next = if message.ends_with("\n\n") {
+            summary.clone()
+        } else {
+            format!("\n\n{summary}")
+        };
+        if message.chars().count() + next.chars().count() > MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS {
+            let remaining =
+                MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS.saturating_sub(message.chars().count());
+            if remaining > 0 {
+                message.push_str(&truncate_message_content_from_start(&next, remaining));
+            }
+            break;
+        }
+        message.push_str(&next);
+    }
+    Some(message)
+}
+
+fn execute_suggest_shell_command_tool(
+    arguments: &str,
+    suggested_shell_commands: &mut HashSet<String>,
+) -> anyhow::Result<String> {
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|_| anyhow!("Invalid suggest_shell_command arguments"))?;
+    let command = required_string_arg(&args, "command")?.trim();
+    if command.is_empty() {
+        return Err(anyhow!("command cannot be empty"));
+    }
+    if !suggested_shell_commands.insert(command.to_string()) {
+        return Ok(format!(
+            "Shell command suggestion was already delivered earlier in this turn. The command was NOT executed and is not repeated. Stop calling tools and reply with a short final summary.\nCommand: {command}"
+        ));
+    }
+
+    let rationale = optional_string_arg(&args, "rationale").unwrap_or("No rationale provided.");
+    let expected_output = optional_string_arg(&args, "expected_output")
+        .unwrap_or("If output is needed, ask the user to run the command and provide it.");
+    let is_read_only = optional_bool_arg(&args, "is_read_only")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_risky = optional_bool_arg(&args, "is_risky")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(format!(
+        "Shell command suggestion was delivered to the user. The command was NOT executed.\nStop calling tools now. Reply with a short, natural-language final answer summarizing what you suggested and why; ask the user to run it and share the output if you need it to continue.\n\nCommand:\n```bash\n{command}\n```\nRationale: {rationale}\nRead-only: {is_read_only}\nRisky: {is_risky}\nExpected output: {expected_output}"
+    ))
+}
+
+fn execute_read_file_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid read_file arguments"))?;
+    let path = required_string_arg(&args, "path")?;
+    let path = resolve_local_tool_path(path, cwd)?;
+    let metadata =
+        fs::metadata(&path).map_err(|_| anyhow!("File is not readable: {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("Path is not a file: {}", path.display()));
+    }
+    if metadata.len() > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+        return Err(anyhow!("File is too large to read: {}", path.display()));
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|_| anyhow!("File is not valid UTF-8: {}", path.display()))?;
+    let start_line = optional_usize_arg(&args, "start_line").unwrap_or(1).max(1);
+    let end_line = optional_usize_arg(&args, "end_line").unwrap_or(usize::MAX);
+    if end_line < start_line {
+        return Err(anyhow!(
+            "end_line must be greater than or equal to start_line"
+        ));
+    }
+
+    let selected = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            (line_number >= start_line && line_number <= end_line)
+                .then(|| format!("{line_number}: {line}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(format!("File: {}\n{}", path.display(), selected))
+}
+
+fn execute_grep_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid grep arguments"))?;
+    let query = required_string_arg(&args, "query")?;
+    if query.is_empty() {
+        return Err(anyhow!("query cannot be empty"));
+    }
+    let path = optional_string_arg(&args, "path").unwrap_or(".");
+    let path = resolve_local_tool_path(path, cwd)?;
+    let case_sensitive = args
+        .get("case_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    let mut results = Vec::new();
+
+    for file in local_tool_files(&path)? {
+        if results.len() >= MAX_LOCAL_DIRECT_TOOL_SCAN_FILES {
+            break;
+        }
+        let Ok(metadata) = fs::metadata(&file) else {
+            continue;
+        };
+        if metadata.len() > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for (index, line) in content.lines().enumerate() {
+            let haystack = if case_sensitive {
+                line.to_string()
+            } else {
+                line.to_lowercase()
+            };
+            if haystack.contains(&needle) {
+                results.push(format!("{}:{}: {}", file.display(), index + 1, line));
+                if results.len() >= MAX_LOCAL_DIRECT_TOOL_RESULTS {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(if results.is_empty() {
+        "No matches found.".to_string()
+    } else {
+        results.join("\n")
+    })
+}
+
+fn execute_glob_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid glob arguments"))?;
+    let pattern = required_string_arg(&args, "pattern")?;
+    if pattern.is_empty() {
+        return Err(anyhow!("pattern cannot be empty"));
+    }
+    let path = optional_string_arg(&args, "path").unwrap_or(".");
+    let root = resolve_local_tool_path(path, cwd)?;
+    let mut results = Vec::new();
+
+    for file in local_tool_files(&root)? {
+        let candidate = file.to_string_lossy();
+        let relative = file
+            .strip_prefix(&root)
+            .ok()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| file.clone());
+        let relative = relative.to_string_lossy();
+        if simple_pattern_matches(pattern, &candidate) || simple_pattern_matches(pattern, &relative)
+        {
+            results.push(file.display().to_string());
+            if results.len() >= MAX_LOCAL_DIRECT_TOOL_RESULTS {
+                break;
+            }
+        }
+    }
+
+    Ok(if results.is_empty() {
+        "No files matched.".to_string()
+    } else {
+        results.join("\n")
+    })
+}
+
+fn local_tool_cwd(input: &[AIAgentInput]) -> Option<PathBuf> {
+    input
+        .iter()
+        .filter_map(AIAgentInput::context)
+        .flatten()
+        .find_map(|context| match context {
+            AIAgentContext::Directory { pwd: Some(pwd), .. } if !pwd.is_empty() => {
+                Some(PathBuf::from(pwd))
+            }
+            _ => None,
+        })
+}
+
+fn resolve_local_tool_path(path: &str, cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(path);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        let cwd =
+            cwd.ok_or_else(|| anyhow!("Relative paths require a current working directory"))?;
+        cwd.join(path)
+    };
+    Ok(resolved.canonicalize().unwrap_or(resolved))
+}
+
+fn local_tool_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let metadata =
+        fs::metadata(path).map_err(|_| anyhow!("Path is not readable: {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "Path is neither a file nor a directory: {}",
+            path.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_local_tool_files(path, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_local_tool_files(path: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if files.len() >= MAX_LOCAL_DIRECT_TOOL_SCAN_FILES {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(path).map_err(|_| anyhow!("Directory is not readable: {}", path.display()))?;
+    for entry in entries {
+        if files.len() >= MAX_LOCAL_DIRECT_TOOL_SCAN_FILES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_local_tool_files(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn required_string_arg<'a>(args: &'a Value, name: &str) -> anyhow::Result<&'a str> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Missing or invalid {name} argument"))
+}
+
+fn optional_string_arg<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_bool_arg(args: &Value, name: &str) -> Option<bool> {
+    args.get(name).and_then(Value::as_bool)
+}
+
+fn optional_usize_arg(args: &Value, name: &str) -> Option<usize> {
+    args.get(name)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
+fn simple_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    if pattern.contains('*') || pattern.contains('?') {
+        wildcard_matches(pattern.as_bytes(), candidate.as_bytes())
+    } else {
+        candidate.contains(pattern)
+    }
+}
+
+fn wildcard_matches(pattern: &[u8], candidate: &[u8]) -> bool {
+    let (mut pattern_index, mut candidate_index) = (0, 0);
+    let (mut star_index, mut match_index) = (None, 0);
+
+    while candidate_index < candidate.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?'
+                || pattern[pattern_index] == candidate[candidate_index])
+        {
+            pattern_index += 1;
+            candidate_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            match_index = candidate_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            match_index += 1;
+            candidate_index = match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::Task]) {
@@ -282,16 +1177,16 @@ fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::
     for message in history {
         match &message.message {
             Some(api::message::Message::UserQuery(query)) if !query.query.is_empty() => {
-                messages.push(OpenAIChatMessage {
-                    role: "user",
-                    content: truncate_message_content(&query.query, MAX_LOCAL_DIRECT_MESSAGE_CHARS),
-                });
+                messages.push(openai_message(
+                    "user",
+                    truncate_message_content(&query.query, MAX_LOCAL_DIRECT_MESSAGE_CHARS),
+                ));
             }
             Some(api::message::Message::AgentOutput(output)) if !output.text.is_empty() => {
-                messages.push(OpenAIChatMessage {
-                    role: "assistant",
-                    content: truncate_message_content(&output.text, MAX_LOCAL_DIRECT_MESSAGE_CHARS),
-                });
+                messages.push(openai_message(
+                    "assistant",
+                    truncate_message_content(&output.text, MAX_LOCAL_DIRECT_MESSAGE_CHARS),
+                ));
             }
             _ => {}
         }
@@ -582,10 +1477,7 @@ fn truncate_messages_to_char_budget(messages: &mut Vec<OpenAIChatMessage>, max_c
     for message in messages.drain(..).rev() {
         if remaining_chars == 0 {
             if retained.is_empty() {
-                retained.push(OpenAIChatMessage {
-                    role: message.role,
-                    content: String::new(),
-                });
+                retained.push(openai_message(message.role, String::new()));
             }
             break;
         }
@@ -595,10 +1487,10 @@ fn truncate_messages_to_char_budget(messages: &mut Vec<OpenAIChatMessage>, max_c
             remaining_chars -= message_chars;
             retained.push(message);
         } else {
-            retained.push(OpenAIChatMessage {
-                role: message.role,
-                content: truncate_message_content(&message.content, remaining_chars),
-            });
+            retained.push(openai_message(
+                message.role,
+                truncate_message_content(&message.content, remaining_chars),
+            ));
             break;
         }
     }
@@ -640,13 +1532,14 @@ fn drain_sse_events(pending: &mut String) -> anyhow::Result<Vec<OpenAIStreamEven
             log::debug!("Ignoring non-OpenAI local provider stream payload: {data}");
             continue;
         };
-        events.extend(event.choices.into_iter().filter_map(|choice| {
-            choice
-                .delta
-                .content
-                .filter(|content| !content.is_empty())
-                .map(OpenAIStreamEvent::Delta)
-        }));
+        for choice in event.choices {
+            if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+                events.push(OpenAIStreamEvent::Delta(content));
+            }
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                events.extend(tool_calls.into_iter().map(OpenAIStreamEvent::ToolCallDelta));
+            }
+        }
     }
     Ok(events)
 }
@@ -796,15 +1689,33 @@ fn stream_finished_done() -> api::ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completions_url, drain_sse_events, openai_messages_from_inputs_and_tasks,
-        root_task_id, OpenAIStreamEvent, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
-        MAX_LOCAL_DIRECT_MESSAGE_CHARS,
+        chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
+        execute_glob_tool, execute_grep_tool, execute_local_tool, execute_read_file_tool,
+        execute_suggest_shell_command_tool, fallback_tool_results_message, local_read_only_tools,
+        local_tool_display_summary, local_tool_result_stats, local_tool_result_summary,
+        openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
+        EmptyLocalProviderResponseResolution, OpenAIChatRequest, OpenAIChatToolCall,
+        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
+        LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
+        MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
+        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
     };
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
+
+    fn tool_call(name: &str, arguments: &str) -> OpenAIChatToolCall {
+        OpenAIChatToolCall {
+            id: "call_1".to_string(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
 
     fn user_query_input(
         query: &str,
@@ -911,6 +1822,347 @@ mod tests {
     }
 
     #[test]
+    fn drain_sse_events_extracts_tool_call_deltas() {
+        let mut pending = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"function\":{\"arguments\":\"Cargo.toml\\\"}\"}}]}}]}\n"
+        )
+        .to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+        let mut accumulator = OpenAIToolCallAccumulator::default();
+        for event in events {
+            if let OpenAIStreamEvent::ToolCallDelta(delta) = event {
+                accumulator.push(delta);
+            }
+        }
+
+        let tool_calls = accumulator.into_tool_calls();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            tool_calls[0].function.arguments,
+            "{\"path\":\"Cargo.toml\"}"
+        );
+    }
+
+    #[test]
+    fn local_read_only_tools_include_expected_functions() {
+        let names = local_read_only_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["read_file", "grep", "glob", "suggest_shell_command"]
+        );
+    }
+
+    #[test]
+    fn openai_chat_request_finalize_mode_omits_tools_and_sets_tool_choice_none() {
+        let request = OpenAIChatRequest {
+            model: "local-model".to_string(),
+            messages: vec![openai_message("user", "hello")],
+            stream: true,
+            tools: match RequestMode::Finalize {
+                RequestMode::ToolUse => local_read_only_tools(),
+                RequestMode::Finalize => Vec::new(),
+            },
+            tool_choice: match RequestMode::Finalize {
+                RequestMode::ToolUse => None,
+                RequestMode::Finalize => Some("none"),
+            },
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(!value.as_object().unwrap().contains_key("tools"));
+        assert_eq!(value["tool_choice"], "none");
+    }
+
+    #[test]
+    fn openai_chat_request_tool_use_mode_includes_tools_without_tool_choice() {
+        let request = OpenAIChatRequest {
+            model: "local-model".to_string(),
+            messages: vec![openai_message("user", "hello")],
+            stream: true,
+            tools: match RequestMode::ToolUse {
+                RequestMode::ToolUse => local_read_only_tools(),
+                RequestMode::Finalize => Vec::new(),
+            },
+            tool_choice: match RequestMode::ToolUse {
+                RequestMode::ToolUse => None,
+                RequestMode::Finalize => Some("none"),
+            },
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(!value["tools"].as_array().unwrap().is_empty());
+        assert!(!value.as_object().unwrap().contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn tool_calls_require_finalize_detects_suggest_shell_command() {
+        assert!(super::tool_calls_require_finalize(&[tool_call(
+            "suggest_shell_command",
+            r#"{"command":"git status"}"#,
+        )]));
+        assert!(!super::tool_calls_require_finalize(&[tool_call(
+            "read_file",
+            r#"{"path":"Cargo.toml"}"#,
+        )]));
+    }
+
+    #[test]
+    fn suggest_shell_command_tool_reports_not_executed() {
+        let mut suggestions = HashSet::new();
+
+        let result = execute_suggest_shell_command_tool(
+            r#"{"command":"git status","rationale":"check repo","is_read_only":true,"is_risky":false,"expected_output":"status output"}"#,
+            &mut suggestions,
+        )
+        .unwrap();
+
+        assert!(result.contains("NOT executed"));
+        assert!(result.contains("Stop calling tools"));
+        assert!(result.contains("git status"));
+        assert!(result.contains("Rationale: check repo"));
+        assert!(suggestions.contains("git status"));
+    }
+
+    #[test]
+    fn suggest_shell_command_tool_rejects_invalid_arguments() {
+        let mut suggestions = HashSet::new();
+
+        let error = execute_suggest_shell_command_tool("not-json", &mut suggestions).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Invalid suggest_shell_command arguments"));
+    }
+
+    #[test]
+    fn suggest_shell_command_tool_deduplicates_same_command() {
+        let mut suggestions = HashSet::new();
+        let args = r#"{"command":"git status"}"#;
+
+        let first = execute_suggest_shell_command_tool(args, &mut suggestions).unwrap();
+        let second = execute_suggest_shell_command_tool(args, &mut suggestions).unwrap();
+
+        assert!(first.contains("NOT executed"));
+        assert!(second.contains("already delivered"));
+        assert!(second.contains("Stop calling tools"));
+    }
+
+    #[test]
+    fn execute_local_tool_handles_shell_suggestion_without_execution() {
+        let mut suggestions = HashSet::new();
+        let tool_call = tool_call("suggest_shell_command", r#"{"command":"cargo test"}"#);
+
+        let result = execute_local_tool(&tool_call, None, &mut suggestions);
+
+        assert!(result.contains("NOT executed"));
+        assert!(result.contains("Stop calling tools"));
+        assert!(result.contains("cargo test"));
+    }
+
+    #[test]
+    fn empty_response_resolution_errors_without_tokens_or_tool_results() {
+        assert_eq!(
+            empty_local_provider_response_resolution(false, &[]),
+            EmptyLocalProviderResponseResolution::Error
+        );
+    }
+
+    #[test]
+    fn empty_response_resolution_finishes_after_tokens() {
+        assert_eq!(
+            empty_local_provider_response_resolution(true, &[]),
+            EmptyLocalProviderResponseResolution::Finish
+        );
+    }
+
+    #[test]
+    fn empty_response_resolution_falls_back_after_tool_results() {
+        let resolution = empty_local_provider_response_resolution(
+            false,
+            &["Tool: grep\nResult: alpha".to_string()],
+        );
+
+        match resolution {
+            EmptyLocalProviderResponseResolution::Fallback(message) => {
+                assert!(message.contains("Tool: grep"));
+                assert!(message.contains("alpha"));
+            }
+            _ => panic!("expected fallback resolution"),
+        }
+    }
+
+    #[test]
+    fn local_tool_result_summary_includes_tool_arguments_and_truncated_result() {
+        let tool_call = OpenAIChatToolCall {
+            id: "call_1".to_string(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: "grep".to_string(),
+                arguments: "{\"query\":\"alpha\"}".to_string(),
+            },
+        };
+        let long_result = "x".repeat(MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS + 100);
+
+        let summary = local_tool_result_summary(&tool_call, &long_result);
+
+        assert!(summary.contains("Tool: grep"));
+        assert!(summary.contains("{\"query\":\"alpha\"}"));
+        assert!(summary.chars().count() < MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS * 2);
+    }
+
+    #[test]
+    fn fallback_tool_results_message_returns_none_without_results() {
+        assert!(fallback_tool_results_message(&[]).is_none());
+    }
+
+    #[test]
+    fn fallback_tool_results_message_includes_recent_results_with_total_limit() {
+        let summaries = vec![
+            "Tool: read_file\nResult:\nalpha".to_string(),
+            "Tool: grep\nResult:\n".to_string()
+                + &"b".repeat(MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS),
+        ];
+
+        let fallback = fallback_tool_results_message(&summaries).unwrap();
+
+        assert!(fallback.contains("The local provider returned no final answer"));
+        assert!(fallback.contains("Tool: grep"));
+        assert!(fallback.chars().count() <= MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS);
+    }
+
+    #[test]
+    fn local_tool_display_summary_formats_read_file_stats_and_preview() {
+        let tool_call = tool_call("read_file", "{\"path\":\"Cargo.toml\"}");
+        let result = "File: Cargo.toml\n1: [workspace]\n2: members = []";
+
+        let summary = local_tool_display_summary(&tool_call, result);
+
+        assert!(summary.contains("> Local tool: read_file"));
+        assert!(summary.contains("Arguments: `{"));
+        assert!(summary.contains("read 2 lines"));
+        assert!(summary.contains("1: [workspace]"));
+    }
+
+    #[test]
+    fn local_tool_display_summary_formats_shell_command_suggestion() {
+        let tool_call = tool_call(
+            "suggest_shell_command",
+            "{\"command\":\"git status\",\"rationale\":\"inspect repo\",\"is_read_only\":true,\"is_risky\":false,\"expected_output\":\"status\"}",
+        );
+
+        let summary = local_tool_display_summary(
+            &tool_call,
+            "Shell command was suggested to the user but was not executed.",
+        );
+
+        assert!(summary.contains("> Local tool: suggest_shell_command"));
+        assert!(summary.contains("```bash\ngit status\n```"));
+        assert!(summary.contains("Rationale: inspect repo"));
+        assert!(summary.contains("Run this manually"));
+    }
+
+    #[test]
+    fn local_tool_result_stats_formats_grep_and_glob_counts() {
+        assert_eq!(
+            local_tool_result_stats("grep", "src/a.rs:1: alpha\nsrc/b.rs:2: alpha"),
+            "2 matches / 2 files"
+        );
+        assert_eq!(
+            local_tool_result_stats("glob", "src/a.rs\nsrc/b.rs\n"),
+            "2 files"
+        );
+    }
+
+    #[test]
+    fn local_tool_display_summary_formats_errors() {
+        let tool_call = tool_call("read_file", "{\"path\":\"missing\"}");
+
+        let summary = local_tool_display_summary(&tool_call, "Tool error: File is not readable");
+
+        assert!(summary.contains("Result: error: File is not readable"));
+    }
+
+    #[test]
+    fn local_tool_display_summary_truncates_preview() {
+        let tool_call = tool_call("grep", "{\"query\":\"alpha\"}");
+        let result = "x".repeat(MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 100);
+
+        let summary = local_tool_display_summary(&tool_call, &result);
+
+        assert!(summary.contains("> Local tool: grep"));
+        assert!(summary.chars().count() < MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 300);
+    }
+
+    #[test]
+    fn read_file_tool_reads_line_range_relative_to_cwd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("sample.txt");
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let result = execute_read_file_tool(
+            "{\"path\":\"sample.txt\",\"start_line\":2,\"end_line\":3}",
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert!(result.contains("2: beta"));
+        assert!(result.contains("3: gamma"));
+        assert!(!result.contains("1: alpha"));
+    }
+
+    #[test]
+    fn read_file_tool_requires_cwd_for_relative_paths() {
+        let error = execute_read_file_tool("{\"path\":\"sample.txt\"}", None).unwrap_err();
+
+        assert!(error.to_string().contains("Relative paths require"));
+    }
+
+    #[test]
+    fn read_file_tool_rejects_invalid_arguments() {
+        let error = execute_read_file_tool("not-json", None).unwrap_err();
+
+        assert!(error.to_string().contains("Invalid read_file arguments"));
+    }
+
+    #[test]
+    fn grep_tool_returns_bounded_text_matches() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("a.txt"), "Alpha\nbeta\n").unwrap();
+        std::fs::write(temp_dir.path().join("b.txt"), "alphabet\n").unwrap();
+
+        let result = execute_grep_tool("{\"query\":\"alpha\"}", Some(temp_dir.path())).unwrap();
+
+        assert!(result.contains("a.txt:1: Alpha"));
+        assert!(result.contains("b.txt:1: alphabet"));
+    }
+
+    #[test]
+    fn glob_tool_matches_simple_wildcards() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("src")).unwrap();
+        std::fs::write(temp_dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(temp_dir.path().join("README.md"), "readme").unwrap();
+
+        let result = execute_glob_tool("{\"pattern\":\"*.rs\"}", Some(temp_dir.path())).unwrap();
+
+        assert!(result.contains("main.rs"));
+        assert!(!result.contains("README.md"));
+    }
+
+    #[test]
     fn openai_messages_include_history_and_current_query_without_duplicate() {
         let tasks = vec![api::Task {
             id: "root".to_string(),
@@ -975,10 +2227,7 @@ mod tests {
                 .map(|message| (message.role, message.content.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (
-                    "system",
-                    "You are a helpful local coding assistant running inside Warp."
-                ),
+                ("system", LOCAL_DIRECT_SYSTEM_PROMPT),
                 ("user", "remember alpha"),
                 ("assistant", "alpha remembered"),
                 ("user", "what did I say?"),
