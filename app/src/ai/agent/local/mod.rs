@@ -3,7 +3,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -11,7 +11,7 @@ use anyhow::anyhow;
 use async_stream::stream;
 use chrono::Local;
 use futures_lite::Stream;
-use futures_util::StreamExt as _;
+use futures_util::{future::join_all, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -191,7 +191,7 @@ pub fn generate_openai_compatible_output(
         let mut reasoning_message_id: Option<String> = None;
         let mut reasoning_started_at: Option<Instant> = None;
         let mut tool_result_summaries = Vec::new();
-        let mut suggested_shell_commands = HashSet::new();
+        let suggested_shell_commands = Arc::new(Mutex::new(HashSet::new()));
 
         for round in 0..MAX_LOCAL_DIRECT_TOOL_ROUNDS {
             log::debug!("Starting local direct tool loop round {}", round + 1);
@@ -358,8 +358,32 @@ pub fn generate_openai_compatible_output(
             messages.push(openai_assistant_tool_call_message(tool_calls.clone()));
             let should_finalize = tool_calls_require_finalize(&tool_calls);
 
-            for tool_call in tool_calls {
-                let result = execute_local_tool(&tool_call, cwd.as_deref(), &mut suggested_shell_commands);
+            let tool_results = join_all(tool_calls.into_iter().map(|tool_call| {
+                let cwd = cwd.clone();
+                let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+                async move {
+                    let tool_call_for_error = tool_call.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let result = execute_local_tool(
+                            &tool_call,
+                            cwd.as_deref(),
+                            &suggested_shell_commands,
+                        );
+                        (tool_call, result)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => (
+                            tool_call_for_error,
+                            format!("Tool error: Local tool task failed: {error}"),
+                        ),
+                    }
+                }
+            }))
+            .await;
+
+            for (tool_call, result) in tool_results {
                 log_local_tool_result(&tool_call, &result);
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
                 yield Ok(append_agent_output_message_content(
@@ -789,17 +813,20 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
 fn execute_local_tool(
     tool_call: &OpenAIChatToolCall,
     cwd: Option<&Path>,
-    suggested_shell_commands: &mut HashSet<String>,
+    suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
 ) -> String {
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd),
         "grep" => execute_grep_tool(&tool_call.function.arguments, cwd),
         "glob" => execute_glob_tool(&tool_call.function.arguments, cwd),
         "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd),
-        "suggest_shell_command" => execute_suggest_shell_command_tool(
-            &tool_call.function.arguments,
-            suggested_shell_commands,
-        ),
+        "suggest_shell_command" => match suggested_shell_commands.lock() {
+            Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
+                &tool_call.function.arguments,
+                &mut suggested_shell_commands,
+            ),
+            Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
+        },
         name => Err(anyhow!("Unknown local tool: {name}")),
     };
 
@@ -2015,7 +2042,10 @@ mod tests {
     };
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
 
@@ -2313,10 +2343,10 @@ mod tests {
 
     #[test]
     fn execute_local_tool_handles_shell_suggestion_without_execution() {
-        let mut suggestions = HashSet::new();
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
         let tool_call = tool_call("suggest_shell_command", r#"{"command":"cargo test"}"#);
 
-        let result = execute_local_tool(&tool_call, None, &mut suggestions);
+        let result = execute_local_tool(&tool_call, None, &suggestions);
 
         assert!(result.contains("NOT executed"));
         assert!(result.contains("Stop calling tools"));
