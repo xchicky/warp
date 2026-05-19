@@ -181,12 +181,21 @@ pub fn generate_openai_compatible_output(
         if created_task {
             yield Ok(create_task(&task_id));
         }
-        yield Ok(add_agent_output_message(
-            &task_id,
-            &request_id,
-            &message_id,
-            String::new(),
-        ));
+
+        let mut agent_output_message_started = false;
+        macro_rules! yield_agent_output_content {
+            ($text:expr) => {
+                for event in agent_output_content_events(
+                    &mut agent_output_message_started,
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    $text,
+                ) {
+                    yield Ok(event);
+                }
+            };
+        }
 
         let mut messages = match openai_messages_from_inputs_and_tasks(&input, &tasks) {
             Ok(messages) => messages,
@@ -237,12 +246,7 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield Ok(append_agent_output_message_content(
-                                &task_id,
-                                &request_id,
-                                &message_id,
-                                token,
-                            ));
+                            yield_agent_output_content!(token);
                         }
                         OpenAIStreamEvent::ReasoningDelta(token) => {
                             if let Some(reasoning_id) = &reasoning_message_id {
@@ -292,12 +296,7 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield Ok(append_agent_output_message_content(
-                                &task_id,
-                                &request_id,
-                                &message_id,
-                                token,
-                            ));
+                            yield_agent_output_content!(token);
                         }
                         OpenAIStreamEvent::ReasoningDelta(token) => {
                             if let Some(reasoning_id) = &reasoning_message_id {
@@ -346,12 +345,7 @@ pub fn generate_openai_compatible_output(
                         log::info!(
                             "Local direct provider returned empty final answer after tool results; emitting fallback summary"
                         );
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            fallback,
-                        ));
+                        yield_agent_output_content!(fallback);
                         yield Ok(stream_finished_done());
                         return;
                     }
@@ -396,11 +390,9 @@ pub fn generate_openai_compatible_output(
                 log_local_tool_result(&tool_call, &result);
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
                 if tool_call.function.name == "suggest_shell_command" {
-                    yield Ok(append_agent_output_message_content(
-                        &task_id,
-                        &request_id,
-                        &message_id,
-                        local_shell_command_display_summary(&tool_call.function.arguments, &result),
+                    yield_agent_output_content!(local_shell_command_display_summary(
+                        &tool_call.function.arguments,
+                        &result,
                     ));
                 } else if let Some(events) = structured_tool_card_events(
                     &task_id,
@@ -453,12 +445,7 @@ pub fn generate_openai_compatible_output(
                 match event {
                     OpenAIStreamEvent::Delta(token) => {
                         finalize_received_token = true;
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            token,
-                        ));
+                        yield_agent_output_content!(token);
                     }
                     OpenAIStreamEvent::ReasoningDelta(token) => {
                         if let Some(reasoning_id) = &reasoning_message_id {
@@ -506,12 +493,7 @@ pub fn generate_openai_compatible_output(
                 match event {
                     OpenAIStreamEvent::Delta(token) => {
                         finalize_received_token = true;
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            token,
-                        ));
+                        yield_agent_output_content!(token);
                     }
                     OpenAIStreamEvent::ReasoningDelta(token) => {
                         if let Some(reasoning_id) = &reasoning_message_id {
@@ -555,20 +537,12 @@ pub fn generate_openai_compatible_output(
 
         match fallback_tool_results_message(&tool_result_summaries) {
             Some(fallback) => {
-                yield Ok(append_agent_output_message_content(
-                    &task_id,
-                    &request_id,
-                    &message_id,
-                    fallback,
-                ));
+                yield_agent_output_content!(fallback);
             }
             None => {
-                yield Ok(append_agent_output_message_content(
-                    &task_id,
-                    &request_id,
-                    &message_id,
-                    "I suggested commands but did not run anything; tell me what to do next.".to_string(),
-                ));
+                yield_agent_output_content!(
+                    "I suggested commands but did not run anything; tell me what to do next.".to_string()
+                );
             }
         }
         yield Ok(stream_finished_done());
@@ -1838,6 +1812,29 @@ fn append_agent_output_message_content(
     }
 }
 
+fn agent_output_content_events(
+    agent_output_message_started: &mut bool,
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    text: String,
+) -> Vec<api::ResponseEvent> {
+    let mut events = Vec::new();
+    if !*agent_output_message_started {
+        events.push(add_agent_output_message(
+            task_id,
+            request_id,
+            message_id,
+            String::new(),
+        ));
+        *agent_output_message_started = true;
+    }
+    events.push(append_agent_output_message_content(
+        task_id, request_id, message_id, text,
+    ));
+    events
+}
+
 fn add_agent_reasoning_message(
     task_id: &str,
     request_id: &str,
@@ -1986,9 +1983,10 @@ fn stream_finished_done() -> api::ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
-        execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
-        execute_read_file_tool, execute_suggest_shell_command_tool, fallback_tool_results_message,
+        agent_output_content_events, chat_completions_url, drain_sse_events,
+        empty_local_provider_response_resolution, execute_glob_tool, execute_grep_tool,
+        execute_list_directory_tool, execute_local_tool, execute_read_file_tool,
+        execute_suggest_shell_command_tool, fallback_tool_results_message,
         generate_openai_compatible_output, local_read_only_tools, local_tool_result_summary,
         openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
@@ -2062,6 +2060,29 @@ mod tests {
         })
     }
 
+    fn message_kind(event: &api::ResponseEvent) -> &'static str {
+        let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+            return "other";
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) = actions
+            .actions
+            .first()
+            .and_then(|action| action.action.as_ref())
+        else {
+            return "other";
+        };
+        match add
+            .messages
+            .first()
+            .and_then(|message| message.message.as_ref())
+        {
+            Some(api::message::Message::AgentOutput(_)) => "agent_output",
+            Some(api::message::Message::ToolCall(_)) => "tool_call",
+            Some(api::message::Message::ToolCallResult(_)) => "tool_call_result",
+            _ => "other",
+        }
+    }
+
     #[test]
     fn chat_completions_url_appends_path_to_base_url() {
         assert_eq!(
@@ -2092,6 +2113,62 @@ mod tests {
         let conversation_id = first_stream_init_conversation_id(None);
 
         assert!(Uuid::parse_str(&conversation_id).is_ok());
+    }
+
+    #[test]
+    fn defers_agent_output_message_until_first_content() {
+        let tool_call = tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        let mut events = test_tool_card_events(
+            "task",
+            "request",
+            &tool_call,
+            "File: /repo/Cargo.toml\n1: [workspace]",
+        )
+        .unwrap();
+        let mut agent_output_started = false;
+        events.extend(agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            "final answer".to_string(),
+        ));
+
+        let kinds = events.iter().map(message_kind).collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec!["tool_call", "tool_call_result", "agent_output", "other"]
+        );
+    }
+
+    #[test]
+    fn creates_agent_output_message_on_first_text_delta() {
+        let mut agent_output_started = false;
+
+        let first = agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            "hello".to_string(),
+        );
+        let second = agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            " world".to_string(),
+        );
+
+        assert_eq!(
+            first.iter().map(message_kind).collect::<Vec<_>>(),
+            vec!["agent_output", "other"]
+        );
+        assert_eq!(
+            second.iter().map(message_kind).collect::<Vec<_>>(),
+            vec!["other"]
+        );
     }
 
     #[test]
