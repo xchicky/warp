@@ -169,15 +169,18 @@ pub async fn generate_multi_agent_output(
 }
 
 fn local_direct_config_for_request(params: &RequestParams) -> Option<LocalDirectConfig> {
-    if !params
+    let local_config = params.local_direct_config.clone()?;
+    let has_user_query = params
         .input
         .iter()
-        .any(|input| input.user_query().is_some())
-    {
-        return None;
-    }
+        .any(|input| input.user_query().is_some());
+    let is_continuation = params.conversation_token.is_some();
 
-    params.local_direct_config.clone()
+    if has_user_query || is_continuation {
+        Some(local_config)
+    } else {
+        None
+    }
 }
 
 fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {

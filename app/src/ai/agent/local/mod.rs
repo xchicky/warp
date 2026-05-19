@@ -172,6 +172,16 @@ pub fn generate_openai_compatible_output(
 
         yield Ok(stream_init(&request_id, &conversation_id));
 
+        let input_kinds = input
+            .iter()
+            .map(local_direct_input_kind)
+            .collect::<Vec<_>>();
+        log::debug!("Local direct agent input kinds: {}", input_kinds.join(","));
+        if !input.iter().any(|input| input.user_query().is_some()) {
+            yield Ok(stream_finished_done());
+            return;
+        }
+
         let (task_id, created_task) = match root_task_id {
             Some(task_id) => (task_id, false),
             None => (Uuid::new_v4().to_string(), true),
@@ -602,6 +612,29 @@ fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
     tool_calls
         .iter()
         .any(|call| call.function.name == "suggest_shell_command")
+}
+
+fn local_direct_input_kind(input: &AIAgentInput) -> &'static str {
+    match input {
+        AIAgentInput::UserQuery { .. } => "UserQuery",
+        AIAgentInput::AutoCodeDiffQuery { .. } => "AutoCodeDiffQuery",
+        AIAgentInput::ResumeConversation { .. } => "ResumeConversation",
+        AIAgentInput::InitProjectRules { .. } => "InitProjectRules",
+        AIAgentInput::CreateEnvironment { .. } => "CreateEnvironment",
+        AIAgentInput::TriggerPassiveSuggestion { .. } => "TriggerPassiveSuggestion",
+        AIAgentInput::CreateNewProject { .. } => "CreateNewProject",
+        AIAgentInput::CloneRepository { .. } => "CloneRepository",
+        AIAgentInput::CodeReview { .. } => "CodeReview",
+        AIAgentInput::FetchReviewComments { .. } => "FetchReviewComments",
+        AIAgentInput::SummarizeConversation { .. } => "SummarizeConversation",
+        AIAgentInput::InvokeSkill { .. } => "InvokeSkill",
+        AIAgentInput::StartFromAmbientRunPrompt { .. } => "StartFromAmbientRunPrompt",
+        AIAgentInput::ActionResult { .. } => "ActionResult",
+        AIAgentInput::MessagesReceivedFromAgents { .. } => "MessagesReceivedFromAgents",
+        AIAgentInput::EventsFromAgents { .. } => "EventsFromAgents",
+        AIAgentInput::PassiveSuggestionResult { .. } => "PassiveSuggestionResult",
+        AIAgentInput::OrchestrationConfigUpdate { .. } => "OrchestrationConfigUpdate",
+    }
 }
 
 fn openai_messages_from_inputs_and_tasks(
@@ -1995,7 +2028,10 @@ mod tests {
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
     };
-    use crate::ai::agent::{api::ServerConversationToken, local::tool_card::test_tool_card_events};
+    use crate::ai::agent::{
+        api::ServerConversationToken, local::tool_card::test_tool_card_events, AIAgentContext,
+        AIAgentInput,
+    };
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
     use futures_util::StreamExt as _;
@@ -2113,6 +2149,35 @@ mod tests {
         let conversation_id = first_stream_init_conversation_id(None);
 
         assert!(Uuid::parse_str(&conversation_id).is_ok());
+    }
+
+    #[test]
+    fn local_stream_finishes_non_user_query_without_provider_request() {
+        futures::executor::block_on(async {
+            let mut stream = generate_openai_compatible_output(
+                local_direct_config(),
+                vec![AIAgentInput::ResumeConversation {
+                    context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+                }],
+                Vec::new(),
+                Some(ServerConversationToken::new(
+                    "local-conversation".to_string(),
+                )),
+            );
+
+            let init = stream.next().await.unwrap().unwrap();
+            assert!(matches!(
+                init.r#type,
+                Some(api::response_event::Type::Init(_))
+            ));
+
+            let finished = stream.next().await.unwrap().unwrap();
+            assert!(matches!(
+                finished.r#type,
+                Some(api::response_event::Type::Finished(_))
+            ));
+            assert!(stream.next().await.is_none());
+        });
     }
 
     #[test]
