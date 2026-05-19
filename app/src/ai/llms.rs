@@ -618,13 +618,13 @@ fn add_custom_models(models: &mut ModelsByFeature, api_keys: &ai::api_keys::ApiK
             .openai
             .as_ref()
             .zip(api_keys.openai_base_url.as_ref())
-            .and_then(|_| api_keys.openai_model.as_deref())
+            .and(api_keys.openai_model.as_deref())
             .map(|model| custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)),
         api_keys
             .anthropic
             .as_ref()
             .zip(api_keys.anthropic_base_url.as_ref())
-            .and_then(|_| api_keys.anthropic_model.as_deref())
+            .and(api_keys.anthropic_model.as_deref())
             .map(|model| custom_llm_info("Local Anthropic", model, LLMProvider::Anthropic)),
     ];
 

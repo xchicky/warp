@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -14,6 +14,7 @@ use async_stream::stream;
 use chrono::Local;
 use futures_lite::Stream;
 use futures_util::{future::join_all, StreamExt as _};
+use instant::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
