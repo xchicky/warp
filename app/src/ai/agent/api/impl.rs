@@ -26,8 +26,13 @@ pub async fn generate_multi_agent_output(
 
     if let Some(local_config) = local_direct_config_for_request(&params) {
         return Ok(Box::pin(
-            generate_openai_compatible_output(local_config, params.input, params.tasks)
-                .take_until(cancellation_rx),
+            generate_openai_compatible_output(
+                local_config,
+                params.input,
+                params.tasks,
+                params.conversation_token.clone(),
+            )
+            .take_until(cancellation_rx),
         ));
     }
 

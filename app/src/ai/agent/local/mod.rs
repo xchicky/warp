@@ -23,7 +23,9 @@ use self::tool_card::structured_tool_card_events;
 
 use crate::{
     ai::agent::{
-        api::Event, task::helper::TaskExt, AIAgentAttachment, AIAgentContext, AIAgentInput,
+        api::{Event, ServerConversationToken},
+        task::helper::TaskExt,
+        AIAgentAttachment, AIAgentContext, AIAgentInput,
     },
     server::server_api::AIApiError,
 };
@@ -158,10 +160,14 @@ pub fn generate_openai_compatible_output(
     config: LocalDirectConfig,
     input: Vec<AIAgentInput>,
     tasks: Vec<api::Task>,
+    conversation_token: Option<ServerConversationToken>,
 ) -> LocalResponseStream {
     Box::pin(stream! {
         let request_id = Uuid::new_v4().to_string();
-        let conversation_id = Uuid::new_v4().to_string();
+        let conversation_id = conversation_token
+            .as_ref()
+            .map(|token| token.as_str().to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let root_task_id = root_task_id(&tasks);
 
         yield Ok(stream_init(&request_id, &conversation_id));
@@ -1983,20 +1989,23 @@ mod tests {
         chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
         execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
         execute_read_file_tool, execute_suggest_shell_command_tool, fallback_tool_results_message,
-        local_read_only_tools, local_tool_result_summary, openai_message,
-        openai_messages_from_inputs_and_tasks, root_task_id, EmptyLocalProviderResponseResolution,
-        OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
+        generate_openai_compatible_output, local_read_only_tools, local_tool_result_summary,
+        openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
+        EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
+        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
         OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
     };
-    use crate::ai::agent::local::tool_card::test_tool_card_events;
+    use crate::ai::agent::{api::ServerConversationToken, local::tool_card::test_tool_card_events};
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
+    use futures_util::StreamExt as _;
     use std::{
         collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
     };
+    use uuid::Uuid;
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
 
@@ -2027,6 +2036,32 @@ mod tests {
         }
     }
 
+    fn local_direct_config() -> LocalDirectConfig {
+        LocalDirectConfig {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test-model".to_string(),
+        }
+    }
+
+    fn first_stream_init_conversation_id(
+        conversation_token: Option<ServerConversationToken>,
+    ) -> String {
+        futures::executor::block_on(async move {
+            let mut stream = generate_openai_compatible_output(
+                local_direct_config(),
+                vec![user_query_input("hello", Vec::new(), HashMap::new())],
+                Vec::new(),
+                conversation_token,
+            );
+            let event = stream.next().await.unwrap().unwrap();
+            let Some(api::response_event::Type::Init(init)) = event.r#type else {
+                panic!("expected stream init");
+            };
+            init.conversation_id
+        })
+    }
+
     #[test]
     fn chat_completions_url_appends_path_to_base_url() {
         assert_eq!(
@@ -2041,6 +2076,22 @@ mod tests {
             chat_completions_url("https://example.com/v1/chat/completions"),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn local_stream_init_reuses_conversation_token() {
+        let conversation_id = first_stream_init_conversation_id(Some(
+            ServerConversationToken::new("server-conversation-token".to_string()),
+        ));
+
+        assert_eq!(conversation_id, "server-conversation-token");
+    }
+
+    #[test]
+    fn local_stream_init_generates_uuid_without_conversation_token() {
+        let conversation_id = first_stream_init_conversation_id(None);
+
+        assert!(Uuid::parse_str(&conversation_id).is_ok());
     }
 
     #[test]
