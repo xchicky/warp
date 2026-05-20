@@ -4,7 +4,9 @@ use chrono::Local;
 use serde_json::Value;
 use warp_multi_agent_api as api;
 
-use super::{apply_file_diff::ApplyFileDiffSummary, OpenAIChatToolCall};
+use super::{
+    apply_file_diff::ApplyFileDiffSummary, mcp_tools::LocalMcpToolCatalogEntry, OpenAIChatToolCall,
+};
 
 pub(super) fn structured_tool_card_events(
     task_id: &str,
@@ -28,6 +30,16 @@ pub(super) fn structured_tool_call_event(
     tool_call: &OpenAIChatToolCall,
 ) -> Option<api::ResponseEvent> {
     let tool = build_tool_call(&tool_call.function.name, &tool_call.function.arguments)?;
+    Some(add_tool_call_message(task_id, request_id, tool_call, tool))
+}
+
+pub(super) fn structured_mcp_tool_call_event(
+    task_id: &str,
+    request_id: &str,
+    tool_call: &OpenAIChatToolCall,
+    mcp_entry: &LocalMcpToolCatalogEntry,
+) -> Option<api::ResponseEvent> {
+    let tool = build_mcp_tool_call(&tool_call.function.arguments, mcp_entry)?;
     Some(add_tool_call_message(task_id, request_id, tool_call, tool))
 }
 
@@ -59,6 +71,20 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         )),
         _ => None,
     }
+}
+
+fn build_mcp_tool_call(
+    arguments: &str,
+    mcp_entry: &LocalMcpToolCatalogEntry,
+) -> Option<api::message::tool_call::Tool> {
+    let args = parse_args(arguments);
+    Some(api::message::tool_call::Tool::CallMcpTool(
+        api::message::tool_call::CallMcpTool {
+            name: mcp_entry.mcp_tool_name.clone(),
+            args: Some(serde_json_object_to_prost_struct(args)?),
+            server_id: mcp_entry.server_id.clone(),
+        },
+    ))
 }
 
 fn build_tool_call_result(
@@ -443,6 +469,42 @@ fn tool_error(result: &str) -> Option<String> {
 
 fn parse_args(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or(Value::Null)
+}
+
+fn serde_json_object_to_prost_struct(value: Value) -> Option<prost_types::Struct> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    Some(prost_types::Struct {
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| serde_json_to_prost(value).map(|value| (key, value)))
+            .collect::<Option<_>>()?,
+    })
+}
+
+fn serde_json_to_prost(value: Value) -> Option<prost_types::Value> {
+    use prost_types::value::Kind;
+    Some(prost_types::Value {
+        kind: Some(match value {
+            Value::Null => Kind::NullValue(0),
+            Value::Bool(value) => Kind::BoolValue(value),
+            Value::Number(number) => Kind::NumberValue(number.as_f64()?),
+            Value::String(value) => Kind::StringValue(value),
+            Value::Array(values) => Kind::ListValue(prost_types::ListValue {
+                values: values
+                    .into_iter()
+                    .map(serde_json_to_prost)
+                    .collect::<Option<_>>()?,
+            }),
+            Value::Object(fields) => Kind::StructValue(prost_types::Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| serde_json_to_prost(value).map(|value| (key, value)))
+                    .collect::<Option<_>>()?,
+            }),
+        }),
+    })
 }
 
 fn optional_string_arg(args: &Value, name: &str) -> Option<String> {

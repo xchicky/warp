@@ -27,16 +27,18 @@ use self::{
         apply_file_diff_result_text, apply_unified_diff, atomic_write_text,
         resolve_writable_file_target, AppliedFileDiff, ApplyFileDiffSummary,
     },
-    tool_card::{structured_tool_call_event, structured_tool_card_events},
+    tool_card::{
+        structured_mcp_tool_call_event, structured_tool_call_event, structured_tool_card_events,
+    },
 };
-use mcp_tools::mcp_tool_catalog;
+use mcp_tools::{mcp_tool_catalog, LocalMcpToolCatalog};
 
 use crate::{
     ai::agent::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, MCPContext, RequestCommandOutputResult,
+        AIAgentInput, CallMCPToolResult, MCPContext, RequestCommandOutputResult,
     },
     features::FeatureFlag,
     server::server_api::AIApiError,
@@ -265,6 +267,8 @@ const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
 const MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS: usize = 32 * 1024;
+const MAX_LOCAL_DIRECT_MCP_RESULT_BYTES: usize = 64 * 1024;
+const MAX_LOCAL_DIRECT_MCP_RESULT_CHARS: usize = 32 * 1024;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. When run_shell_command is advertised, use it for shell commands that should run after visible user approval. Otherwise, if you need the user to run a shell command, use suggest_shell_command; suggested commands are not executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
@@ -329,7 +333,11 @@ pub fn generate_openai_compatible_output(
             };
         }
 
-        let mut messages = match openai_messages_from_inputs_and_tasks(&input, &tasks) {
+        let mut messages = match openai_messages_from_inputs_and_tasks(
+            &input,
+            &tasks,
+            mcp_context.as_ref(),
+        ) {
             Ok(messages) => messages,
             Err(error) => {
                 yield Err(Arc::new(AIApiError::Other(error)));
@@ -346,6 +354,7 @@ pub fn generate_openai_compatible_output(
         let max_tool_rounds = if has_user_query { MAX_LOCAL_DIRECT_TOOL_ROUNDS } else { 0 };
         for round in 0..max_tool_rounds {
             log::debug!("Starting local direct tool loop round {}", round + 1);
+            let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context.as_ref());
             let response = match request_openai_compatible_completion(
                 &config,
                 messages.clone(),
@@ -499,6 +508,7 @@ pub fn generate_openai_compatible_output(
                 tool_calls,
                 cwd.clone(),
                 Arc::clone(&suggested_shell_commands),
+                mcp_tool_catalog.clone().map(Arc::new),
             )
             .await;
 
@@ -506,7 +516,14 @@ pub fn generate_openai_compatible_output(
             for (tool_call, result) in tool_results {
                 log_local_tool_result(&tool_call, &result.text);
                 if result.pending_tool_call {
-                    if let Some(event) = structured_tool_call_event(&task_id, &request_id, &tool_call) {
+                    if let Some(event) = mcp_tool_catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.find_openai_name(&tool_call.function.name))
+                        .and_then(|entry| {
+                            structured_mcp_tool_call_event(&task_id, &request_id, &tool_call, entry)
+                        })
+                        .or_else(|| structured_tool_call_event(&task_id, &request_id, &tool_call))
+                    {
                         yield Ok(event);
                     }
                     waiting_for_out_of_band_action = true;
@@ -765,7 +782,8 @@ fn local_shell_action_result(input: &AIAgentInput) -> bool {
         input,
         AIAgentInput::ActionResult {
             result: AIAgentActionResult {
-                result: AIAgentActionResultType::RequestCommandOutput(_),
+                result: AIAgentActionResultType::RequestCommandOutput(_)
+                    | AIAgentActionResultType::CallMCPTool(_),
                 ..
             },
             ..
@@ -776,10 +794,12 @@ fn local_shell_action_result(input: &AIAgentInput) -> bool {
 fn openai_messages_from_inputs_and_tasks(
     input: &[AIAgentInput],
     tasks: &[api::Task],
+    mcp_context: Option<&LocalMcpContext>,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
+    let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context);
 
-    append_history_messages(&mut messages, tasks);
+    append_history_messages(&mut messages, tasks, mcp_tool_catalog.as_ref());
     let mut appended_action_result = false;
     for input in input {
         if let AIAgentInput::ActionResult { result, .. } = input {
@@ -855,33 +875,47 @@ fn openai_assistant_tool_call_message(tool_calls: Vec<OpenAIChatToolCall>) -> Op
 fn openai_tool_message_from_action_result(
     result: &AIAgentActionResult,
 ) -> Option<OpenAIChatMessage> {
-    let AIAgentActionResultType::RequestCommandOutput(command_result) = &result.result else {
-        return None;
-    };
-    Some(openai_tool_message(
-        result.id.to_string(),
-        shell_command_result_for_provider(command_result),
-    ))
+    match &result.result {
+        AIAgentActionResultType::RequestCommandOutput(command_result) => Some(openai_tool_message(
+            result.id.to_string(),
+            shell_command_result_for_provider(command_result),
+        )),
+        AIAgentActionResultType::CallMCPTool(mcp_result) => Some(openai_tool_message(
+            result.id.to_string(),
+            mcp_tool_result_for_provider(None, None, mcp_result),
+        )),
+        _ => None,
+    }
 }
 
 fn openai_tool_call_from_action_result(result: &AIAgentActionResult) -> Option<OpenAIChatToolCall> {
-    let AIAgentActionResultType::RequestCommandOutput(command_result) = &result.result else {
-        return None;
-    };
-    let command = match command_result {
-        RequestCommandOutputResult::Completed { command, .. }
-        | RequestCommandOutputResult::LongRunningCommandSnapshot { command, .. }
-        | RequestCommandOutputResult::Denylisted { command } => command.clone(),
-        RequestCommandOutputResult::CancelledBeforeExecution => String::new(),
-    };
-    Some(OpenAIChatToolCall {
-        id: result.id.to_string(),
-        r#type: "function",
-        function: OpenAIChatToolCallFunction {
-            name: "run_shell_command".to_string(),
-            arguments: json!({ "command": command }).to_string(),
-        },
-    })
+    match &result.result {
+        AIAgentActionResultType::RequestCommandOutput(command_result) => {
+            let command = match command_result {
+                RequestCommandOutputResult::Completed { command, .. }
+                | RequestCommandOutputResult::LongRunningCommandSnapshot { command, .. }
+                | RequestCommandOutputResult::Denylisted { command } => command.clone(),
+                RequestCommandOutputResult::CancelledBeforeExecution => String::new(),
+            };
+            Some(OpenAIChatToolCall {
+                id: result.id.to_string(),
+                r#type: "function",
+                function: OpenAIChatToolCallFunction {
+                    name: "run_shell_command".to_string(),
+                    arguments: json!({ "command": command }).to_string(),
+                },
+            })
+        }
+        AIAgentActionResultType::CallMCPTool(_) => Some(OpenAIChatToolCall {
+            id: result.id.to_string(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: "mcp__unknown__tool".to_string(),
+                arguments: json!({}).to_string(),
+            },
+        }),
+        _ => None,
+    }
 }
 
 fn messages_have_tool_call(messages: &[OpenAIChatMessage], tool_call_id: &str) -> bool {
@@ -1009,6 +1043,24 @@ fn local_tools() -> Vec<OpenAIChatTool> {
 }
 
 fn local_tools_for_context(mcp_context: Option<&LocalMcpContext>) -> Vec<OpenAIChatTool> {
+    let mut tools = local_tools_without_mcp();
+    if FeatureFlag::LocalAgentMcp.is_enabled() {
+        if let Some(catalog) = mcp_context.and_then(|context| mcp_tool_catalog(context, &tools)) {
+            tools.extend(catalog.into_tool_definitions());
+        }
+    }
+    tools
+}
+
+fn local_mcp_tool_catalog(mcp_context: Option<&LocalMcpContext>) -> Option<LocalMcpToolCatalog> {
+    if !FeatureFlag::LocalAgentMcp.is_enabled() {
+        return None;
+    }
+    let local_tools = local_tools_without_mcp();
+    mcp_context.and_then(|context| mcp_tool_catalog(context, &local_tools))
+}
+
+fn local_tools_without_mcp() -> Vec<OpenAIChatTool> {
     let mut tools = local_read_only_tools();
     if FeatureFlag::LocalAgentFileWrites.is_enabled() {
         tools.push(apply_file_diff_tool_definition());
@@ -1017,11 +1069,6 @@ fn local_tools_for_context(mcp_context: Option<&LocalMcpContext>) -> Vec<OpenAIC
     }
     if FeatureFlag::LocalAgentShellExecution.is_enabled() {
         tools.push(run_shell_command_tool_definition());
-    }
-    if FeatureFlag::LocalAgentMcp.is_enabled() {
-        if let Some(catalog) = mcp_context.and_then(|context| mcp_tool_catalog(context, &tools)) {
-            tools.extend(catalog.into_tool_definitions());
-        }
     }
     tools
 }
@@ -1193,26 +1240,31 @@ async fn execute_local_tool_batch(
     tool_calls: Vec<OpenAIChatToolCall>,
     cwd: Option<PathBuf>,
     suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
+    mcp_tool_catalog: Option<Arc<LocalMcpToolCatalog>>,
 ) -> Vec<(OpenAIChatToolCall, LocalToolExecutionResult)> {
     #[cfg(test)]
     let feature_flag_overrides = warp_core::features::get_overrides();
 
-    if tool_calls
-        .iter()
-        .any(|tool_call| is_mutating_local_tool(&tool_call.function.name))
-    {
+    if tool_calls.iter().any(|tool_call| {
+        is_sequential_local_tool(&tool_call.function.name, mcp_tool_catalog.as_deref())
+    }) {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let cwd = cwd.clone();
             let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+            let mcp_tool_catalog = mcp_tool_catalog.clone();
             let tool_call_for_error = tool_call.clone();
             #[cfg(test)]
             let feature_flag_overrides = feature_flag_overrides.clone();
             let result = tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result =
-                    execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
+                let result = execute_local_tool(
+                    &tool_call,
+                    cwd.as_deref(),
+                    &suggested_shell_commands,
+                    mcp_tool_catalog.as_deref(),
+                );
                 (tool_call, result)
             })
             .await
@@ -1236,6 +1288,7 @@ async fn execute_local_tool_batch(
     join_all(tool_calls.into_iter().map(|tool_call| {
         let cwd = cwd.clone();
         let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+        let mcp_tool_catalog = mcp_tool_catalog.clone();
         #[cfg(test)]
         let feature_flag_overrides = feature_flag_overrides.clone();
         async move {
@@ -1243,8 +1296,12 @@ async fn execute_local_tool_batch(
             match tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result =
-                    execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
+                let result = execute_local_tool(
+                    &tool_call,
+                    cwd.as_deref(),
+                    &suggested_shell_commands,
+                    mcp_tool_catalog.as_deref(),
+                );
                 (tool_call, result)
             })
             .await
@@ -1269,6 +1326,11 @@ fn is_mutating_local_tool(name: &str) -> bool {
     )
 }
 
+fn is_sequential_local_tool(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCatalog>) -> bool {
+    is_mutating_local_tool(name)
+        || mcp_tool_catalog.is_some_and(|catalog| catalog.find_openai_name(name).is_some())
+}
+
 struct LocalToolExecutionResult {
     text: String,
     apply_file_diff_summary: Option<ApplyFileDiffSummary>,
@@ -1289,6 +1351,7 @@ fn execute_local_tool(
     tool_call: &OpenAIChatToolCall,
     cwd: Option<&Path>,
     suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
 ) -> LocalToolExecutionResult {
     let result = match tool_call.function.name.as_str() {
         "read_file" => {
@@ -1313,7 +1376,8 @@ fn execute_local_tool(
             .map(|text| (text, None)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
-        name => Err(anyhow!("Unknown local tool: {name}")),
+        name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
+            .map(|text| (text, None)),
     };
 
     let (text, apply_file_diff_summary) = match result {
@@ -1323,9 +1387,42 @@ fn execute_local_tool(
     LocalToolExecutionResult {
         text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
         apply_file_diff_summary,
-        pending_tool_call: tool_call.function.name == "run_shell_command"
+        pending_tool_call: (tool_call.function.name == "run_shell_command"
+            || is_mcp_tool_call(&tool_call.function.name, mcp_tool_catalog))
             && !text.starts_with("Tool error:"),
     }
+}
+
+fn is_mcp_tool_call(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCatalog>) -> bool {
+    mcp_tool_catalog.is_some_and(|catalog| catalog.find_openai_name(name).is_some())
+}
+
+fn execute_mcp_tool_request(
+    openai_name: &str,
+    arguments: &str,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+) -> anyhow::Result<String> {
+    if !FeatureFlag::LocalAgentMcp.is_enabled() {
+        return Err(anyhow!("MCP tools are disabled by feature flag"));
+    }
+    let Some(entry) = mcp_tool_catalog.and_then(|catalog| catalog.find_openai_name(openai_name))
+    else {
+        return Err(anyhow!("Unknown local tool: {openai_name}"));
+    };
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid MCP tool arguments"))?;
+    if !args.is_object() {
+        return Err(anyhow!("MCP tool arguments must be a JSON object"));
+    }
+    let formatted_args = truncate_message_content(arguments, 4 * 1024);
+    Ok(format!(
+        "MCP tool call requires user approval.\nServer: {}\nTool: {}\nLocal function: {}\nExternal MCP server id: {}\nArguments:\n{}",
+        entry.server_name,
+        entry.mcp_tool_name,
+        entry.openai_name,
+        entry.server_id,
+        formatted_args,
+    ))
 }
 
 fn execute_apply_file_diff_tool(
@@ -2062,7 +2159,11 @@ fn wildcard_matches(pattern: &[u8], candidate: &[u8]) -> bool {
     pattern_index == pattern.len()
 }
 
-fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::Task]) {
+fn append_history_messages(
+    messages: &mut Vec<OpenAIChatMessage>,
+    tasks: &[api::Task],
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+) {
     let Some(root) = root_task(tasks) else {
         return;
     };
@@ -2089,7 +2190,7 @@ fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::
                 ));
             }
             Some(api::message::Message::ToolCall(tool_call)) => {
-                if let Some(tool_call) = openai_tool_call_from_api(tool_call) {
+                if let Some(tool_call) = openai_tool_call_from_api(tool_call, mcp_tool_catalog) {
                     messages.push(openai_assistant_tool_call_message(vec![tool_call]));
                 }
             }
@@ -2103,7 +2204,10 @@ fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::
     }
 }
 
-fn openai_tool_call_from_api(tool_call: &api::message::ToolCall) -> Option<OpenAIChatToolCall> {
+fn openai_tool_call_from_api(
+    tool_call: &api::message::ToolCall,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+) -> Option<OpenAIChatToolCall> {
     let tool = tool_call.tool.as_ref()?;
     match tool {
         api::message::tool_call::Tool::RunShellCommand(command) => Some(OpenAIChatToolCall {
@@ -2120,6 +2224,30 @@ fn openai_tool_call_from_api(tool_call: &api::message::ToolCall) -> Option<OpenA
                 .to_string(),
             },
         }),
+        api::message::tool_call::Tool::CallMcpTool(call) => {
+            let openai_name = mcp_tool_catalog
+                .and_then(|catalog| {
+                    catalog.entries().iter().find(|entry| {
+                        entry.server_id == call.server_id && entry.mcp_tool_name == call.name
+                    })
+                })
+                .map(|entry| entry.openai_name.clone())
+                .unwrap_or_else(|| {
+                    format!("mcp__unknown__{}", sanitize_openai_tool_name(&call.name))
+                });
+            Some(OpenAIChatToolCall {
+                id: tool_call.tool_call_id.clone(),
+                r#type: "function",
+                function: OpenAIChatToolCallFunction {
+                    name: openai_name,
+                    arguments: call
+                        .args
+                        .as_ref()
+                        .map(prost_struct_to_json_string)
+                        .unwrap_or_else(|| "{}".to_string()),
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -2135,6 +2263,10 @@ fn openai_tool_message_from_api(
                 shell_command_api_result_for_provider(result),
             ))
         }
+        api::message::tool_call_result::Result::CallMcpTool(result) => Some(openai_tool_message(
+            tool_call_result.tool_call_id.clone(),
+            mcp_tool_api_result_for_provider(None, None, result),
+        )),
         _ => None,
     }
 }
@@ -2159,6 +2291,255 @@ fn shell_command_api_result_for_provider(result: &api::RunShellCommandResult) ->
             result.command
         ),
     }
+}
+
+fn mcp_tool_result_for_provider(
+    server_name: Option<&str>,
+    tool_name: Option<&str>,
+    result: &CallMCPToolResult,
+) -> String {
+    let status = match result {
+        CallMCPToolResult::Success { .. } => "success",
+        CallMCPToolResult::Error(_) => "error",
+        CallMCPToolResult::Cancelled => "cancelled",
+    };
+    let mut sections = vec![format!(
+        "MCP tool result\nServer: {}\nTool: {}\nStatus: {status}",
+        server_name.unwrap_or("unknown"),
+        tool_name.unwrap_or("unknown"),
+    )];
+    match result {
+        CallMCPToolResult::Success { result } => {
+            sections.push(mcp_call_tool_result_content_for_provider(result));
+        }
+        CallMCPToolResult::Error(error) => {
+            sections.push(format!(
+                "Error:\n{}",
+                truncate_mcp_output_for_provider(error)
+            ));
+        }
+        CallMCPToolResult::Cancelled => {
+            sections
+                .push("The MCP tool call was cancelled or denied before execution.".to_string());
+        }
+    }
+    sections.join("\n")
+}
+
+fn mcp_tool_api_result_for_provider(
+    server_name: Option<&str>,
+    tool_name: Option<&str>,
+    result: &api::CallMcpToolResult,
+) -> String {
+    let status = match result.result.as_ref() {
+        Some(api::call_mcp_tool_result::Result::Success(_)) => "success",
+        Some(api::call_mcp_tool_result::Result::Error(_)) => "error",
+        None => "unavailable",
+    };
+    let mut sections = vec![format!(
+        "MCP tool result\nServer: {}\nTool: {}\nStatus: {status}",
+        server_name.unwrap_or("unknown"),
+        tool_name.unwrap_or("unknown"),
+    )];
+    match result.result.as_ref() {
+        Some(api::call_mcp_tool_result::Result::Success(success)) => {
+            sections.push(mcp_api_success_content_for_provider(success));
+        }
+        Some(api::call_mcp_tool_result::Result::Error(error)) => {
+            sections.push(format!(
+                "Error:\n{}",
+                truncate_mcp_output_for_provider(&error.message)
+            ));
+        }
+        None => sections.push("No MCP result payload was returned.".to_string()),
+    }
+    sections.join("\n")
+}
+
+fn mcp_call_tool_result_content_for_provider(result: &rmcp::model::CallToolResult) -> String {
+    let mut lines = Vec::new();
+    if let Some(structured_content) = &result.structured_content {
+        lines.push(format!("Structured content:\n{structured_content}"));
+    }
+    for content in &result.content {
+        match &content.raw {
+            rmcp::model::RawContent::Text(text) => {
+                lines.push(format!("Text:\n{}", text.text));
+            }
+            rmcp::model::RawContent::Image(image) => {
+                lines.push(format!(
+                    "Unsupported image content: mime_type={}, bytes={}",
+                    image.mime_type,
+                    image.data.len()
+                ));
+            }
+            rmcp::model::RawContent::Resource(resource) => {
+                lines.push(format!(
+                    "Unsupported embedded resource content: {}",
+                    mcp_resource_metadata(&resource.resource)
+                ));
+            }
+            rmcp::model::RawContent::Audio(audio) => {
+                lines.push(format!(
+                    "Unsupported audio content: mime_type={}, bytes={}",
+                    audio.mime_type,
+                    audio.data.len()
+                ));
+            }
+            rmcp::model::RawContent::ResourceLink(link) => {
+                lines.push(format!(
+                    "Unsupported resource link content: uri={}",
+                    link.uri
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("No text or structured content returned.".to_string());
+    }
+    truncate_mcp_output_for_provider(&lines.join("\n\n"))
+}
+
+fn mcp_api_success_content_for_provider(success: &api::call_mcp_tool_result::Success) -> String {
+    let mut lines = Vec::new();
+    for result in &success.results {
+        match result.result.as_ref() {
+            Some(api::call_mcp_tool_result::success::result::Result::Text(text)) => {
+                lines.push(format!("Text:\n{}", text.text));
+            }
+            Some(api::call_mcp_tool_result::success::result::Result::Image(image)) => {
+                lines.push(format!(
+                    "Unsupported image content: mime_type={}, bytes={}",
+                    image.mime_type,
+                    image.data.len()
+                ));
+            }
+            Some(api::call_mcp_tool_result::success::result::Result::Resource(resource)) => {
+                lines.push(format!(
+                    "Unsupported embedded resource content: {}",
+                    mcp_api_resource_metadata(resource)
+                ));
+            }
+            None => lines.push("Empty MCP result item.".to_string()),
+        }
+    }
+    if lines.is_empty() {
+        lines.push("No text content returned.".to_string());
+    }
+    truncate_mcp_output_for_provider(&lines.join("\n\n"))
+}
+
+fn mcp_resource_metadata(resource: &rmcp::model::ResourceContents) -> String {
+    match resource {
+        rmcp::model::ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        } => format!(
+            "uri={}, mime_type={}, text_chars={}",
+            uri,
+            mime_type.as_deref().unwrap_or(""),
+            text.chars().count()
+        ),
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            ..
+        } => format!(
+            "uri={}, mime_type={}, bytes={}",
+            uri,
+            mime_type.as_deref().unwrap_or(""),
+            blob.len()
+        ),
+    }
+}
+
+fn mcp_api_resource_metadata(resource: &api::McpResourceContent) -> String {
+    match resource.content_type.as_ref() {
+        Some(api::mcp_resource_content::ContentType::Text(text)) => format!(
+            "uri={}, mime_type={}, text_chars={}",
+            resource.uri,
+            text.mime_type,
+            text.content.chars().count()
+        ),
+        Some(api::mcp_resource_content::ContentType::Binary(binary)) => format!(
+            "uri={}, mime_type={}, bytes={}",
+            resource.uri,
+            binary.mime_type,
+            binary.data.len()
+        ),
+        None => format!("uri={}, empty resource content", resource.uri),
+    }
+}
+
+fn truncate_mcp_output_for_provider(output: &str) -> String {
+    let bytes_limited = if output.len() > MAX_LOCAL_DIRECT_MCP_RESULT_BYTES {
+        format!(
+            "[truncated to last {} bytes]\n{}",
+            MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
+            String::from_utf8_lossy(
+                &output.as_bytes()[output.len() - MAX_LOCAL_DIRECT_MCP_RESULT_BYTES..]
+            )
+        )
+    } else {
+        output.to_string()
+    };
+    if bytes_limited.chars().count() > MAX_LOCAL_DIRECT_MCP_RESULT_CHARS {
+        let tail = bytes_limited
+            .chars()
+            .rev()
+            .take(MAX_LOCAL_DIRECT_MCP_RESULT_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        format!("[truncated to last {MAX_LOCAL_DIRECT_MCP_RESULT_CHARS} chars]\n{tail}")
+    } else {
+        bytes_limited
+    }
+}
+
+fn prost_struct_to_json_string(value: &prost_types::Struct) -> String {
+    serde_json::to_string(&prost_struct_to_json(value)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn prost_struct_to_json(value: &prost_types::Struct) -> Value {
+    Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), prost_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn prost_value_to_json(value: &prost_types::Value) -> Value {
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::NullValue(_)) | None => Value::Null,
+        Some(prost_types::value::Kind::NumberValue(value)) => {
+            serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+        }
+        Some(prost_types::value::Kind::StringValue(value)) => Value::String(value.clone()),
+        Some(prost_types::value::Kind::BoolValue(value)) => Value::Bool(*value),
+        Some(prost_types::value::Kind::StructValue(value)) => prost_struct_to_json(value),
+        Some(prost_types::value::Kind::ListValue(value)) => {
+            Value::Array(value.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+fn sanitize_openai_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn local_context_text(input: &[AIAgentInput]) -> Option<String> {
@@ -2812,16 +3193,18 @@ mod tests {
         execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
         execute_run_shell_command_tool, execute_suggest_shell_command_tool,
         execute_write_file_tool, fallback_tool_results_message, generate_openai_compatible_output,
-        is_mutating_local_tool, local_read_only_tools, local_shell_action_result,
-        local_tool_result_summary, local_tools, local_tools_for_context, openai_message,
-        openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
+        is_mutating_local_tool, local_mcp_tool_catalog, local_read_only_tools,
+        local_shell_action_result, local_tool_result_summary, local_tools, local_tools_for_context,
+        mcp_tool_result_for_provider, openai_message, openai_messages_from_inputs_and_tasks,
+        root_task_id, shell_command_result_for_provider, structured_mcp_tool_call_event,
         structured_tool_call_event, truncate_shell_output_for_provider,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
         OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
         OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
-        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
-        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
+        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES,
+        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -2829,8 +3212,8 @@ mod tests {
             apply_file_diff::ApplyFileDiffSummary,
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
-        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, MCPContext,
-        MCPServer, RequestCommandOutputResult,
+        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, CallMCPToolResult,
+        MCPContext, MCPServer, RequestCommandOutputResult,
     };
     use crate::features::FeatureFlag;
     use ai::agent::action_result::{AnyFileContent, FileContext};
@@ -2879,6 +3262,37 @@ mod tests {
             base_url: "http://127.0.0.1:1/v1".to_string(),
             model: "test-model".to_string(),
         }
+    }
+
+    fn mcp_tool(name: &str, description: &str) -> rmcp::model::Tool {
+        rmcp::model::Tool::new(
+            name.to_string(),
+            description.to_string(),
+            serde_json::json!({ "type": "object" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    fn local_mcp_context_with_tool(
+        server_id: &str,
+        server_name: &str,
+        tool_name: &str,
+    ) -> LocalMcpContext {
+        #[allow(deprecated)]
+        LocalMcpContext::from_mcp_context(MCPContext {
+            resources: Vec::new(),
+            tools: Vec::new(),
+            servers: vec![MCPServer {
+                id: server_id.to_string(),
+                name: server_name.to_string(),
+                description: String::new(),
+                resources: Vec::new(),
+                tools: vec![mcp_tool(tool_name, "Test MCP tool")],
+            }],
+        })
+        .unwrap()
     }
 
     fn first_stream_init_conversation_id(
@@ -3325,6 +3739,86 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_call_requests_out_of_band_action_with_original_name() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "filesystem",
+            "read_path",
+        );
+        let catalog = local_mcp_tool_catalog(Some(&local_context)).unwrap();
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let tool_call = tool_call(
+            "mcp__filesystem__read_path",
+            r#"{"path":"Cargo.toml","limit":5}"#,
+        );
+
+        let result = execute_local_tool(&tool_call, None, &suggestions, Some(&catalog));
+
+        assert!(result.pending_tool_call);
+        assert!(result.text.contains("MCP tool call requires user approval"));
+        assert!(result.text.contains("Tool: read_path"));
+        assert!(result
+            .text
+            .contains("Local function: mcp__filesystem__read_path"));
+
+        let entry = catalog
+            .find_openai_name("mcp__filesystem__read_path")
+            .unwrap();
+        let event = structured_mcp_tool_call_event("task", "request", &tool_call, entry).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::CallMcpTool(call_mcp_tool)) = &call.tool else {
+            panic!("expected call mcp tool");
+        };
+
+        assert_eq!(call.tool_call_id, "call_1");
+        assert_eq!(call_mcp_tool.name, "read_path");
+        assert_ne!(call_mcp_tool.name, "mcp__filesystem__read_path");
+        assert_eq!(
+            call_mcp_tool.server_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            call_mcp_tool
+                .args
+                .as_ref()
+                .unwrap()
+                .fields
+                .get("path")
+                .and_then(|value| value.kind.as_ref()),
+            Some(&prost_types::value::Kind::StringValue(
+                "Cargo.toml".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_rejects_non_object_arguments() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let catalog = local_mcp_tool_catalog(Some(&local_context)).unwrap();
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let tool_call = tool_call("mcp__filesystem__read_path", r#""not object""#);
+
+        let result = execute_local_tool(&tool_call, None, &suggestions, Some(&catalog));
+
+        assert!(!result.pending_tool_call);
+        assert!(result
+            .text
+            .contains("MCP tool arguments must be a JSON object"));
+    }
+
+    #[test]
     fn run_shell_command_schema_does_not_advertise_unsupported_rationale_or_timeout() {
         let _shell_enabled = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
         let tool = local_tools()
@@ -3445,7 +3939,7 @@ mod tests {
         let suggestions = Arc::new(Mutex::new(HashSet::new()));
         let tool_call = tool_call("suggest_shell_command", r#"{"command":"cargo test"}"#);
 
-        let result = execute_local_tool(&tool_call, None, &suggestions);
+        let result = execute_local_tool(&tool_call, None, &suggestions, None);
 
         assert!(result.text.contains("NOT executed"));
         assert!(result.text.contains("Stop calling tools"));
@@ -3503,7 +3997,7 @@ mod tests {
             r#"{"command":"cargo test","is_read_only":true,"is_risky":false}"#,
         );
 
-        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions);
+        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions, None);
 
         assert!(result.pending_tool_call);
         assert!(result.text.contains("waiting for user approval"));
@@ -3596,7 +4090,7 @@ mod tests {
         };
 
         assert!(local_shell_action_result(&input));
-        let messages = openai_messages_from_inputs_and_tasks(&[input], &[]).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None).unwrap();
         assert_eq!(messages[messages.len() - 2].role, "assistant");
         assert_eq!(
             messages[messages.len() - 2].tool_calls.as_ref().unwrap()[0].id,
@@ -3609,6 +4103,51 @@ mod tests {
         assert!(message.content.contains("Status: completed"));
         assert!(message.content.contains("Exit code: 0"));
         assert!(message.content.contains("ok"));
+    }
+
+    #[test]
+    fn mcp_action_result_becomes_openai_tool_message() {
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_mcp".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::CallMCPTool(CallMCPToolResult::Success {
+                result: rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(
+                    "mcp ok",
+                )]),
+            }),
+        };
+        let input = AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+        };
+
+        assert!(local_shell_action_result(&input));
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None).unwrap();
+        assert_eq!(messages[messages.len() - 2].role, "assistant");
+        assert_eq!(
+            messages[messages.len() - 2].tool_calls.as_ref().unwrap()[0].id,
+            "call_mcp"
+        );
+        let message = messages.last().unwrap();
+
+        assert_eq!(message.role, "tool");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_mcp"));
+        assert!(message.content.contains("Status: success"));
+        assert!(message.content.contains("mcp ok"));
+    }
+
+    #[test]
+    fn mcp_rejection_result_is_provider_tool_message() {
+        let result = mcp_tool_result_for_provider(
+            Some("filesystem"),
+            Some("write_ticket"),
+            &CallMCPToolResult::Cancelled,
+        );
+
+        assert!(result.contains("Status: cancelled"));
+        assert!(result.contains("cancelled or denied"));
+        assert!(result.contains("filesystem"));
+        assert!(result.contains("write_ticket"));
     }
 
     #[test]
@@ -3674,7 +4213,7 @@ mod tests {
             r#"{"summary":"update sample","patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"}"#,
         );
 
-        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions);
+        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions, None);
 
         assert!(result.text.contains("Applied patch successfully"));
         assert!(result.apply_file_diff_summary.is_some());
@@ -3944,6 +4483,7 @@ mod tests {
             ],
             Some(temp_dir.path().to_path_buf()),
             suggestions,
+            None,
         )
         .await;
 
@@ -3978,6 +4518,7 @@ mod tests {
             ],
             Some(temp_dir.path().to_path_buf()),
             suggestions,
+            None,
         )
         .await;
 
@@ -4008,6 +4549,7 @@ mod tests {
             ],
             Some(temp_dir.path().to_path_buf()),
             suggestions,
+            None,
         )
         .await;
 
@@ -4015,6 +4557,57 @@ mod tests {
         assert_eq!(results[0].0.function.name, "run_shell_command");
         assert!(results[0].1.pending_tool_call);
         assert!(!temp_dir.path().join("created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_pauses_at_mcp_action_before_later_mutations() {
+        let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let catalog = Arc::new(local_mcp_tool_catalog(Some(&local_context)).unwrap());
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let results = execute_local_tool_batch(
+            vec![
+                tool_call("mcp__filesystem__read_path", r#"{"path":"Cargo.toml"}"#),
+                tool_call(
+                    "write_file",
+                    r#"{"path":"created.txt","content":"created\n"}"#,
+                ),
+            ],
+            Some(temp_dir.path().to_path_buf()),
+            suggestions,
+            Some(catalog),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.function.name, "mcp__filesystem__read_path");
+        assert!(results[0].1.pending_tool_call);
+        assert!(!temp_dir.path().join("created.txt").exists());
+    }
+
+    #[test]
+    fn mcp_result_truncates_and_reports_unsupported_binary_metadata() {
+        let output = format!(
+            "{}TAIL",
+            "x".repeat(MAX_LOCAL_DIRECT_MCP_RESULT_BYTES + 100)
+        );
+        let result = CallMCPToolResult::Success {
+            result: rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(output),
+                rmcp::model::Content::image("abc123", "image/png"),
+            ]),
+        };
+
+        let formatted = mcp_tool_result_for_provider(Some("server"), Some("tool"), &result);
+
+        assert!(formatted.contains("Status: success"));
+        assert!(formatted.contains("truncated"));
+        assert!(formatted.contains("TAIL"));
+        assert!(formatted.contains("Unsupported image content: mime_type=image/png"));
+        assert!(!formatted.contains("abc123"));
     }
 
     #[test]
@@ -4535,7 +5128,7 @@ mod tests {
         }];
         let input = vec![user_query_input("what did I say?", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
 
         assert_eq!(messages[0].role, "system");
         assert_eq!(
@@ -4581,7 +5174,7 @@ mod tests {
         }];
         let input = vec![user_query_input("current", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
 
         assert!(messages
             .iter()
@@ -4616,7 +5209,7 @@ mod tests {
         }];
         let input = vec![user_query_input("current", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
         let non_system_chars = messages[1..]
             .iter()
             .map(|message| message.content.chars().count())
@@ -4658,7 +5251,7 @@ mod tests {
             HashMap::new(),
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[]).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
         let message = &messages.last().unwrap().content;
 
         assert!(message.contains("User message:\nexplain the context"));
@@ -4716,7 +5309,7 @@ mod tests {
             attachments,
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[]).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
         let context = &messages.last().unwrap().content;
 
         assert!(context.contains("File context (src/main.rs (1-2))"));
@@ -4754,7 +5347,7 @@ mod tests {
             attachments,
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[]).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages.last().unwrap().content, "hello");
