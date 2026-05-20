@@ -36,7 +36,6 @@ use crate::{
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
         AIAgentInput, RequestCommandOutputResult,
     },
-    ai::blocklist::ShellCommandExecutor,
     features::FeatureFlag,
     server::server_api::AIApiError,
 };
@@ -1058,12 +1057,10 @@ fn run_shell_command_tool_definition() -> OpenAIChatTool {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Exact shell command to request. It is shown to the user before execution." },
-                    "rationale": { "type": "string", "description": "Why this command should be run." },
                     "is_read_only": { "type": "boolean", "description": "Whether the command is expected to be read-only." },
                     "is_risky": { "type": "boolean", "description": "Whether the command may be risky or have side effects." },
                     "uses_pager": { "type": "boolean", "description": "Whether the command may invoke a pager. Defaults to false." },
-                    "cwd": { "type": "string", "description": "Optional cwd under the active workspace. M1.3 only supports the active terminal cwd." },
-                    "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional requested timeout in milliseconds, clamped to the client maximum." }
+                    "cwd": { "type": "string", "description": "Optional cwd under the active workspace. M1.3 rejects cwd values that do not match the active terminal cwd." }
                 },
                 "required": ["command"]
             }),
@@ -1373,6 +1370,8 @@ fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow
     }
     let args: Value = serde_json::from_str(arguments)
         .map_err(|_| anyhow!("Invalid run_shell_command arguments"))?;
+    reject_unsupported_run_shell_command_arg(&args, "rationale")?;
+    reject_unsupported_run_shell_command_arg(&args, "timeout_ms")?;
     let command = required_string_arg(&args, "command")?.trim();
     if command.is_empty() {
         return Err(anyhow!("command cannot be empty"));
@@ -1384,8 +1383,6 @@ fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow
     let active_cwd =
         cwd.ok_or_else(|| anyhow!("run_shell_command requires a current working directory"))?;
     let resolved_cwd = resolve_run_shell_command_cwd(&args, active_cwd)?;
-    let timeout_ms = clamped_shell_timeout_ms(optional_u64_arg(&args, "timeout_ms"));
-    let rationale = optional_string_arg(&args, "rationale").unwrap_or("No rationale provided.");
     let is_read_only = optional_bool_arg(&args, "is_read_only")
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
@@ -1394,9 +1391,18 @@ fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow
         .unwrap_or_else(|| "unknown".to_string());
 
     Ok(format!(
-        "Shell command execution was requested and is waiting for user approval. The command has NOT been executed by the local tool runner.\nCommand: {command}\nCwd: {}\nRationale: {rationale}\nRead-only: {is_read_only}\nRisky: {is_risky}\nTimeout ms: {timeout_ms}",
+        "Shell command execution was requested and is waiting for user approval. The command has NOT been executed by the local tool runner.\nCommand: {command}\nCwd: {}\nRead-only: {is_read_only}\nRisky: {is_risky}",
         resolved_cwd.display()
     ))
+}
+
+fn reject_unsupported_run_shell_command_arg(args: &Value, name: &str) -> anyhow::Result<()> {
+    if args.get(name).is_some() {
+        return Err(anyhow!(
+            "{name} is not supported for run_shell_command in M1.3 because the existing RunShellCommand action path cannot carry it into confirmation/execution"
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_run_shell_command_cwd(args: &Value, active_cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -1435,11 +1441,6 @@ fn resolve_run_shell_command_cwd(args: &Value, active_cwd: &Path) -> anyhow::Res
         ));
     }
     Ok(target.path)
-}
-
-fn clamped_shell_timeout_ms(timeout_ms: Option<u64>) -> u64 {
-    let max_ms = ShellCommandExecutor::MAX_AGENT_DELAY_DURATION.as_millis() as u64;
-    timeout_ms.unwrap_or(max_ms).clamp(1, max_ms)
 }
 
 fn reject_binary_text(text: &str, name: &str) -> anyhow::Result<()> {
@@ -1899,10 +1900,6 @@ fn optional_usize_arg(args: &Value, name: &str) -> Option<usize> {
     args.get(name)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-}
-
-fn optional_u64_arg(args: &Value, name: &str) -> Option<u64> {
-    args.get(name).and_then(Value::as_u64)
 }
 
 fn simple_pattern_matches(pattern: &str, candidate: &str) -> bool {
@@ -2688,8 +2685,8 @@ fn stream_finished_done() -> api::ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_output_content_events, chat_completions_url, clamped_shell_timeout_ms,
-        drain_sse_events, empty_local_provider_response_resolution, execute_apply_file_diff_tool,
+        agent_output_content_events, chat_completions_url, drain_sse_events,
+        empty_local_provider_response_resolution, execute_apply_file_diff_tool,
         execute_edit_file_tool, execute_glob_tool, execute_grep_tool, execute_list_directory_tool,
         execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
         execute_run_shell_command_tool, execute_suggest_shell_command_tool,
@@ -3103,6 +3100,21 @@ mod tests {
     }
 
     #[test]
+    fn run_shell_command_schema_does_not_advertise_unsupported_rationale_or_timeout() {
+        let _shell_enabled = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let tool = local_tools()
+            .into_iter()
+            .find(|tool| tool.function.name == "run_shell_command")
+            .unwrap();
+
+        let properties = &tool.function.parameters["properties"];
+        assert!(properties.get("command").is_some());
+        assert!(properties.get("cwd").is_some());
+        assert!(properties.get("rationale").is_none());
+        assert!(properties.get("timeout_ms").is_none());
+    }
+
+    #[test]
     fn openai_chat_request_finalize_mode_omits_tools_and_sets_tool_choice_none() {
         let request = OpenAIChatRequest {
             model: "local-model".to_string(),
@@ -3263,7 +3275,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let tool_call = tool_call(
             "run_shell_command",
-            r#"{"command":"cargo test","rationale":"verify","is_read_only":true,"is_risky":false,"timeout_ms":999999}"#,
+            r#"{"command":"cargo test","is_read_only":true,"is_risky":false}"#,
         );
 
         let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions);
@@ -3271,10 +3283,30 @@ mod tests {
         assert!(result.pending_tool_call);
         assert!(result.text.contains("waiting for user approval"));
         assert!(result.text.contains("cargo test"));
-        assert!(result.text.contains(&format!(
-            "Timeout ms: {}",
-            clamped_shell_timeout_ms(Some(999999))
-        )));
+        assert!(result.text.contains("Read-only: true"));
+        assert!(result.text.contains("Risky: false"));
+    }
+
+    #[test]
+    fn run_shell_command_tool_rejects_timeout_and_rationale_until_action_path_supports_them() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let timeout = execute_run_shell_command_tool(
+            r#"{"command":"cargo test","timeout_ms":1000}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(timeout.to_string().contains("timeout_ms is not supported"));
+        assert!(timeout.to_string().contains("cannot carry it"));
+
+        let rationale = execute_run_shell_command_tool(
+            r#"{"command":"cargo test","rationale":"verify"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(rationale.to_string().contains("rationale is not supported"));
+        assert!(rationale.to_string().contains("cannot carry it"));
     }
 
     #[test]
