@@ -16,6 +16,7 @@ pub(super) struct LocalMcpToolCatalog {
 pub(super) struct LocalMcpToolCatalogEntry {
     pub openai_name: String,
     pub server_id: String,
+    pub server_name: String,
     pub mcp_tool_name: String,
     pub tool: OpenAIChatTool,
 }
@@ -25,9 +26,14 @@ impl LocalMcpToolCatalog {
         self.entries.into_iter().map(|entry| entry.tool).collect()
     }
 
-    #[cfg(test)]
     pub fn entries(&self) -> &[LocalMcpToolCatalogEntry] {
         &self.entries
+    }
+
+    pub fn find_openai_name(&self, openai_name: &str) -> Option<&LocalMcpToolCatalogEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.openai_name == openai_name)
     }
 }
 
@@ -65,6 +71,7 @@ pub(super) fn mcp_tool_catalog(
             entries.push(LocalMcpToolCatalogEntry {
                 openai_name: openai_name.clone(),
                 server_id: server.id().to_string(),
+                server_name: server.name().to_string(),
                 mcp_tool_name: tool.name().to_string(),
                 tool: OpenAIChatTool {
                     r#type: "function",
