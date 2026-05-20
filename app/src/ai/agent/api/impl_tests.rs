@@ -1,10 +1,16 @@
-use crate::ai::agent::api::RequestParams;
+use crate::ai::agent::{
+    api::{RequestParams, ServerConversationToken},
+    local::LocalDirectConfig,
+    task::TaskId,
+    AIAgentActionId, AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput,
+    ReadFilesResult,
+};
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::LLMId;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
-use super::get_supported_tools;
+use super::{get_supported_tools, local_direct_config_for_request};
 
 fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool) -> RequestParams {
     let model = LLMId::from("test-model");
@@ -42,6 +48,54 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         parent_agent_id: None,
         agent_name: None,
     }
+}
+
+fn local_direct_config() -> LocalDirectConfig {
+    LocalDirectConfig {
+        api_key: "test-key".to_string(),
+        base_url: "http://127.0.0.1:1/v1".to_string(),
+        model: "test-model".to_string(),
+    }
+}
+
+fn action_result_input() -> AIAgentInput {
+    AIAgentInput::ActionResult {
+        result: AIAgentActionResult {
+            id: AIAgentActionId::from("action".to_string()),
+            task_id: TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::ReadFiles(ReadFilesResult::Cancelled),
+        },
+        context: std::sync::Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+    }
+}
+
+fn resume_conversation_input() -> AIAgentInput {
+    AIAgentInput::ResumeConversation {
+        context: std::sync::Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+    }
+}
+
+#[test]
+fn local_route_continues_for_non_user_query_with_token() {
+    let mut params = request_params_with_ask_user_question_enabled(false);
+    let local_config = local_direct_config();
+    params.local_direct_config = Some(local_config.clone());
+    params.conversation_token = Some(ServerConversationToken::new(
+        "local-conversation".to_string(),
+    ));
+    params.input = vec![action_result_input()];
+
+    assert_eq!(local_direct_config_for_request(&params), Some(local_config));
+}
+
+#[test]
+fn local_route_skipped_for_non_user_query_without_token() {
+    let mut params = request_params_with_ask_user_question_enabled(false);
+    params.local_direct_config = Some(local_direct_config());
+    params.conversation_token = None;
+    params.input = vec![resume_conversation_input()];
+
+    assert_eq!(local_direct_config_for_request(&params), None);
 }
 
 #[test]

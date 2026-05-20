@@ -1,9 +1,11 @@
+mod tool_card;
+
 use std::{
     collections::HashSet,
     fmt, fs,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -11,15 +13,20 @@ use anyhow::anyhow;
 use async_stream::stream;
 use chrono::Local;
 use futures_lite::Stream;
-use futures_util::StreamExt as _;
+use futures_util::{future::join_all, StreamExt as _};
+use instant::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
+use self::tool_card::structured_tool_card_events;
+
 use crate::{
     ai::agent::{
-        api::Event, task::helper::TaskExt, AIAgentAttachment, AIAgentContext, AIAgentInput,
+        api::{Event, ServerConversationToken},
+        task::helper::TaskExt,
+        AIAgentAttachment, AIAgentContext, AIAgentInput,
     },
     server::server_api::AIApiError,
 };
@@ -107,6 +114,8 @@ struct OpenAIStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
     tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
 }
 
@@ -127,6 +136,7 @@ struct OpenAIStreamToolCallFunctionDelta {
 #[derive(Debug, PartialEq, Eq)]
 enum OpenAIStreamEvent {
     Delta(String),
+    ReasoningDelta(String),
     ToolCallDelta(OpenAIStreamToolCallDelta),
     Done,
 }
@@ -143,7 +153,6 @@ const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
 const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
 const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
-const MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS: usize = 1024;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. You may inspect files with read-only tools. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
@@ -152,13 +161,27 @@ pub fn generate_openai_compatible_output(
     config: LocalDirectConfig,
     input: Vec<AIAgentInput>,
     tasks: Vec<api::Task>,
+    conversation_token: Option<ServerConversationToken>,
 ) -> LocalResponseStream {
     Box::pin(stream! {
         let request_id = Uuid::new_v4().to_string();
-        let conversation_id = Uuid::new_v4().to_string();
+        let conversation_id = conversation_token
+            .as_ref()
+            .map(|token| token.as_str().to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let root_task_id = root_task_id(&tasks);
 
         yield Ok(stream_init(&request_id, &conversation_id));
+
+        let input_kinds = input
+            .iter()
+            .map(local_direct_input_kind)
+            .collect::<Vec<_>>();
+        log::debug!("Local direct agent input kinds: {}", input_kinds.join(","));
+        if !input.iter().any(|input| input.user_query().is_some()) {
+            yield Ok(stream_finished_done());
+            return;
+        }
 
         let (task_id, created_task) = match root_task_id {
             Some(task_id) => (task_id, false),
@@ -169,12 +192,21 @@ pub fn generate_openai_compatible_output(
         if created_task {
             yield Ok(create_task(&task_id));
         }
-        yield Ok(add_agent_output_message(
-            &task_id,
-            &request_id,
-            &message_id,
-            String::new(),
-        ));
+
+        let mut agent_output_message_started = false;
+        macro_rules! yield_agent_output_content {
+            ($text:expr) => {
+                for event in agent_output_content_events(
+                    &mut agent_output_message_started,
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    $text,
+                ) {
+                    yield Ok(event);
+                }
+            };
+        }
 
         let mut messages = match openai_messages_from_inputs_and_tasks(&input, &tasks) {
             Ok(messages) => messages,
@@ -185,8 +217,10 @@ pub fn generate_openai_compatible_output(
         };
         let cwd = local_tool_cwd(&input);
         let mut received_token = false;
+        let mut reasoning_message_id: Option<String> = None;
+        let mut reasoning_started_at: Option<Instant> = None;
         let mut tool_result_summaries = Vec::new();
-        let mut suggested_shell_commands = HashSet::new();
+        let suggested_shell_commands = Arc::new(Mutex::new(HashSet::new()));
 
         for round in 0..MAX_LOCAL_DIRECT_TOOL_ROUNDS {
             log::debug!("Starting local direct tool loop round {}", round + 1);
@@ -223,12 +257,27 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield Ok(append_agent_output_message_content(
-                                &task_id,
-                                &request_id,
-                                &message_id,
-                                token,
-                            ));
+                            yield_agent_output_content!(token);
+                        }
+                        OpenAIStreamEvent::ReasoningDelta(token) => {
+                            if let Some(reasoning_id) = &reasoning_message_id {
+                                yield Ok(append_agent_reasoning_content(
+                                    &task_id,
+                                    &request_id,
+                                    reasoning_id,
+                                    token,
+                                ));
+                            } else {
+                                reasoning_started_at = Some(Instant::now());
+                                let reasoning_id = Uuid::new_v4().to_string();
+                                yield Ok(add_agent_reasoning_message(
+                                    &task_id,
+                                    &request_id,
+                                    &reasoning_id,
+                                    token,
+                                ));
+                                reasoning_message_id = Some(reasoning_id);
+                            }
                         }
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
@@ -258,12 +307,27 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield Ok(append_agent_output_message_content(
-                                &task_id,
-                                &request_id,
-                                &message_id,
-                                token,
-                            ));
+                            yield_agent_output_content!(token);
+                        }
+                        OpenAIStreamEvent::ReasoningDelta(token) => {
+                            if let Some(reasoning_id) = &reasoning_message_id {
+                                yield Ok(append_agent_reasoning_content(
+                                    &task_id,
+                                    &request_id,
+                                    reasoning_id,
+                                    token,
+                                ));
+                            } else {
+                                reasoning_started_at = Some(Instant::now());
+                                let reasoning_id = Uuid::new_v4().to_string();
+                                yield Ok(add_agent_reasoning_message(
+                                    &task_id,
+                                    &request_id,
+                                    &reasoning_id,
+                                    token,
+                                ));
+                                reasoning_message_id = Some(reasoning_id);
+                            }
                         }
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
@@ -275,6 +339,14 @@ pub fn generate_openai_compatible_output(
 
             let tool_calls = tool_call_accumulator.into_tool_calls();
             if tool_calls.is_empty() {
+                if let (Some(reasoning_id), Some(started_at)) = (&reasoning_message_id, reasoning_started_at) {
+                    yield Ok(finish_agent_reasoning_message(
+                        &task_id,
+                        &request_id,
+                        reasoning_id,
+                        started_at.elapsed(),
+                    ));
+                }
                 match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
                     EmptyLocalProviderResponseResolution::Finish => {
                         yield Ok(stream_finished_done());
@@ -284,12 +356,7 @@ pub fn generate_openai_compatible_output(
                         log::info!(
                             "Local direct provider returned empty final answer after tool results; emitting fallback summary"
                         );
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            fallback,
-                        ));
+                        yield_agent_output_content!(fallback);
                         yield Ok(stream_finished_done());
                         return;
                     }
@@ -305,16 +372,49 @@ pub fn generate_openai_compatible_output(
             messages.push(openai_assistant_tool_call_message(tool_calls.clone()));
             let should_finalize = tool_calls_require_finalize(&tool_calls);
 
-            for tool_call in tool_calls {
-                let result = execute_local_tool(&tool_call, cwd.as_deref(), &mut suggested_shell_commands);
+            let tool_results = join_all(tool_calls.into_iter().map(|tool_call| {
+                let cwd = cwd.clone();
+                let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+                async move {
+                    let tool_call_for_error = tool_call.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let result = execute_local_tool(
+                            &tool_call,
+                            cwd.as_deref(),
+                            &suggested_shell_commands,
+                        );
+                        (tool_call, result)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => (
+                            tool_call_for_error,
+                            format!("Tool error: Local tool task failed: {error}"),
+                        ),
+                    }
+                }
+            }))
+            .await;
+
+            for (tool_call, result) in tool_results {
                 log_local_tool_result(&tool_call, &result);
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
-                yield Ok(append_agent_output_message_content(
+                if tool_call.function.name == "suggest_shell_command" {
+                    yield_agent_output_content!(local_shell_command_display_summary(
+                        &tool_call.function.arguments,
+                        &result,
+                    ));
+                } else if let Some(events) = structured_tool_card_events(
                     &task_id,
                     &request_id,
-                    &message_id,
-                    local_tool_display_summary(&tool_call, &result),
-                ));
+                    &tool_call,
+                    &result,
+                ) {
+                    for event in events {
+                        yield Ok(event);
+                    }
+                }
                 messages.push(openai_tool_message(tool_call.id, result));
             }
 
@@ -356,12 +456,27 @@ pub fn generate_openai_compatible_output(
                 match event {
                     OpenAIStreamEvent::Delta(token) => {
                         finalize_received_token = true;
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            token,
-                        ));
+                        yield_agent_output_content!(token);
+                    }
+                    OpenAIStreamEvent::ReasoningDelta(token) => {
+                        if let Some(reasoning_id) = &reasoning_message_id {
+                            yield Ok(append_agent_reasoning_content(
+                                &task_id,
+                                &request_id,
+                                reasoning_id,
+                                token,
+                            ));
+                        } else {
+                            reasoning_started_at = Some(Instant::now());
+                            let reasoning_id = Uuid::new_v4().to_string();
+                            yield Ok(add_agent_reasoning_message(
+                                &task_id,
+                                &request_id,
+                                &reasoning_id,
+                                token,
+                            ));
+                            reasoning_message_id = Some(reasoning_id);
+                        }
                     }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
                     OpenAIStreamEvent::Done => {
@@ -389,17 +504,41 @@ pub fn generate_openai_compatible_output(
                 match event {
                     OpenAIStreamEvent::Delta(token) => {
                         finalize_received_token = true;
-                        yield Ok(append_agent_output_message_content(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            token,
-                        ));
+                        yield_agent_output_content!(token);
+                    }
+                    OpenAIStreamEvent::ReasoningDelta(token) => {
+                        if let Some(reasoning_id) = &reasoning_message_id {
+                            yield Ok(append_agent_reasoning_content(
+                                &task_id,
+                                &request_id,
+                                reasoning_id,
+                                token,
+                            ));
+                        } else {
+                            reasoning_started_at = Some(Instant::now());
+                            let reasoning_id = Uuid::new_v4().to_string();
+                            yield Ok(add_agent_reasoning_message(
+                                &task_id,
+                                &request_id,
+                                &reasoning_id,
+                                token,
+                            ));
+                            reasoning_message_id = Some(reasoning_id);
+                        }
                     }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
                     OpenAIStreamEvent::Done => break,
                 }
             }
+        }
+
+        if let (Some(reasoning_id), Some(started_at)) = (&reasoning_message_id, reasoning_started_at) {
+            yield Ok(finish_agent_reasoning_message(
+                &task_id,
+                &request_id,
+                reasoning_id,
+                started_at.elapsed(),
+            ));
         }
 
         if finalize_received_token {
@@ -409,20 +548,12 @@ pub fn generate_openai_compatible_output(
 
         match fallback_tool_results_message(&tool_result_summaries) {
             Some(fallback) => {
-                yield Ok(append_agent_output_message_content(
-                    &task_id,
-                    &request_id,
-                    &message_id,
-                    fallback,
-                ));
+                yield_agent_output_content!(fallback);
             }
             None => {
-                yield Ok(append_agent_output_message_content(
-                    &task_id,
-                    &request_id,
-                    &message_id,
-                    "I suggested commands but did not run anything; tell me what to do next.".to_string(),
-                ));
+                yield_agent_output_content!(
+                    "I suggested commands but did not run anything; tell me what to do next.".to_string()
+                );
             }
         }
         yield Ok(stream_finished_done());
@@ -482,6 +613,29 @@ fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
     tool_calls
         .iter()
         .any(|call| call.function.name == "suggest_shell_command")
+}
+
+fn local_direct_input_kind(input: &AIAgentInput) -> &'static str {
+    match input {
+        AIAgentInput::UserQuery { .. } => "UserQuery",
+        AIAgentInput::AutoCodeDiffQuery { .. } => "AutoCodeDiffQuery",
+        AIAgentInput::ResumeConversation { .. } => "ResumeConversation",
+        AIAgentInput::InitProjectRules { .. } => "InitProjectRules",
+        AIAgentInput::CreateEnvironment { .. } => "CreateEnvironment",
+        AIAgentInput::TriggerPassiveSuggestion { .. } => "TriggerPassiveSuggestion",
+        AIAgentInput::CreateNewProject { .. } => "CreateNewProject",
+        AIAgentInput::CloneRepository { .. } => "CloneRepository",
+        AIAgentInput::CodeReview { .. } => "CodeReview",
+        AIAgentInput::FetchReviewComments { .. } => "FetchReviewComments",
+        AIAgentInput::SummarizeConversation { .. } => "SummarizeConversation",
+        AIAgentInput::InvokeSkill { .. } => "InvokeSkill",
+        AIAgentInput::StartFromAmbientRunPrompt { .. } => "StartFromAmbientRunPrompt",
+        AIAgentInput::ActionResult { .. } => "ActionResult",
+        AIAgentInput::MessagesReceivedFromAgents { .. } => "MessagesReceivedFromAgents",
+        AIAgentInput::EventsFromAgents { .. } => "EventsFromAgents",
+        AIAgentInput::PassiveSuggestionResult { .. } => "PassiveSuggestionResult",
+        AIAgentInput::OrchestrationConfigUpdate { .. } => "OrchestrationConfigUpdate",
+    }
 }
 
 fn openai_messages_from_inputs_and_tasks(
@@ -666,22 +820,41 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
                 }),
             },
         },
+        OpenAIChatTool {
+            r#type: "function",
+            function: OpenAIChatToolFunction {
+                name: "list_directory",
+                description: "List files and directories under a local directory. Use only for read-only inspection.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Optional directory path, absolute or relative to cwd. Defaults to cwd." },
+                        "max_depth": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Optional traversal depth. Defaults to 1 and is clamped to 1..=3." },
+                        "max_entries": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Optional maximum entries to return. Defaults to 200 and is clamped to 1..=2000." }
+                    }
+                }),
+            },
+        },
     ]
 }
 
 fn execute_local_tool(
     tool_call: &OpenAIChatToolCall,
     cwd: Option<&Path>,
-    suggested_shell_commands: &mut HashSet<String>,
+    suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
 ) -> String {
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd),
         "grep" => execute_grep_tool(&tool_call.function.arguments, cwd),
         "glob" => execute_glob_tool(&tool_call.function.arguments, cwd),
-        "suggest_shell_command" => execute_suggest_shell_command_tool(
-            &tool_call.function.arguments,
-            suggested_shell_commands,
-        ),
+        "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd),
+        "suggest_shell_command" => match suggested_shell_commands.lock() {
+            Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
+                &tool_call.function.arguments,
+                &mut suggested_shell_commands,
+            ),
+            Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
+        },
         name => Err(anyhow!("Unknown local tool: {name}")),
     };
 
@@ -746,32 +919,11 @@ fn local_tool_result_summary(tool_call: &OpenAIChatToolCall, result: &str) -> St
     )
 }
 
-fn local_tool_display_summary(tool_call: &OpenAIChatToolCall, result: &str) -> String {
-    if tool_call.function.name == "suggest_shell_command" {
-        return local_shell_command_display_summary(&tool_call.function.arguments, result);
-    }
-
-    let arguments = truncate_message_content_from_start(
-        &tool_call.function.arguments,
-        MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
-    );
-    let preview =
-        truncate_message_content_from_start(result, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS);
-    let stats = local_tool_result_stats(&tool_call.function.name, result);
-    format!(
-        "\n\n> Local tool: {}\n> Arguments: `{}`\n> Result: {}\n> Preview:\n> ```\n{}\n> ```\n\n",
-        tool_call.function.name,
-        escape_markdown_inline_code(&arguments),
-        stats,
-        quote_markdown_preview(&preview)
-    )
-}
-
 fn local_shell_command_display_summary(arguments: &str, result: &str) -> String {
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
         return format!(
             "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
-            local_tool_result_stats("suggest_shell_command", result)
+            shell_command_result_summary(result)
         );
     };
     let command = args
@@ -792,7 +944,7 @@ fn local_shell_command_display_summary(arguments: &str, result: &str) -> String 
     if command.is_empty() || result.starts_with("Tool error:") {
         return format!(
             "\n\n> Local tool: suggest_shell_command\n> Result: {}\n\n",
-            local_tool_result_stats("suggest_shell_command", result)
+            shell_command_result_summary(result)
         );
     }
 
@@ -802,46 +954,11 @@ fn local_shell_command_display_summary(arguments: &str, result: &str) -> String 
     )
 }
 
-fn local_tool_result_stats(tool_name: &str, result: &str) -> String {
+fn shell_command_result_summary(result: &str) -> String {
     if let Some(error) = result.strip_prefix("Tool error:") {
         return format!("error: {}", error.trim());
     }
-
-    match tool_name {
-        "read_file" => {
-            let line_count = result.lines().count().saturating_sub(1);
-            format!("read {line_count} lines / {} chars", result.chars().count())
-        }
-        "grep" => {
-            let matches = result
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            let file_count = result
-                .lines()
-                .filter_map(|line| line.split_once(':').map(|(file, _)| file))
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            format!("{matches} matches / {file_count} files")
-        }
-        "glob" => {
-            let files = result
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            format!("{files} files")
-        }
-        "suggest_shell_command" => "suggested; not executed".to_string(),
-        _ => format!("{} chars", result.chars().count()),
-    }
-}
-
-fn escape_markdown_inline_code(text: &str) -> String {
-    text.replace('`', "\\`")
-}
-
-fn quote_markdown_preview(text: &str) -> String {
-    text.lines().collect::<Vec<_>>().join("\n> ")
+    "suggested; not executed".to_string()
 }
 
 fn fallback_tool_results_message(tool_result_summaries: &[String]) -> Option<String> {
@@ -1027,6 +1144,68 @@ fn execute_glob_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<Stri
         "No files matched.".to_string()
     } else {
         results.join("\n")
+    })
+}
+
+fn execute_list_directory_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid list_directory arguments"))?;
+    let path = optional_string_arg(&args, "path").unwrap_or(".");
+    let root = resolve_local_tool_path(path, cwd)?;
+    let metadata = fs::metadata(&root)
+        .map_err(|_| anyhow!("Directory is not readable: {}", root.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!("Path is not a directory: {}", root.display()));
+    }
+
+    let max_depth = optional_usize_arg(&args, "max_depth")
+        .unwrap_or(1)
+        .clamp(1, 3);
+    let max_entries = optional_usize_arg(&args, "max_entries")
+        .unwrap_or(200)
+        .clamp(1, 2000);
+    let skipped_directories = [".git", "node_modules", "target"];
+    let mut entries = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&root)
+        .max_depth(max_depth)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !skipped_directories.iter().any(|name| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|entry_name| entry_name == *name)
+                })
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if !file_type.is_file() && !file_type.is_dir() {
+            continue;
+        }
+        let kind = if file_type.is_dir() { "dir" } else { "file" };
+        let path = entry
+            .path()
+            .strip_prefix(&root)
+            .ok()
+            .unwrap_or_else(|| entry.path());
+        entries.push(format!("{kind}: {}", path.display()));
+        if entries.len() >= max_entries {
+            break;
+        }
+    }
+    entries.sort();
+
+    Ok(if entries.is_empty() {
+        "No entries found.".to_string()
+    } else {
+        entries.join("\n")
     })
 }
 
@@ -1533,6 +1712,14 @@ fn drain_sse_events(pending: &mut String) -> anyhow::Result<Vec<OpenAIStreamEven
             continue;
         };
         for choice in event.choices {
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .or(choice.delta.reasoning)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                events.push(OpenAIStreamEvent::ReasoningDelta(reasoning));
+            }
             if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                 events.push(OpenAIStreamEvent::Delta(content));
             }
@@ -1659,6 +1846,147 @@ fn append_agent_output_message_content(
     }
 }
 
+fn agent_output_content_events(
+    agent_output_message_started: &mut bool,
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    text: String,
+) -> Vec<api::ResponseEvent> {
+    let mut events = Vec::new();
+    if !*agent_output_message_started {
+        events.push(add_agent_output_message(
+            task_id,
+            request_id,
+            message_id,
+            String::new(),
+        ));
+        *agent_output_message_started = true;
+    }
+    events.push(append_agent_output_message_content(
+        task_id, request_id, message_id, text,
+    ));
+    events
+}
+
+fn add_agent_reasoning_message(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    reasoning: String,
+) -> api::ResponseEvent {
+    let now = Local::now();
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.to_string(),
+                            messages: vec![api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: Some(prost_types::Timestamp {
+                                    seconds: now.timestamp(),
+                                    nanos: now.timestamp_subsec_nanos() as i32,
+                                }),
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning,
+                                        finished_duration: None,
+                                    },
+                                )),
+                            }],
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn append_agent_reasoning_content(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    reasoning: String,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AppendToMessageContent(
+                        api::client_action::AppendToMessageContent {
+                            task_id: task_id.to_string(),
+                            message: Some(api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: None,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning,
+                                        finished_duration: None,
+                                    },
+                                )),
+                            }),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_reasoning.reasoning".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn finish_agent_reasoning_message(
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    duration: Duration,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::UpdateTaskMessage(
+                        api::client_action::UpdateTaskMessage {
+                            task_id: task_id.to_string(),
+                            message: Some(api::Message {
+                                id: message_id.to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: None,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentReasoning(
+                                    api::message::AgentReasoning {
+                                        reasoning: String::new(),
+                                        finished_duration: Some(prost_types::Duration {
+                                            seconds: duration.as_secs() as i64,
+                                            nanos: duration.subsec_nanos() as i32,
+                                        }),
+                                    },
+                                )),
+                            }),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_reasoning.finished_duration".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
 fn stream_finished_done() -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::Finished(
@@ -1689,20 +2017,30 @@ fn stream_finished_done() -> api::ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_completions_url, drain_sse_events, empty_local_provider_response_resolution,
-        execute_glob_tool, execute_grep_tool, execute_local_tool, execute_read_file_tool,
-        execute_suggest_shell_command_tool, fallback_tool_results_message, local_read_only_tools,
-        local_tool_display_summary, local_tool_result_stats, local_tool_result_summary,
+        agent_output_content_events, chat_completions_url, drain_sse_events,
+        empty_local_provider_response_resolution, execute_glob_tool, execute_grep_tool,
+        execute_list_directory_tool, execute_local_tool, execute_read_file_tool,
+        execute_suggest_shell_command_tool, fallback_tool_results_message,
+        generate_openai_compatible_output, local_read_only_tools, local_tool_result_summary,
         openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
-        EmptyLocalProviderResponseResolution, OpenAIChatRequest, OpenAIChatToolCall,
-        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
-        LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
-        MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
-        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS,
+        EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
+        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
+        OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
+        MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
+        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
+    };
+    use crate::ai::agent::{
+        api::ServerConversationToken, local::tool_card::test_tool_card_events, AIAgentContext,
+        AIAgentInput,
     };
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
-    use std::collections::{HashMap, HashSet};
+    use futures_util::StreamExt as _;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
+    use uuid::Uuid;
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
 
@@ -1733,6 +2071,55 @@ mod tests {
         }
     }
 
+    fn local_direct_config() -> LocalDirectConfig {
+        LocalDirectConfig {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test-model".to_string(),
+        }
+    }
+
+    fn first_stream_init_conversation_id(
+        conversation_token: Option<ServerConversationToken>,
+    ) -> String {
+        futures::executor::block_on(async move {
+            let mut stream = generate_openai_compatible_output(
+                local_direct_config(),
+                vec![user_query_input("hello", Vec::new(), HashMap::new())],
+                Vec::new(),
+                conversation_token,
+            );
+            let event = stream.next().await.unwrap().unwrap();
+            let Some(api::response_event::Type::Init(init)) = event.r#type else {
+                panic!("expected stream init");
+            };
+            init.conversation_id
+        })
+    }
+
+    fn message_kind(event: &api::ResponseEvent) -> &'static str {
+        let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+            return "other";
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) = actions
+            .actions
+            .first()
+            .and_then(|action| action.action.as_ref())
+        else {
+            return "other";
+        };
+        match add
+            .messages
+            .first()
+            .and_then(|message| message.message.as_ref())
+        {
+            Some(api::message::Message::AgentOutput(_)) => "agent_output",
+            Some(api::message::Message::ToolCall(_)) => "tool_call",
+            Some(api::message::Message::ToolCallResult(_)) => "tool_call_result",
+            _ => "other",
+        }
+    }
+
     #[test]
     fn chat_completions_url_appends_path_to_base_url() {
         assert_eq!(
@@ -1746,6 +2133,107 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://example.com/v1/chat/completions"),
             "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn local_stream_init_reuses_conversation_token() {
+        let conversation_id = first_stream_init_conversation_id(Some(
+            ServerConversationToken::new("server-conversation-token".to_string()),
+        ));
+
+        assert_eq!(conversation_id, "server-conversation-token");
+    }
+
+    #[test]
+    fn local_stream_init_generates_uuid_without_conversation_token() {
+        let conversation_id = first_stream_init_conversation_id(None);
+
+        assert!(Uuid::parse_str(&conversation_id).is_ok());
+    }
+
+    #[test]
+    fn local_stream_finishes_non_user_query_without_provider_request() {
+        futures::executor::block_on(async {
+            let mut stream = generate_openai_compatible_output(
+                local_direct_config(),
+                vec![AIAgentInput::ResumeConversation {
+                    context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+                }],
+                Vec::new(),
+                Some(ServerConversationToken::new(
+                    "local-conversation".to_string(),
+                )),
+            );
+
+            let init = stream.next().await.unwrap().unwrap();
+            assert!(matches!(
+                init.r#type,
+                Some(api::response_event::Type::Init(_))
+            ));
+
+            let finished = stream.next().await.unwrap().unwrap();
+            assert!(matches!(
+                finished.r#type,
+                Some(api::response_event::Type::Finished(_))
+            ));
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn defers_agent_output_message_until_first_content() {
+        let tool_call = tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        let mut events = test_tool_card_events(
+            "task",
+            "request",
+            &tool_call,
+            "File: /repo/Cargo.toml\n1: [workspace]",
+        )
+        .unwrap();
+        let mut agent_output_started = false;
+        events.extend(agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            "final answer".to_string(),
+        ));
+
+        let kinds = events.iter().map(message_kind).collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec!["tool_call", "tool_call_result", "agent_output", "other"]
+        );
+    }
+
+    #[test]
+    fn creates_agent_output_message_on_first_text_delta() {
+        let mut agent_output_started = false;
+
+        let first = agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            "hello".to_string(),
+        );
+        let second = agent_output_content_events(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            " world".to_string(),
+        );
+
+        assert_eq!(
+            first.iter().map(message_kind).collect::<Vec<_>>(),
+            vec!["agent_output", "other"]
+        );
+        assert_eq!(
+            second.iter().map(message_kind).collect::<Vec<_>>(),
+            vec!["other"]
         );
     }
 
@@ -1822,6 +2310,34 @@ mod tests {
     }
 
     #[test]
+    fn drain_sse_events_extracts_reasoning_content() {
+        let mut pending =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n".to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(
+            events,
+            vec![OpenAIStreamEvent::ReasoningDelta("hmm".to_string())]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_sse_events_extracts_reasoning_alias() {
+        let mut pending =
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n".to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(
+            events,
+            vec![OpenAIStreamEvent::ReasoningDelta("thinking".to_string())]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn drain_sse_events_extracts_tool_call_deltas() {
         let mut pending = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
@@ -1859,7 +2375,13 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["read_file", "grep", "glob", "suggest_shell_command"]
+            vec![
+                "read_file",
+                "grep",
+                "glob",
+                "suggest_shell_command",
+                "list_directory"
+            ]
         );
     }
 
@@ -1917,6 +2439,10 @@ mod tests {
             "read_file",
             r#"{"path":"Cargo.toml"}"#,
         )]));
+        assert!(!super::tool_calls_require_finalize(&[tool_call(
+            "list_directory",
+            r#"{"path":"."}"#,
+        )]));
     }
 
     #[test]
@@ -1962,10 +2488,10 @@ mod tests {
 
     #[test]
     fn execute_local_tool_handles_shell_suggestion_without_execution() {
-        let mut suggestions = HashSet::new();
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
         let tool_call = tool_call("suggest_shell_command", r#"{"command":"cargo test"}"#);
 
-        let result = execute_local_tool(&tool_call, None, &mut suggestions);
+        let result = execute_local_tool(&tool_call, None, &suggestions);
 
         assert!(result.contains("NOT executed"));
         assert!(result.contains("Stop calling tools"));
@@ -2044,66 +2570,132 @@ mod tests {
     }
 
     #[test]
-    fn local_tool_display_summary_formats_read_file_stats_and_preview() {
-        let tool_call = tool_call("read_file", "{\"path\":\"Cargo.toml\"}");
-        let result = "File: Cargo.toml\n1: [workspace]\n2: members = []";
-
-        let summary = local_tool_display_summary(&tool_call, result);
-
-        assert!(summary.contains("> Local tool: read_file"));
-        assert!(summary.contains("Arguments: `{"));
-        assert!(summary.contains("read 2 lines"));
-        assert!(summary.contains("1: [workspace]"));
-    }
-
-    #[test]
-    fn local_tool_display_summary_formats_shell_command_suggestion() {
+    fn execute_grep_tool_emits_tool_call_and_result_messages() {
         let tool_call = tool_call(
-            "suggest_shell_command",
-            "{\"command\":\"git status\",\"rationale\":\"inspect repo\",\"is_read_only\":true,\"is_risky\":false,\"expected_output\":\"status\"}",
+            "grep",
+            r#"{"query":"alpha","path":"src","case_sensitive":true}"#,
         );
+        let result = "/repo/src/a.rs:3: alpha\n/repo/src/a.rs:7: alpha";
 
-        let summary = local_tool_display_summary(
-            &tool_call,
-            "Shell command was suggested to the user but was not executed.",
-        );
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
 
-        assert!(summary.contains("> Local tool: suggest_shell_command"));
-        assert!(summary.contains("```bash\ngit status\n```"));
-        assert!(summary.contains("Rationale: inspect repo"));
-        assert!(summary.contains("Run this manually"));
+        assert_eq!(events.len(), 2);
+        let api::response_event::Type::ClientActions(actions) = events[0].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCall(tool_call_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call message");
+        };
+        assert_eq!(tool_call_message.tool_call_id, "call_1");
+        let Some(api::message::tool_call::Tool::Grep(grep)) = tool_call_message.tool.as_ref()
+        else {
+            panic!("expected grep tool call");
+        };
+        assert_eq!(grep.queries, vec!["alpha"]);
+        assert_eq!(grep.path, "src");
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        assert_eq!(result_message.tool_call_id, "call_1");
+        let Some(api::message::tool_call_result::Result::Grep(grep_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected grep result");
+        };
+        let Some(api::grep_result::Result::Success(success)) = grep_result.result.as_ref() else {
+            panic!("expected grep success");
+        };
+        assert_eq!(success.matched_files.len(), 1);
+        assert_eq!(success.matched_files[0].file_path, "/repo/src/a.rs");
+        assert_eq!(success.matched_files[0].matched_lines.len(), 2);
+        assert_eq!(success.matched_files[0].matched_lines[0].line_number, 3);
     }
 
     #[test]
-    fn local_tool_result_stats_formats_grep_and_glob_counts() {
-        assert_eq!(
-            local_tool_result_stats("grep", "src/a.rs:1: alpha\nsrc/b.rs:2: alpha"),
-            "2 matches / 2 files"
-        );
-        assert_eq!(
-            local_tool_result_stats("glob", "src/a.rs\nsrc/b.rs\n"),
-            "2 files"
-        );
+    fn execute_read_file_tool_emits_text_files_success() {
+        let tool_call = tool_call("read_file", r#"{"path":"Cargo.toml"}"#);
+        let result = "File: /repo/Cargo.toml\n1: [workspace]";
+
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        let Some(api::message::tool_call_result::Result::ReadFiles(read_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected read files result");
+        };
+        let Some(api::read_files_result::Result::TextFilesSuccess(success)) =
+            read_result.result.as_ref()
+        else {
+            panic!("expected text files success");
+        };
+        assert_eq!(success.files[0].file_path, "/repo/Cargo.toml");
+        assert_eq!(success.files[0].content, "1: [workspace]");
     }
 
     #[test]
-    fn local_tool_display_summary_formats_errors() {
-        let tool_call = tool_call("read_file", "{\"path\":\"missing\"}");
+    fn execute_grep_tool_emits_error_on_invalid_regex() {
+        let tool_call = tool_call("grep", r#"{"query":"["}"#);
+        let result = "Tool error: Invalid grep arguments";
 
-        let summary = local_tool_display_summary(&tool_call, "Tool error: File is not readable");
+        let events = test_tool_card_events("task", "request", &tool_call, result).unwrap();
 
-        assert!(summary.contains("Result: error: File is not readable"));
-    }
-
-    #[test]
-    fn local_tool_display_summary_truncates_preview() {
-        let tool_call = tool_call("grep", "{\"query\":\"alpha\"}");
-        let result = "x".repeat(MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 100);
-
-        let summary = local_tool_display_summary(&tool_call, &result);
-
-        assert!(summary.contains("> Local tool: grep"));
-        assert!(summary.chars().count() < MAX_LOCAL_DIRECT_TOOL_DISPLAY_PREVIEW_CHARS + 300);
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        let Some(api::message::tool_call_result::Result::Grep(grep_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected grep result");
+        };
+        let Some(api::grep_result::Result::Error(error)) = grep_result.result.as_ref() else {
+            panic!("expected grep error");
+        };
+        assert_eq!(error.message, "Invalid grep arguments");
     }
 
     #[test]
@@ -2160,6 +2752,26 @@ mod tests {
 
         assert!(result.contains("main.rs"));
         assert!(!result.contains("README.md"));
+    }
+
+    #[test]
+    fn list_directory_tool_lists_entries_and_skips_large_dirs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("src")).unwrap();
+        std::fs::write(temp_dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir(temp_dir.path().join("target")).unwrap();
+        std::fs::write(temp_dir.path().join("target/ignored.txt"), "ignored").unwrap();
+
+        let result = execute_list_directory_tool(
+            r#"{"path":".","max_depth":3,"max_entries":2000}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert!(result.contains("dir: src"));
+        assert!(result.contains("file: src/main.rs"));
+        assert!(!result.contains("target"));
+        assert!(!result.contains("ignored.txt"));
     }
 
     #[test]
