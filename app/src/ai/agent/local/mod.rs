@@ -3,7 +3,7 @@ mod mcp_tools;
 mod tool_card;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
     pin::Pin,
@@ -798,17 +798,25 @@ fn openai_messages_from_inputs_and_tasks(
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
     let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context);
+    let mcp_tool_call_metadata_by_id =
+        mcp_tool_call_metadata_by_id(tasks, mcp_tool_catalog.as_ref());
 
     append_history_messages(&mut messages, tasks, mcp_tool_catalog.as_ref());
     let mut appended_action_result = false;
     for input in input {
         if let AIAgentInput::ActionResult { result, .. } = input {
             if !messages_have_tool_call(&messages, &result.id.to_string()) {
-                if let Some(tool_call) = openai_tool_call_from_action_result(result) {
+                if let Some(tool_call) = openai_tool_call_from_action_result(
+                    result,
+                    mcp_tool_call_metadata_by_id.get(&result.id.to_string()),
+                ) {
                     messages.push(openai_assistant_tool_call_message(vec![tool_call]));
                 }
             }
-            if let Some(message) = openai_tool_message_from_action_result(result) {
+            if let Some(message) = openai_tool_message_from_action_result(
+                result,
+                mcp_tool_call_metadata_by_id.get(&result.id.to_string()),
+            ) {
                 messages.push(message);
                 appended_action_result = true;
             }
@@ -874,6 +882,7 @@ fn openai_assistant_tool_call_message(tool_calls: Vec<OpenAIChatToolCall>) -> Op
 
 fn openai_tool_message_from_action_result(
     result: &AIAgentActionResult,
+    mcp_metadata: Option<&McpToolCallMetadata>,
 ) -> Option<OpenAIChatMessage> {
     match &result.result {
         AIAgentActionResultType::RequestCommandOutput(command_result) => Some(openai_tool_message(
@@ -882,13 +891,20 @@ fn openai_tool_message_from_action_result(
         )),
         AIAgentActionResultType::CallMCPTool(mcp_result) => Some(openai_tool_message(
             result.id.to_string(),
-            mcp_tool_result_for_provider(None, None, mcp_result),
+            mcp_tool_result_for_provider(
+                mcp_metadata.map(|metadata| metadata.server_name.as_str()),
+                mcp_metadata.map(|metadata| metadata.tool_name.as_str()),
+                mcp_result,
+            ),
         )),
         _ => None,
     }
 }
 
-fn openai_tool_call_from_action_result(result: &AIAgentActionResult) -> Option<OpenAIChatToolCall> {
+fn openai_tool_call_from_action_result(
+    result: &AIAgentActionResult,
+    mcp_metadata: Option<&McpToolCallMetadata>,
+) -> Option<OpenAIChatToolCall> {
     match &result.result {
         AIAgentActionResultType::RequestCommandOutput(command_result) => {
             let command = match command_result {
@@ -910,7 +926,9 @@ fn openai_tool_call_from_action_result(result: &AIAgentActionResult) -> Option<O
             id: result.id.to_string(),
             r#type: "function",
             function: OpenAIChatToolCallFunction {
-                name: "mcp__unknown__tool".to_string(),
+                name: mcp_metadata
+                    .map(|metadata| metadata.openai_name.clone())
+                    .unwrap_or_else(|| "mcp__unknown__tool".to_string()),
                 arguments: json!({}).to_string(),
             },
         }),
@@ -2175,6 +2193,7 @@ fn append_history_messages(
         .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
         .collect::<Vec<_>>();
     history.reverse();
+    let mut mcp_tool_calls_by_id: HashMap<String, McpToolCallMetadata> = HashMap::new();
     for message in history {
         match &message.message {
             Some(api::message::Message::UserQuery(query)) if !query.query.is_empty() => {
@@ -2190,18 +2209,76 @@ fn append_history_messages(
                 ));
             }
             Some(api::message::Message::ToolCall(tool_call)) => {
+                if let Some(metadata) = mcp_tool_call_metadata_from_api(tool_call, mcp_tool_catalog)
+                {
+                    mcp_tool_calls_by_id.insert(tool_call.tool_call_id.clone(), metadata);
+                }
                 if let Some(tool_call) = openai_tool_call_from_api(tool_call, mcp_tool_catalog) {
                     messages.push(openai_assistant_tool_call_message(vec![tool_call]));
                 }
             }
             Some(api::message::Message::ToolCallResult(tool_call_result)) => {
-                if let Some(message) = openai_tool_message_from_api(tool_call_result) {
+                if let Some(message) = openai_tool_message_from_api(
+                    tool_call_result,
+                    mcp_tool_calls_by_id.get(&tool_call_result.tool_call_id),
+                ) {
                     messages.push(message);
                 }
             }
             _ => {}
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpToolCallMetadata {
+    openai_name: String,
+    server_name: String,
+    tool_name: String,
+}
+
+fn mcp_tool_call_metadata_by_id(
+    tasks: &[api::Task],
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+) -> HashMap<String, McpToolCallMetadata> {
+    let mut metadata_by_id = HashMap::new();
+    for task in tasks {
+        for message in &task.messages {
+            let Some(api::message::Message::ToolCall(tool_call)) = &message.message else {
+                continue;
+            };
+            if let Some(metadata) = mcp_tool_call_metadata_from_api(tool_call, mcp_tool_catalog) {
+                metadata_by_id.insert(tool_call.tool_call_id.clone(), metadata);
+            }
+        }
+    }
+    metadata_by_id
+}
+
+fn mcp_tool_call_metadata_from_api(
+    tool_call: &api::message::ToolCall,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+) -> Option<McpToolCallMetadata> {
+    let Some(api::message::tool_call::Tool::CallMcpTool(call)) = &tool_call.tool else {
+        return None;
+    };
+    if let Some(entry) = mcp_tool_catalog.and_then(|catalog| {
+        catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.server_id == call.server_id && entry.mcp_tool_name == call.name)
+    }) {
+        return Some(McpToolCallMetadata {
+            openai_name: entry.openai_name.clone(),
+            server_name: entry.server_name.clone(),
+            tool_name: entry.mcp_tool_name.clone(),
+        });
+    }
+    Some(McpToolCallMetadata {
+        openai_name: format!("mcp__unknown__{}", sanitize_openai_tool_name(&call.name)),
+        server_name: call.server_id.clone(),
+        tool_name: call.name.clone(),
+    })
 }
 
 fn openai_tool_call_from_api(
@@ -2254,6 +2331,7 @@ fn openai_tool_call_from_api(
 
 fn openai_tool_message_from_api(
     tool_call_result: &api::message::ToolCallResult,
+    mcp_metadata: Option<&McpToolCallMetadata>,
 ) -> Option<OpenAIChatMessage> {
     let result = tool_call_result.result.as_ref()?;
     match result {
@@ -2265,8 +2343,22 @@ fn openai_tool_message_from_api(
         }
         api::message::tool_call_result::Result::CallMcpTool(result) => Some(openai_tool_message(
             tool_call_result.tool_call_id.clone(),
-            mcp_tool_api_result_for_provider(None, None, result),
+            mcp_tool_api_result_for_provider(
+                mcp_metadata.map(|metadata| metadata.server_name.as_str()),
+                mcp_metadata.map(|metadata| metadata.tool_name.as_str()),
+                result,
+            ),
         )),
+        api::message::tool_call_result::Result::Cancel(_) if mcp_metadata.is_some() => {
+            Some(openai_tool_message(
+                tool_call_result.tool_call_id.clone(),
+                mcp_tool_result_for_provider(
+                    mcp_metadata.map(|metadata| metadata.server_name.as_str()),
+                    mcp_metadata.map(|metadata| metadata.tool_name.as_str()),
+                    &CallMCPToolResult::Cancelled,
+                ),
+            ))
+        }
         _ => None,
     }
 }
@@ -3295,6 +3387,53 @@ mod tests {
         .unwrap()
     }
 
+    fn task_with_mcp_tool_call(
+        tool_call_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        result: Option<api::message::ToolCallResult>,
+    ) -> api::Task {
+        let mut messages = vec![api::Message {
+            id: "mcp-call-message".to_string(),
+            task_id: "root".to_string(),
+            request_id: "request-1".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: tool_call_id.to_string(),
+                tool: Some(api::message::tool_call::Tool::CallMcpTool(
+                    api::message::tool_call::CallMcpTool {
+                        name: tool_name.to_string(),
+                        args: Some(prost_types::Struct {
+                            fields: Default::default(),
+                        }),
+                        server_id: server_id.to_string(),
+                    },
+                )),
+            })),
+        }];
+        if let Some(result) = result {
+            messages.push(api::Message {
+                id: "mcp-result-message".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-2".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCallResult(result)),
+            });
+        }
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
     fn first_stream_init_conversation_id(
         conversation_token: Option<ServerConversationToken>,
     ) -> String {
@@ -4134,6 +4273,124 @@ mod tests {
         assert_eq!(message.tool_call_id.as_deref(), Some("call_mcp"));
         assert!(message.content.contains("Status: success"));
         assert!(message.content.contains("mcp ok"));
+    }
+
+    #[test]
+    fn mcp_action_result_uses_history_tool_call_metadata() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_mcp".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("root".to_string()),
+            result: AIAgentActionResultType::CallMCPTool(CallMCPToolResult::Success {
+                result: rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(
+                    "mcp ok",
+                )]),
+            }),
+        };
+        let input = AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+        };
+        let tasks = vec![task_with_mcp_tool_call(
+            "call_mcp",
+            "server-id",
+            "read_path",
+            None,
+        )];
+
+        let messages =
+            openai_messages_from_inputs_and_tasks(&[input], &tasks, Some(&local_context)).unwrap();
+        let assistant_tool_call = messages
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+            .find(|tool_call| tool_call.id == "call_mcp")
+            .unwrap();
+        let result_message = messages.last().unwrap();
+
+        assert_eq!(
+            assistant_tool_call.function.name,
+            "mcp__filesystem__read_path"
+        );
+        assert!(result_message.content.contains("Server: filesystem"));
+        assert!(result_message.content.contains("Tool: read_path"));
+        assert!(!result_message.content.contains("Server: unknown"));
+    }
+
+    #[test]
+    fn mcp_history_result_uses_preceding_tool_call_metadata() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let result = api::message::ToolCallResult {
+            tool_call_id: "call_mcp".to_string(),
+            context: None,
+            result: Some(api::message::tool_call_result::Result::CallMcpTool(
+                api::CallMcpToolResult {
+                    result: Some(api::call_mcp_tool_result::Result::Success(
+                        api::call_mcp_tool_result::Success {
+                            results: vec![api::call_mcp_tool_result::success::Result {
+                                result: Some(
+                                    api::call_mcp_tool_result::success::result::Result::Text(
+                                        api::call_mcp_tool_result::success::result::Text {
+                                            text: "mcp ok".to_string(),
+                                        },
+                                    ),
+                                ),
+                            }],
+                        },
+                    )),
+                },
+            )),
+        };
+        let tasks = vec![task_with_mcp_tool_call(
+            "call_mcp",
+            "server-id",
+            "read_path",
+            Some(result),
+        )];
+        let input = vec![user_query_input("continue", Vec::new(), HashMap::new())];
+
+        let messages =
+            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context)).unwrap();
+        let result_message = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
+            .unwrap();
+
+        assert!(result_message.content.contains("Server: filesystem"));
+        assert!(result_message.content.contains("Tool: read_path"));
+        assert!(result_message.content.contains("mcp ok"));
+        assert!(!result_message.content.contains("Server: unknown"));
+    }
+
+    #[test]
+    fn mcp_history_cancel_becomes_provider_tool_message() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let result = api::message::ToolCallResult {
+            tool_call_id: "call_mcp".to_string(),
+            context: None,
+            result: Some(api::message::tool_call_result::Result::Cancel(())),
+        };
+        let tasks = vec![task_with_mcp_tool_call(
+            "call_mcp",
+            "server-id",
+            "read_path",
+            Some(result),
+        )];
+        let input = vec![user_query_input("continue", Vec::new(), HashMap::new())];
+
+        let messages =
+            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context)).unwrap();
+        let result_message = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
+            .unwrap();
+
+        assert!(result_message.content.contains("Status: cancelled"));
+        assert!(result_message.content.contains("Server: filesystem"));
+        assert!(result_message.content.contains("Tool: read_path"));
     }
 
     #[test]
