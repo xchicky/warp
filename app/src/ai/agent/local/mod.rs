@@ -34,7 +34,7 @@ use crate::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, RequestCommandOutputResult,
+        AIAgentInput, MCPContext, RequestCommandOutputResult,
     },
     features::FeatureFlag,
     server::server_api::AIApiError,
@@ -45,6 +45,65 @@ pub struct LocalDirectConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalMcpContext {
+    servers: Vec<LocalMcpServerContext>,
+}
+
+impl LocalMcpContext {
+    /// Build local-agent MCP lifecycle metadata from Warp's existing request MCP context.
+    ///
+    /// M2.1 intentionally keeps only server-level metadata and counts. It does not copy raw tool
+    /// schemas into OpenAI tool definitions, retain MCP process handles, or start any local-agent
+    /// stdio runner. M2.2/M2.3 can extend this adapter to expose and invoke tools through the
+    /// existing Warp MCP managers.
+    pub fn from_mcp_context(context: MCPContext) -> Option<Self> {
+        let servers = context
+            .servers
+            .into_iter()
+            .map(LocalMcpServerContext::from)
+            .collect::<Vec<_>>();
+        (!servers.is_empty()).then_some(Self { servers })
+    }
+
+    fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn servers(&self) -> &[LocalMcpServerContext] {
+        &self.servers
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalMcpServerContext {
+    id: String,
+    name: String,
+    description: String,
+    resource_count: usize,
+    tool_count: usize,
+}
+
+impl From<crate::ai::agent::MCPServer> for LocalMcpServerContext {
+    fn from(server: crate::ai::agent::MCPServer) -> Self {
+        Self {
+            id: server.id,
+            name: server.name,
+            description: server.description,
+            resource_count: server.resources.len(),
+            tool_count: server.tools.len(),
+        }
+    }
+}
+
+impl LocalMcpServerContext {
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl fmt::Debug for LocalDirectConfig {
@@ -173,6 +232,7 @@ pub fn generate_openai_compatible_output(
     input: Vec<AIAgentInput>,
     tasks: Vec<api::Task>,
     conversation_token: Option<ServerConversationToken>,
+    mcp_context: Option<LocalMcpContext>,
 ) -> LocalResponseStream {
     Box::pin(stream! {
         let request_id = Uuid::new_v4().to_string();
@@ -189,6 +249,12 @@ pub fn generate_openai_compatible_output(
             .map(local_direct_input_kind)
             .collect::<Vec<_>>();
         log::debug!("Local direct agent input kinds: {}", input_kinds.join(","));
+        if let Some(mcp_context) = &mcp_context {
+            log::debug!(
+                "Local direct MCP context available: active_servers={}",
+                mcp_context.server_count()
+            );
+        }
         let has_user_query = input.iter().any(|input| input.user_query().is_some());
         let has_shell_action_result = input.iter().any(local_shell_action_result);
         if !has_user_query && !has_shell_action_result {
@@ -2695,8 +2761,8 @@ mod tests {
         local_tool_result_summary, local_tools, openai_message,
         openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
         structured_tool_call_event, truncate_shell_output_for_provider,
-        EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
-        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
+        EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
+        OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
         OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
@@ -2708,8 +2774,8 @@ mod tests {
             apply_file_diff::ApplyFileDiffSummary,
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
-        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput,
-        RequestCommandOutputResult,
+        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, MCPContext,
+        MCPServer, RequestCommandOutputResult,
     };
     use crate::features::FeatureFlag;
     use ai::agent::action_result::{AnyFileContent, FileContext};
@@ -2769,6 +2835,7 @@ mod tests {
                 vec![user_query_input("hello", Vec::new(), HashMap::new())],
                 Vec::new(),
                 conversation_token,
+                None,
             );
             let event = stream.next().await.unwrap().unwrap();
             let Some(api::response_event::Type::Init(init)) = event.r#type else {
@@ -2845,6 +2912,7 @@ mod tests {
                 Some(ServerConversationToken::new(
                     "local-conversation".to_string(),
                 )),
+                None,
             );
 
             let init = stream.next().await.unwrap().unwrap();
@@ -3097,6 +3165,53 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(shell_enabled_names.contains(&"run_shell_command"));
+    }
+
+    #[test]
+    fn local_agent_mcp_flag_does_not_advertise_mcp_tools_in_m2_1() {
+        let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
+
+        let names = local_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "grep",
+                "glob",
+                "suggest_shell_command",
+                "list_directory",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_mcp_context_keeps_metadata_only_without_tool_catalog_injection() {
+        #[allow(deprecated)]
+        let context = MCPContext {
+            resources: Vec::new(),
+            tools: Vec::new(),
+            servers: vec![MCPServer {
+                id: "server-id".to_string(),
+                name: "filesystem".to_string(),
+                description: "File system tools".to_string(),
+                resources: Vec::new(),
+                tools: Vec::new(),
+            }],
+        };
+
+        let local_context = LocalMcpContext::from_mcp_context(context).unwrap();
+
+        assert_eq!(local_context.server_count(), 1);
+        assert_eq!(local_context.servers()[0].name(), "filesystem");
+        assert!(local_tools()
+            .iter()
+            .all(|tool| !tool.function.name.starts_with("mcp")));
     }
 
     #[test]

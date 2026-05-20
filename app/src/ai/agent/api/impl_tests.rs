@@ -3,14 +3,14 @@ use crate::ai::agent::{
     local::LocalDirectConfig,
     task::TaskId,
     AIAgentActionId, AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput,
-    ReadFilesResult,
+    MCPContext, MCPServer, ReadFilesResult,
 };
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::LLMId;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
-use super::{get_supported_tools, local_direct_config_for_request};
+use super::{get_supported_tools, local_direct_config_for_request, local_mcp_context_for_request};
 
 fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool) -> RequestParams {
     let model = LLMId::from("test-model");
@@ -75,6 +75,21 @@ fn resume_conversation_input() -> AIAgentInput {
     }
 }
 
+fn mcp_context_with_server(name: &str) -> MCPContext {
+    #[allow(deprecated)]
+    MCPContext {
+        resources: Vec::new(),
+        tools: Vec::new(),
+        servers: vec![MCPServer {
+            id: format!("{name}-id"),
+            name: name.to_string(),
+            description: "test server".to_string(),
+            resources: Vec::new(),
+            tools: Vec::new(),
+        }],
+    }
+}
+
 #[test]
 fn local_route_continues_for_non_user_query_with_token() {
     let mut params = request_params_with_ask_user_question_enabled(false);
@@ -86,6 +101,40 @@ fn local_route_continues_for_non_user_query_with_token() {
     params.input = vec![action_result_input()];
 
     assert_eq!(local_direct_config_for_request(&params), Some(local_config));
+}
+
+#[test]
+fn local_mcp_context_is_flag_gated() {
+    let _flag = FeatureFlag::LocalAgentMcp.override_enabled(false);
+
+    assert_eq!(
+        local_mcp_context_for_request(Some(mcp_context_with_server("server"))),
+        None
+    );
+}
+
+#[test]
+fn local_mcp_context_uses_existing_grouped_server_context_when_enabled() {
+    let _flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+
+    let context = local_mcp_context_for_request(Some(mcp_context_with_server("server"))).unwrap();
+
+    assert_eq!(context.servers().len(), 1);
+    assert_eq!(context.servers()[0].name(), "server");
+}
+
+#[test]
+fn local_mcp_context_is_empty_without_active_servers_or_cwd_scoped_context() {
+    let _flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+    #[allow(deprecated)]
+    let empty_context = MCPContext {
+        resources: Vec::new(),
+        tools: Vec::new(),
+        servers: Vec::new(),
+    };
+
+    assert_eq!(local_mcp_context_for_request(None), None);
+    assert_eq!(local_mcp_context_for_request(Some(empty_context)), None);
 }
 
 #[test]

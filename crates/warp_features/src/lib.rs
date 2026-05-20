@@ -576,6 +576,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to request shell command execution with user approval.
     LocalAgentShellExecution,
 
+    /// Enables local OpenAI-compatible agents to consume existing Warp MCP server lifecycle context.
+    LocalAgentMcp,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 
