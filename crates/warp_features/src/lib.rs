@@ -573,6 +573,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to write files under the active workspace.
     LocalAgentFileWrites,
 
+    /// Enables local OpenAI-compatible agents to request shell command execution with user approval.
+    LocalAgentShellExecution,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 

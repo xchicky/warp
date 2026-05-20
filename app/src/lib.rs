@@ -2774,6 +2774,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::V4AFileDiffs,
         #[cfg(feature = "local_agent_file_writes")]
         FeatureFlag::LocalAgentFileWrites,
+        #[cfg(feature = "local_agent_shell_execution")]
+        FeatureFlag::LocalAgentShellExecution,
         #[cfg(feature = "interactive_conversation_management_view")]
         FeatureFlag::InteractiveConversationManagementView,
         #[cfg(feature = "agent_tips")]
