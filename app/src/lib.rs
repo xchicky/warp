@@ -2772,6 +2772,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::WarpManagedSecrets,
         #[cfg(feature = "v4a_file_diffs")]
         FeatureFlag::V4AFileDiffs,
+        #[cfg(feature = "local_agent_file_writes")]
+        FeatureFlag::LocalAgentFileWrites,
         #[cfg(feature = "interactive_conversation_management_view")]
         FeatureFlag::InteractiveConversationManagementView,
         #[cfg(feature = "agent_tips")]

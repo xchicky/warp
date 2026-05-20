@@ -570,6 +570,9 @@ pub enum FeatureFlag {
     /// Enables support for AM file diffs backed by the V4A patch format.
     V4AFileDiffs,
 
+    /// Enables local OpenAI-compatible agents to write files under the active workspace.
+    LocalAgentFileWrites,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 

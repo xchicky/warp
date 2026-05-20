@@ -4,16 +4,17 @@ use chrono::Local;
 use serde_json::Value;
 use warp_multi_agent_api as api;
 
-use super::OpenAIChatToolCall;
+use super::{apply_file_diff::ApplyFileDiffSummary, OpenAIChatToolCall};
 
 pub(super) fn structured_tool_card_events(
     task_id: &str,
     request_id: &str,
     tool_call: &OpenAIChatToolCall,
     result: &str,
+    apply_file_diff_summary: Option<&ApplyFileDiffSummary>,
 ) -> Option<Vec<api::ResponseEvent>> {
     let tool = build_tool_call(&tool_call.function.name, &tool_call.function.arguments)?;
-    let result = build_tool_call_result(&tool_call.function.name, result)?;
+    let result = build_tool_call_result(&tool_call.function.name, result, apply_file_diff_summary)?;
 
     Some(vec![
         add_tool_call_message(task_id, request_id, tool_call, tool),
@@ -35,6 +36,9 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         "list_directory" => Some(api::message::tool_call::Tool::FileGlobV2(
             build_list_directory_tool_call(arguments),
         )),
+        "apply_file_diff" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
+            build_apply_file_diffs_tool_call(arguments),
+        )),
         _ => None,
     }
 }
@@ -42,6 +46,7 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
 fn build_tool_call_result(
     name: &str,
     result: &str,
+    apply_file_diff_summary: Option<&ApplyFileDiffSummary>,
 ) -> Option<api::message::tool_call_result::Result> {
     match name {
         "read_file" => Some(api::message::tool_call_result::Result::ReadFiles(
@@ -52,6 +57,9 @@ fn build_tool_call_result(
         )),
         "glob" | "list_directory" => Some(api::message::tool_call_result::Result::FileGlobV2(
             file_glob_result_from_text(result),
+        )),
+        "apply_file_diff" => Some(api::message::tool_call_result::Result::ApplyFileDiffs(
+            apply_file_diffs_result_from_text(result, apply_file_diff_summary),
         )),
         _ => None,
     }
@@ -185,6 +193,17 @@ fn build_list_directory_tool_call(arguments: &str) -> api::message::tool_call::F
     }
 }
 
+fn build_apply_file_diffs_tool_call(arguments: &str) -> api::message::tool_call::ApplyFileDiffs {
+    let args = parse_args(arguments);
+    api::message::tool_call::ApplyFileDiffs {
+        summary: optional_string_arg(&args, "summary").unwrap_or_default(),
+        diffs: Vec::new(),
+        new_files: Vec::new(),
+        deleted_files: Vec::new(),
+        v4a_updates: Vec::new(),
+    }
+}
+
 fn read_files_result_from_text(result: &str) -> api::ReadFilesResult {
     if let Some(error) = tool_error(result) {
         return api::ReadFilesResult {
@@ -300,6 +319,43 @@ fn file_glob_result_from_text(result: &str) -> api::FileGlobV2Result {
     }
 }
 
+fn apply_file_diffs_result_from_text(
+    result: &str,
+    summary: Option<&ApplyFileDiffSummary>,
+) -> api::ApplyFileDiffsResult {
+    if let Some(error) = tool_error(result) {
+        return api::ApplyFileDiffsResult {
+            result: Some(api::apply_file_diffs_result::Result::Error(
+                api::apply_file_diffs_result::Error { message: error },
+            )),
+        };
+    }
+
+    api::ApplyFileDiffsResult {
+        result: Some(api::apply_file_diffs_result::Result::Success({
+            #[allow(deprecated)]
+            api::apply_file_diffs_result::Success {
+                updated_files: Vec::new(),
+                updated_files_v2: summary
+                    .into_iter()
+                    .flat_map(|summary| summary.files.iter())
+                    .map(
+                        |file| api::apply_file_diffs_result::success::UpdatedFileContent {
+                            file: Some(api::FileContent {
+                                file_path: file.path.clone(),
+                                content: file.content.clone(),
+                                line_range: None,
+                            }),
+                            was_edited_by_user: false,
+                        },
+                    )
+                    .collect(),
+                deleted_files: Vec::new(),
+            }
+        })),
+    }
+}
+
 fn tool_error(result: &str) -> Option<String> {
     result
         .strip_prefix("Tool error:")
@@ -337,5 +393,5 @@ pub(super) fn test_tool_card_events(
     tool_call: &OpenAIChatToolCall,
     result: &str,
 ) -> Option<Vec<api::ResponseEvent>> {
-    structured_tool_card_events(task_id, request_id, tool_call, result)
+    structured_tool_card_events(task_id, request_id, tool_call, result, None)
 }
