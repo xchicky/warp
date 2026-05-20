@@ -390,6 +390,10 @@ fn apply_hunk_at(
     start: usize,
     hunk: &Hunk,
 ) -> anyhow::Result<(Vec<String>, usize, usize, usize)> {
+    if start > lines.len() {
+        bail!("hunk position is past end of file");
+    }
+
     let mut cursor = start;
     let mut replacement = Vec::new();
     let mut additions = 0;
@@ -542,6 +546,51 @@ mod tests {
         assert!(error.to_string().contains("hunk removal mismatch"));
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "one\n");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn add_only_hunk_out_of_range_returns_error_without_modifying_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+
+        let error = apply_unified_diff(
+            concat!(
+                "--- a/sample.txt\n",
+                "+++ b/sample.txt\n",
+                "@@ -3,0 +3,1 @@\n",
+                "+beta\n",
+            ),
+            Some(temp_dir.path()),
+            1024,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("past end of file"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+    }
+
+    #[test]
+    fn add_only_hunk_can_append_at_end_of_existing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+
+        let summary = apply_unified_diff(
+            concat!(
+                "--- a/sample.txt\n",
+                "+++ b/sample.txt\n",
+                "@@ -2,0 +2,1 @@\n",
+                "+beta\n",
+            ),
+            Some(temp_dir.path()),
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta\n");
+        assert_eq!(summary.files[0].additions, 1);
+        assert_eq!(summary.files[0].removals, 0);
     }
 
     #[test]
