@@ -186,7 +186,15 @@ fn convert_schema_value(value: &Value, root: bool) -> Result<Value, String> {
         "uniqueItems",
     ] {
         if let Some(value) = object.get(key) {
-            converted.insert(key.to_string(), value.clone());
+            let value = if key == "description" {
+                let Value::String(description) = value else {
+                    return Err("description must be a string".to_string());
+                };
+                Value::String(sanitize_provider_visible_text(description))
+            } else {
+                value.clone()
+            };
+            converted.insert(key.to_string(), value);
         }
     }
 
@@ -285,13 +293,28 @@ fn stable_short_suffix(input: &str) -> String {
 }
 
 fn sanitize_provider_visible_text(text: &str) -> String {
-    text.split_whitespace()
-        .map(redact_secret_token)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut redact_next = false;
+    let mut tokens = Vec::new();
+    for token in text.split_whitespace() {
+        if redact_next {
+            tokens.push("<redacted>".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        let redacted = redact_secret_token(token);
+        redact_next = redacted.redact_next;
+        tokens.push(redacted.text);
+    }
+    tokens.join(" ")
 }
 
-fn redact_secret_token(token: &str) -> String {
+struct RedactedToken {
+    text: String,
+    redact_next: bool,
+}
+
+fn redact_secret_token(token: &str) -> RedactedToken {
     let lower = token.to_ascii_lowercase();
     let sensitive = [
         "api_key",
@@ -306,20 +329,35 @@ fn redact_secret_token(token: &str) -> String {
     .iter()
     .any(|needle| lower.contains(needle));
     if !sensitive {
-        return token.to_string();
+        return RedactedToken {
+            text: token.to_string(),
+            redact_next: false,
+        };
     }
 
     for separator in ['=', ':'] {
         if let Some(index) = token.find(separator) {
-            return format!("{}{}<redacted>", &token[..index], separator);
+            return RedactedToken {
+                text: format!("{}{}<redacted>", &token[..index], separator),
+                redact_next: index + separator.len_utf8() == token.len(),
+            };
         }
     }
 
     if lower.starts_with("bearer") {
-        return "Bearer <redacted>".to_string();
+        return RedactedToken {
+            text: "Bearer <redacted>".to_string(),
+            redact_next: lower == "bearer",
+        };
     }
 
-    token.to_string()
+    RedactedToken {
+        text: "<redacted>".to_string(),
+        redact_next: matches!(
+            lower.as_str(),
+            "api_key" | "apikey" | "token" | "secret" | "password" | "credential" | "authorization"
+        ),
+    }
 }
 
 fn truncate_diagnostic(message: &str) -> String {
@@ -496,6 +534,30 @@ mod tests {
         assert_eq!(converted["properties"]["query"]["minLength"], 1);
         assert_eq!(converted["properties"]["limit"]["maximum"], 10);
         assert_eq!(converted["properties"]["tags"]["items"]["type"], "string");
+    }
+
+    #[test]
+    fn convert_mcp_schema_redacts_secret_tokens_in_descriptions() {
+        let converted = convert_mcp_schema_to_openai_parameters(&schema(json!({
+            "type": "object",
+            "description": "Use api_key=root-secret with Authorization: Bearer sk-secret",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Password: hunter2"
+                }
+            }
+        })))
+        .unwrap();
+
+        let encoded = serde_json::to_string(&converted).unwrap();
+
+        assert!(encoded.contains("api_key=<redacted>"));
+        assert!(encoded.contains("Authorization:<redacted>"));
+        assert!(encoded.contains("Password:<redacted>"));
+        assert!(!encoded.contains("root-secret"));
+        assert!(!encoded.contains("sk-secret"));
+        assert!(!encoded.contains("hunter2"));
     }
 
     #[test]
