@@ -1,4 +1,3 @@
-#[cfg(test)]
 mod apply_file_diff;
 mod tool_card;
 
@@ -22,7 +21,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
-use self::tool_card::structured_tool_card_events;
+use self::{
+    apply_file_diff::{apply_file_diff_result_text, apply_unified_diff, ApplyFileDiffSummary},
+    tool_card::structured_tool_card_events,
+};
 
 use crate::{
     ai::agent::{
@@ -30,6 +32,7 @@ use crate::{
         task::helper::TaskExt,
         AIAgentAttachment, AIAgentContext, AIAgentInput,
     },
+    features::FeatureFlag,
     server::server_api::AIApiError,
 };
 
@@ -155,7 +158,7 @@ const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
 const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
 const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
-const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. You may inspect files with read-only tools. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
+const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff is available, you may use it to update existing files under the current workspace. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
@@ -374,32 +377,14 @@ pub fn generate_openai_compatible_output(
             messages.push(openai_assistant_tool_call_message(tool_calls.clone()));
             let should_finalize = tool_calls_require_finalize(&tool_calls);
 
-            let tool_results = join_all(tool_calls.into_iter().map(|tool_call| {
-                let cwd = cwd.clone();
-                let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
-                async move {
-                    let tool_call_for_error = tool_call.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        let result = execute_local_tool(
-                            &tool_call,
-                            cwd.as_deref(),
-                            &suggested_shell_commands,
-                        );
-                        (tool_call, result)
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => (
-                            tool_call_for_error,
-                            format!("Tool error: Local tool task failed: {error}"),
-                        ),
-                    }
-                }
-            }))
+            let tool_results = execute_local_tool_batch(
+                tool_calls,
+                cwd.clone(),
+                Arc::clone(&suggested_shell_commands),
+            )
             .await;
 
-            for (tool_call, result) in tool_results {
+            for (tool_call, result, apply_file_diff_summary) in tool_results {
                 log_local_tool_result(&tool_call, &result);
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
                 if tool_call.function.name == "suggest_shell_command" {
@@ -412,6 +397,7 @@ pub fn generate_openai_compatible_output(
                     &request_id,
                     &tool_call,
                     &result,
+                    apply_file_diff_summary.as_ref(),
                 ) {
                     for event in events {
                         yield Ok(event);
@@ -580,7 +566,7 @@ async fn request_openai_compatible_completion(
         messages,
         stream: true,
         tools: match mode {
-            RequestMode::ToolUse => local_read_only_tools(),
+            RequestMode::ToolUse => local_tools(),
             RequestMode::Finalize => Vec::new(),
         },
         tool_choice: match mode {
@@ -755,6 +741,14 @@ impl OpenAIToolCallAccumulator {
     }
 }
 
+fn local_tools() -> Vec<OpenAIChatTool> {
+    let mut tools = local_read_only_tools();
+    if FeatureFlag::LocalAgentFileWrites.is_enabled() {
+        tools.push(apply_file_diff_tool_definition());
+    }
+    tools
+}
+
 fn local_read_only_tools() -> Vec<OpenAIChatTool> {
     vec![
         OpenAIChatTool {
@@ -840,31 +834,151 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
     ]
 }
 
+fn apply_file_diff_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "apply_file_diff",
+            description: "Apply a unified diff patch to existing UTF-8 files under the current writable workspace. Creates, deletes, renames, binary patches, and fuzzy matching are not supported.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "description": "Unified diff text using ---/+++/@@ headers for existing file updates." },
+                    "summary": { "type": "string", "description": "Optional short description of the intended change." }
+                },
+                "required": ["patch"]
+            }),
+        },
+    }
+}
+
+async fn execute_local_tool_batch(
+    tool_calls: Vec<OpenAIChatToolCall>,
+    cwd: Option<PathBuf>,
+    suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
+) -> Vec<(OpenAIChatToolCall, String, Option<ApplyFileDiffSummary>)> {
+    #[cfg(test)]
+    let feature_flag_overrides = warp_core::features::get_overrides();
+
+    if tool_calls
+        .iter()
+        .any(|tool_call| is_mutating_local_tool(&tool_call.function.name))
+    {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let cwd = cwd.clone();
+            let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+            let tool_call_for_error = tool_call.clone();
+            #[cfg(test)]
+            let feature_flag_overrides = feature_flag_overrides.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                warp_core::features::set_overrides(feature_flag_overrides);
+                let result =
+                    execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
+                (tool_call, result.text, result.apply_file_diff_summary)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                (
+                    tool_call_for_error,
+                    format!("Tool error: Local tool task failed: {error}"),
+                    None,
+                )
+            });
+            results.push(result);
+        }
+        return results;
+    }
+
+    join_all(tool_calls.into_iter().map(|tool_call| {
+        let cwd = cwd.clone();
+        let suggested_shell_commands = Arc::clone(&suggested_shell_commands);
+        #[cfg(test)]
+        let feature_flag_overrides = feature_flag_overrides.clone();
+        async move {
+            let tool_call_for_error = tool_call.clone();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                warp_core::features::set_overrides(feature_flag_overrides);
+                let result =
+                    execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
+                (tool_call, result.text, result.apply_file_diff_summary)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => (
+                    tool_call_for_error,
+                    format!("Tool error: Local tool task failed: {error}"),
+                    None,
+                ),
+            }
+        }
+    }))
+    .await
+}
+
+fn is_mutating_local_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "apply_file_diff" | "write_file" | "edit_file" | "run_shell_command"
+    )
+}
+
+struct LocalToolExecutionResult {
+    text: String,
+    apply_file_diff_summary: Option<ApplyFileDiffSummary>,
+}
+
 fn execute_local_tool(
     tool_call: &OpenAIChatToolCall,
     cwd: Option<&Path>,
     suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
-) -> String {
+) -> LocalToolExecutionResult {
     let result = match tool_call.function.name.as_str() {
-        "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd),
-        "grep" => execute_grep_tool(&tool_call.function.arguments, cwd),
-        "glob" => execute_glob_tool(&tool_call.function.arguments, cwd),
-        "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd),
+        "read_file" => {
+            execute_read_file_tool(&tool_call.function.arguments, cwd).map(|text| (text, None))
+        }
+        "grep" => execute_grep_tool(&tool_call.function.arguments, cwd).map(|text| (text, None)),
+        "glob" => execute_glob_tool(&tool_call.function.arguments, cwd).map(|text| (text, None)),
+        "list_directory" => {
+            execute_list_directory_tool(&tool_call.function.arguments, cwd).map(|text| (text, None))
+        }
+        "apply_file_diff" => execute_apply_file_diff_tool(&tool_call.function.arguments, cwd)
+            .map(|summary| (apply_file_diff_result_text(&summary), Some(summary))),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
                 &mut suggested_shell_commands,
-            ),
+            )
+            .map(|text| (text, None)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
         name => Err(anyhow!("Unknown local tool: {name}")),
     };
 
-    let text = match result {
-        Ok(text) => text,
-        Err(error) => format!("Tool error: {error}"),
+    let (text, apply_file_diff_summary) = match result {
+        Ok((text, apply_file_diff_summary)) => (text, apply_file_diff_summary),
+        Err(error) => (format!("Tool error: {error}"), None),
     };
-    truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS)
+    LocalToolExecutionResult {
+        text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
+        apply_file_diff_summary,
+    }
+}
+
+fn execute_apply_file_diff_tool(
+    arguments: &str,
+    cwd: Option<&Path>,
+) -> anyhow::Result<ApplyFileDiffSummary> {
+    if !FeatureFlag::LocalAgentFileWrites.is_enabled() {
+        return Err(anyhow!("apply_file_diff is disabled by feature flag"));
+    }
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|_| anyhow!("Invalid apply_file_diff arguments"))?;
+    let patch = required_string_arg(&args, "patch")?;
+    apply_unified_diff(patch, cwd, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2020,21 +2134,26 @@ fn stream_finished_done() -> api::ResponseEvent {
 mod tests {
     use super::{
         agent_output_content_events, chat_completions_url, drain_sse_events,
-        empty_local_provider_response_resolution, execute_glob_tool, execute_grep_tool,
-        execute_list_directory_tool, execute_local_tool, execute_read_file_tool,
-        execute_suggest_shell_command_tool, fallback_tool_results_message,
-        generate_openai_compatible_output, local_read_only_tools, local_tool_result_summary,
-        openai_message, openai_messages_from_inputs_and_tasks, root_task_id,
-        EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
-        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
-        OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
+        empty_local_provider_response_resolution, execute_apply_file_diff_tool, execute_glob_tool,
+        execute_grep_tool, execute_list_directory_tool, execute_local_tool,
+        execute_local_tool_batch, execute_read_file_tool, execute_suggest_shell_command_tool,
+        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
+        local_read_only_tools, local_tool_result_summary, local_tools, openai_message,
+        openai_messages_from_inputs_and_tasks, root_task_id, EmptyLocalProviderResponseResolution,
+        LocalDirectConfig, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
+        OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
     };
     use crate::ai::agent::{
-        api::ServerConversationToken, local::tool_card::test_tool_card_events, AIAgentContext,
-        AIAgentInput,
+        api::ServerConversationToken,
+        local::{
+            apply_file_diff::ApplyFileDiffSummary,
+            tool_card::{structured_tool_card_events, test_tool_card_events},
+        },
+        AIAgentContext, AIAgentInput,
     };
+    use crate::features::FeatureFlag;
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use chrono::{Local, TimeZone};
     use futures_util::StreamExt as _;
@@ -2388,6 +2507,24 @@ mod tests {
     }
 
     #[test]
+    fn local_tools_advertises_apply_file_diff_only_when_flag_enabled() {
+        let _disabled = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let disabled_names = local_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(!disabled_names.contains(&"apply_file_diff"));
+        drop(_disabled);
+
+        let _enabled = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let enabled_names = local_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(enabled_names.contains(&"apply_file_diff"));
+    }
+
+    #[test]
     fn openai_chat_request_finalize_mode_omits_tools_and_sets_tool_choice_none() {
         let request = OpenAIChatRequest {
             model: "local-model".to_string(),
@@ -2495,9 +2632,108 @@ mod tests {
 
         let result = execute_local_tool(&tool_call, None, &suggestions);
 
-        assert!(result.contains("NOT executed"));
-        assert!(result.contains("Stop calling tools"));
-        assert!(result.contains("cargo test"));
+        assert!(result.text.contains("NOT executed"));
+        assert!(result.text.contains("Stop calling tools"));
+        assert!(result.text.contains("cargo test"));
+    }
+
+    #[test]
+    fn apply_file_diff_tool_is_disabled_without_flag() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let error = execute_apply_file_diff_tool(
+            r#"{"patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disabled by feature flag"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn apply_file_diff_tool_updates_existing_file() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let summary = execute_apply_file_diff_tool(
+            r#"{"patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert_eq!(summary.files[0].path, "sample.txt");
+        assert_eq!(summary.files[0].additions, 1);
+        assert_eq!(summary.files[0].removals, 1);
+    }
+
+    #[test]
+    fn apply_file_diff_tool_result_truncates_llm_text_but_keeps_card_summary() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let tool_call = tool_call(
+            "apply_file_diff",
+            r#"{"summary":"update sample","patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"}"#,
+        );
+
+        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions);
+
+        assert!(result.text.contains("Applied patch successfully"));
+        assert!(result.apply_file_diff_summary.is_some());
+    }
+
+    #[test]
+    fn mutating_tool_detection_switches_scheduler_path() {
+        assert!(is_mutating_local_tool("apply_file_diff"));
+        assert!(is_mutating_local_tool("write_file"));
+        assert!(is_mutating_local_tool("edit_file"));
+        assert!(is_mutating_local_tool("run_shell_command"));
+        assert!(!is_mutating_local_tool("read_file"));
+        assert!(!is_mutating_local_tool("grep"));
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_preserves_provider_order_for_mutating_batches() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("first.txt"), "old1\n").unwrap();
+        std::fs::write(temp_dir.path().join("second.txt"), "old2\n").unwrap();
+
+        let results = execute_local_tool_batch(
+            vec![
+                tool_call(
+                    "apply_file_diff",
+                    r#"{"patch":"--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-old1\n+new1\n"}"#,
+                ),
+                tool_call("read_file", r#"{"path":"second.txt"}"#),
+                tool_call(
+                    "apply_file_diff",
+                    r#"{"patch":"--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-old2\n+new2\n"}"#,
+                ),
+            ],
+            Some(temp_dir.path().to_path_buf()),
+            suggestions,
+        )
+        .await;
+
+        assert_eq!(results[0].0.function.name, "apply_file_diff");
+        assert_eq!(results[1].0.function.name, "read_file");
+        assert_eq!(results[2].0.function.name, "apply_file_diff");
+        assert!(results[1].1.contains("old2"));
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("second.txt")).unwrap(),
+            "new2\n"
+        );
     }
 
     #[test]
@@ -2698,6 +2934,81 @@ mod tests {
             panic!("expected grep error");
         };
         assert_eq!(error.message, "Invalid grep arguments");
+    }
+
+    #[test]
+    fn execute_apply_file_diff_tool_emits_structured_card_result() {
+        let tool_call = tool_call(
+            "apply_file_diff",
+            r#"{"summary":"update sample","patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"}"#,
+        );
+        let summary = ApplyFileDiffSummary {
+            files: vec![super::apply_file_diff::AppliedFileDiff {
+                path: "sample.txt".to_string(),
+                additions: 1,
+                removals: 1,
+                content: "new\n".to_string(),
+            }],
+        };
+
+        let events = structured_tool_card_events(
+            "task",
+            "request",
+            &tool_call,
+            "Applied patch successfully.",
+            Some(&summary),
+        )
+        .unwrap();
+
+        let api::response_event::Type::ClientActions(actions) = events[0].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCall(tool_call_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(call)) =
+            tool_call_message.tool.as_ref()
+        else {
+            panic!("expected apply file diffs call");
+        };
+        assert_eq!(call.summary, "update sample");
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool result");
+        };
+        let Some(api::message::tool_call_result::Result::ApplyFileDiffs(result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected apply file diffs result");
+        };
+        let Some(api::apply_file_diffs_result::Result::Success(success)) = result.result.as_ref()
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(success.updated_files_v2.len(), 1);
+        assert_eq!(
+            success.updated_files_v2[0].file.as_ref().unwrap().file_path,
+            "sample.txt"
+        );
     }
 
     #[test]
