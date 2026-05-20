@@ -22,6 +22,15 @@ pub(super) fn structured_tool_card_events(
     ])
 }
 
+pub(super) fn structured_tool_call_event(
+    task_id: &str,
+    request_id: &str,
+    tool_call: &OpenAIChatToolCall,
+) -> Option<api::ResponseEvent> {
+    let tool = build_tool_call(&tool_call.function.name, &tool_call.function.arguments)?;
+    Some(add_tool_call_message(task_id, request_id, tool_call, tool))
+}
+
 fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_call::Tool> {
     match name {
         "read_file" => Some(api::message::tool_call::Tool::ReadFiles(
@@ -44,6 +53,9 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         )),
         "edit_file" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
             build_edit_file_tool_call(arguments),
+        )),
+        "run_shell_command" => Some(api::message::tool_call::Tool::RunShellCommand(
+            build_run_shell_command_tool_call(arguments),
         )),
         _ => None,
     }
@@ -245,6 +257,31 @@ fn build_edit_file_tool_call(arguments: &str) -> api::message::tool_call::ApplyF
     }
 }
 
+fn build_run_shell_command_tool_call(arguments: &str) -> api::message::tool_call::RunShellCommand {
+    let args = parse_args(arguments);
+    let is_read_only = optional_bool_arg(&args, "is_read_only").unwrap_or(false);
+    let is_risky = optional_bool_arg(&args, "is_risky").unwrap_or(!is_read_only);
+    api::message::tool_call::RunShellCommand {
+        command: optional_string_arg(&args, "command").unwrap_or_default(),
+        is_read_only,
+        uses_pager: optional_bool_arg(&args, "uses_pager").unwrap_or(false),
+        citations: Vec::new(),
+        is_risky,
+        risk_category: if is_read_only {
+            api::RiskCategory::ReadOnly as i32
+        } else if is_risky {
+            api::RiskCategory::Risky as i32
+        } else {
+            api::RiskCategory::NontrivialLocalChange as i32
+        },
+        wait_until_complete_value: Some(
+            api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(
+                true,
+            ),
+        ),
+    }
+}
+
 fn read_files_result_from_text(result: &str) -> api::ReadFilesResult {
     if let Some(error) = tool_error(result) {
         return api::ReadFilesResult {
@@ -425,6 +462,10 @@ fn optional_i32_arg(args: &Value, name: &str) -> Option<i32> {
     args.get(name)
         .and_then(Value::as_i64)
         .and_then(|value| i32::try_from(value).ok())
+}
+
+fn optional_bool_arg(args: &Value, name: &str) -> Option<bool> {
+    args.get(name).and_then(Value::as_bool)
 }
 
 #[cfg(test)]

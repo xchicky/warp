@@ -26,15 +26,17 @@ use self::{
         apply_file_diff_result_text, apply_unified_diff, atomic_write_text,
         resolve_writable_file_target, AppliedFileDiff, ApplyFileDiffSummary,
     },
-    tool_card::structured_tool_card_events,
+    tool_card::{structured_tool_call_event, structured_tool_card_events},
 };
 
 use crate::{
     ai::agent::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
-        AIAgentAttachment, AIAgentContext, AIAgentInput,
+        AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
+        AIAgentInput, RequestCommandOutputResult,
     },
+    ai::blocklist::ShellCommandExecutor,
     features::FeatureFlag,
     server::server_api::AIApiError,
 };
@@ -161,7 +163,9 @@ const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
 const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
 const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
-const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
+const MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES: usize = 64 * 1024;
+const MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS: usize = 32 * 1024;
+const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. When run_shell_command is advertised, use it for shell commands that should run after visible user approval. Otherwise, if you need the user to run a shell command, use suggest_shell_command; suggested commands are not executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
@@ -186,7 +190,9 @@ pub fn generate_openai_compatible_output(
             .map(local_direct_input_kind)
             .collect::<Vec<_>>();
         log::debug!("Local direct agent input kinds: {}", input_kinds.join(","));
-        if !input.iter().any(|input| input.user_query().is_some()) {
+        let has_user_query = input.iter().any(|input| input.user_query().is_some());
+        let has_shell_action_result = input.iter().any(local_shell_action_result);
+        if !has_user_query && !has_shell_action_result {
             yield Ok(stream_finished_done());
             return;
         }
@@ -230,7 +236,8 @@ pub fn generate_openai_compatible_output(
         let mut tool_result_summaries = Vec::new();
         let suggested_shell_commands = Arc::new(Mutex::new(HashSet::new()));
 
-        for round in 0..MAX_LOCAL_DIRECT_TOOL_ROUNDS {
+        let max_tool_rounds = if has_user_query { MAX_LOCAL_DIRECT_TOOL_ROUNDS } else { 0 };
+        for round in 0..max_tool_rounds {
             log::debug!("Starting local direct tool loop round {}", round + 1);
             let response = match request_openai_compatible_completion(
                 &config,
@@ -387,26 +394,40 @@ pub fn generate_openai_compatible_output(
             )
             .await;
 
-            for (tool_call, result, apply_file_diff_summary) in tool_results {
-                log_local_tool_result(&tool_call, &result);
-                tool_result_summaries.push(local_tool_result_summary(&tool_call, &result));
+            let mut waiting_for_out_of_band_action = false;
+            for (tool_call, result) in tool_results {
+                log_local_tool_result(&tool_call, &result.text);
+                if result.pending_tool_call {
+                    if let Some(event) = structured_tool_call_event(&task_id, &request_id, &tool_call) {
+                        yield Ok(event);
+                    }
+                    waiting_for_out_of_band_action = true;
+                    continue;
+                }
+
+                tool_result_summaries.push(local_tool_result_summary(&tool_call, &result.text));
                 if tool_call.function.name == "suggest_shell_command" {
                     yield_agent_output_content!(local_shell_command_display_summary(
                         &tool_call.function.arguments,
-                        &result,
+                        &result.text,
                     ));
                 } else if let Some(events) = structured_tool_card_events(
                     &task_id,
                     &request_id,
                     &tool_call,
-                    &result,
-                    apply_file_diff_summary.as_ref(),
+                    &result.text,
+                    result.apply_file_diff_summary.as_ref(),
                 ) {
                     for event in events {
                         yield Ok(event);
                     }
                 }
-                messages.push(openai_tool_message(tool_call.id, result));
+                messages.push(openai_tool_message(tool_call.id, result.text));
+            }
+
+            if waiting_for_out_of_band_action {
+                yield Ok(stream_finished_done());
+                return;
             }
 
             if should_finalize {
@@ -629,6 +650,19 @@ fn local_direct_input_kind(input: &AIAgentInput) -> &'static str {
     }
 }
 
+fn local_shell_action_result(input: &AIAgentInput) -> bool {
+    matches!(
+        input,
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                result: AIAgentActionResultType::RequestCommandOutput(_),
+                ..
+            },
+            ..
+        }
+    )
+}
+
 fn openai_messages_from_inputs_and_tasks(
     input: &[AIAgentInput],
     tasks: &[api::Task],
@@ -636,6 +670,20 @@ fn openai_messages_from_inputs_and_tasks(
     let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
 
     append_history_messages(&mut messages, tasks);
+    let mut appended_action_result = false;
+    for input in input {
+        if let AIAgentInput::ActionResult { result, .. } = input {
+            if !messages_have_tool_call(&messages, &result.id.to_string()) {
+                if let Some(tool_call) = openai_tool_call_from_action_result(result) {
+                    messages.push(openai_assistant_tool_call_message(vec![tool_call]));
+                }
+            }
+            if let Some(message) = openai_tool_message_from_action_result(result) {
+                messages.push(message);
+                appended_action_result = true;
+            }
+        }
+    }
 
     let user_query = input
         .iter()
@@ -643,6 +691,10 @@ fn openai_messages_from_inputs_and_tasks(
         .collect::<Vec<_>>()
         .join("\n\n");
     if user_query.is_empty() {
+        if appended_action_result {
+            truncate_messages_to_char_budget(&mut messages, MAX_LOCAL_DIRECT_MESSAGE_CHARS);
+            return Ok(messages);
+        }
         return Err(anyhow!(
             "Local direct agent only supports user query inputs"
         ));
@@ -688,6 +740,103 @@ fn openai_assistant_tool_call_message(tool_calls: Vec<OpenAIChatToolCall>) -> Op
         tool_call_id: None,
         tool_calls: Some(tool_calls),
     }
+}
+
+fn openai_tool_message_from_action_result(
+    result: &AIAgentActionResult,
+) -> Option<OpenAIChatMessage> {
+    let AIAgentActionResultType::RequestCommandOutput(command_result) = &result.result else {
+        return None;
+    };
+    Some(openai_tool_message(
+        result.id.to_string(),
+        shell_command_result_for_provider(command_result),
+    ))
+}
+
+fn openai_tool_call_from_action_result(result: &AIAgentActionResult) -> Option<OpenAIChatToolCall> {
+    let AIAgentActionResultType::RequestCommandOutput(command_result) = &result.result else {
+        return None;
+    };
+    let command = match command_result {
+        RequestCommandOutputResult::Completed { command, .. }
+        | RequestCommandOutputResult::LongRunningCommandSnapshot { command, .. }
+        | RequestCommandOutputResult::Denylisted { command } => command.clone(),
+        RequestCommandOutputResult::CancelledBeforeExecution => String::new(),
+    };
+    Some(OpenAIChatToolCall {
+        id: result.id.to_string(),
+        r#type: "function",
+        function: OpenAIChatToolCallFunction {
+            name: "run_shell_command".to_string(),
+            arguments: json!({ "command": command }).to_string(),
+        },
+    })
+}
+
+fn messages_have_tool_call(messages: &[OpenAIChatMessage], tool_call_id: &str) -> bool {
+    messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .any(|tool_call| tool_call.id == tool_call_id)
+}
+
+fn shell_command_result_for_provider(result: &RequestCommandOutputResult) -> String {
+    match result {
+        RequestCommandOutputResult::Completed {
+            command,
+            output,
+            exit_code,
+            ..
+        } => format!(
+            "run_shell_command result\nStatus: completed\nCommand: {command}\nExit code: {}\nOutput:\n{}",
+            exit_code.value(),
+            truncate_shell_output_for_provider(output)
+        ),
+        RequestCommandOutputResult::LongRunningCommandSnapshot {
+            command,
+            grid_contents,
+            ..
+        } => format!(
+            "run_shell_command result\nStatus: long-running snapshot\nCommand: {command}\nOutput snapshot:\n{}",
+            truncate_shell_output_for_provider(grid_contents)
+        ),
+        RequestCommandOutputResult::CancelledBeforeExecution => {
+            "run_shell_command result\nStatus: permission-denied/cancelled before execution\nOutput:\n".to_string()
+        }
+        RequestCommandOutputResult::Denylisted { command } => format!(
+            "run_shell_command result\nStatus: permission-denied/denylisted\nCommand: {command}\nOutput:\n"
+        ),
+    }
+}
+
+fn truncate_shell_output_for_provider(output: &str) -> String {
+    let within_byte_limit = output.len() <= MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES;
+    let within_char_limit = output.chars().count() <= MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS;
+    if within_byte_limit && within_char_limit {
+        return output.to_string();
+    }
+
+    let mut retained_reversed = Vec::new();
+    let mut retained_bytes = 0usize;
+    for ch in output.chars().rev() {
+        let next_bytes = retained_bytes + ch.len_utf8();
+        if next_bytes > MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES
+            || retained_reversed.len() >= MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS
+        {
+            break;
+        }
+        retained_bytes = next_bytes;
+        retained_reversed.push(ch);
+    }
+    let tail = retained_reversed.into_iter().rev().collect::<String>();
+    format!(
+        "[provider output truncated; showing tail, original_bytes={}, original_chars={}]\n{}",
+        output.len(),
+        output.chars().count(),
+        tail
+    )
 }
 
 #[derive(Default)]
@@ -750,6 +899,9 @@ fn local_tools() -> Vec<OpenAIChatTool> {
         tools.push(apply_file_diff_tool_definition());
         tools.push(write_file_tool_definition());
         tools.push(edit_file_tool_definition());
+    }
+    if FeatureFlag::LocalAgentShellExecution.is_enabled() {
+        tools.push(run_shell_command_tool_definition());
     }
     tools
 }
@@ -896,11 +1048,34 @@ fn edit_file_tool_definition() -> OpenAIChatTool {
     }
 }
 
+fn run_shell_command_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "run_shell_command",
+            description: "Request execution of an opaque shell command after visible user approval in the active terminal context.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Exact shell command to request. It is shown to the user before execution." },
+                    "rationale": { "type": "string", "description": "Why this command should be run." },
+                    "is_read_only": { "type": "boolean", "description": "Whether the command is expected to be read-only." },
+                    "is_risky": { "type": "boolean", "description": "Whether the command may be risky or have side effects." },
+                    "uses_pager": { "type": "boolean", "description": "Whether the command may invoke a pager. Defaults to false." },
+                    "cwd": { "type": "string", "description": "Optional cwd under the active workspace. M1.3 only supports the active terminal cwd." },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional requested timeout in milliseconds, clamped to the client maximum." }
+                },
+                "required": ["command"]
+            }),
+        },
+    }
+}
+
 async fn execute_local_tool_batch(
     tool_calls: Vec<OpenAIChatToolCall>,
     cwd: Option<PathBuf>,
     suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
-) -> Vec<(OpenAIChatToolCall, String, Option<ApplyFileDiffSummary>)> {
+) -> Vec<(OpenAIChatToolCall, LocalToolExecutionResult)> {
     #[cfg(test)]
     let feature_flag_overrides = warp_core::features::get_overrides();
 
@@ -920,17 +1095,22 @@ async fn execute_local_tool_batch(
                 warp_core::features::set_overrides(feature_flag_overrides);
                 let result =
                     execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
-                (tool_call, result.text, result.apply_file_diff_summary)
+                (tool_call, result)
             })
             .await
             .unwrap_or_else(|error| {
                 (
                     tool_call_for_error,
-                    format!("Tool error: Local tool task failed: {error}"),
-                    None,
+                    LocalToolExecutionResult::tool_error(format!(
+                        "Local tool task failed: {error}"
+                    )),
                 )
             });
+            let should_pause_for_action = result.1.pending_tool_call;
             results.push(result);
+            if should_pause_for_action {
+                break;
+            }
         }
         return results;
     }
@@ -947,15 +1127,16 @@ async fn execute_local_tool_batch(
                 warp_core::features::set_overrides(feature_flag_overrides);
                 let result =
                     execute_local_tool(&tool_call, cwd.as_deref(), &suggested_shell_commands);
-                (tool_call, result.text, result.apply_file_diff_summary)
+                (tool_call, result)
             })
             .await
             {
                 Ok(result) => result,
                 Err(error) => (
                     tool_call_for_error,
-                    format!("Tool error: Local tool task failed: {error}"),
-                    None,
+                    LocalToolExecutionResult::tool_error(format!(
+                        "Local tool task failed: {error}"
+                    )),
                 ),
             }
         }
@@ -973,6 +1154,17 @@ fn is_mutating_local_tool(name: &str) -> bool {
 struct LocalToolExecutionResult {
     text: String,
     apply_file_diff_summary: Option<ApplyFileDiffSummary>,
+    pending_tool_call: bool,
+}
+
+impl LocalToolExecutionResult {
+    fn tool_error(error: impl fmt::Display) -> Self {
+        Self {
+            text: format!("Tool error: {error}"),
+            apply_file_diff_summary: None,
+            pending_tool_call: false,
+        }
+    }
 }
 
 fn execute_local_tool(
@@ -993,6 +1185,8 @@ fn execute_local_tool(
             .map(|summary| (apply_file_diff_result_text(&summary), Some(summary))),
         "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd),
         "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd),
+        "run_shell_command" => execute_run_shell_command_tool(&tool_call.function.arguments, cwd)
+            .map(|text| (text, None)),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
@@ -1011,6 +1205,8 @@ fn execute_local_tool(
     LocalToolExecutionResult {
         text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
         apply_file_diff_summary,
+        pending_tool_call: tool_call.function.name == "run_shell_command"
+            && !text.starts_with("Tool error:"),
     }
 }
 
@@ -1169,6 +1365,81 @@ fn execute_edit_file_tool(
         summary.files[0].removals,
     );
     Ok((text, Some(summary)))
+}
+
+fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    if !FeatureFlag::LocalAgentShellExecution.is_enabled() {
+        return Err(anyhow!("run_shell_command is disabled by feature flag"));
+    }
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|_| anyhow!("Invalid run_shell_command arguments"))?;
+    let command = required_string_arg(&args, "command")?.trim();
+    if command.is_empty() {
+        return Err(anyhow!("command cannot be empty"));
+    }
+    if command.contains('\0') {
+        return Err(anyhow!("command cannot contain NUL bytes"));
+    }
+
+    let active_cwd =
+        cwd.ok_or_else(|| anyhow!("run_shell_command requires a current working directory"))?;
+    let resolved_cwd = resolve_run_shell_command_cwd(&args, active_cwd)?;
+    let timeout_ms = clamped_shell_timeout_ms(optional_u64_arg(&args, "timeout_ms"));
+    let rationale = optional_string_arg(&args, "rationale").unwrap_or("No rationale provided.");
+    let is_read_only = optional_bool_arg(&args, "is_read_only")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_risky = optional_bool_arg(&args, "is_risky")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(format!(
+        "Shell command execution was requested and is waiting for user approval. The command has NOT been executed by the local tool runner.\nCommand: {command}\nCwd: {}\nRationale: {rationale}\nRead-only: {is_read_only}\nRisky: {is_risky}\nTimeout ms: {timeout_ms}",
+        resolved_cwd.display()
+    ))
+}
+
+fn resolve_run_shell_command_cwd(args: &Value, active_cwd: &Path) -> anyhow::Result<PathBuf> {
+    let active_cwd = active_cwd.canonicalize().map_err(|_| {
+        anyhow!(
+            "Current working directory is not readable: {}",
+            active_cwd.display()
+        )
+    })?;
+    if !active_cwd.is_dir() {
+        return Err(anyhow!(
+            "Current working directory is not a directory: {}",
+            active_cwd.display()
+        ));
+    }
+
+    let Some(cwd_arg) = optional_string_arg(args, "cwd") else {
+        return Ok(active_cwd);
+    };
+    if cwd_arg.contains('\0') {
+        return Err(anyhow!("cwd cannot contain NUL bytes"));
+    }
+    let target = resolve_writable_file_target(cwd_arg, Some(&active_cwd), "run_shell_command")?;
+    if !target.exists {
+        return Err(anyhow!("cwd does not exist: {}", target.path.display()));
+    }
+    let metadata = fs::metadata(&target.path)
+        .map_err(|_| anyhow!("cwd is not readable: {}", target.path.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!("cwd is not a directory: {}", target.path.display()));
+    }
+    if target.path != active_cwd {
+        return Err(anyhow!(
+            "cwd overrides are not supported in M1.3 unless cwd matches the active terminal cwd: {}",
+            target.path.display()
+        ));
+    }
+    Ok(target.path)
+}
+
+fn clamped_shell_timeout_ms(timeout_ms: Option<u64>) -> u64 {
+    let max_ms = ShellCommandExecutor::MAX_AGENT_DELAY_DURATION.as_millis() as u64;
+    timeout_ms.unwrap_or(max_ms).clamp(1, max_ms)
 }
 
 fn reject_binary_text(text: &str, name: &str) -> anyhow::Result<()> {
@@ -1630,6 +1901,10 @@ fn optional_usize_arg(args: &Value, name: &str) -> Option<usize> {
         .map(|value| value as usize)
 }
 
+fn optional_u64_arg(args: &Value, name: &str) -> Option<u64> {
+    args.get(name).and_then(Value::as_u64)
+}
+
 fn simple_pattern_matches(pattern: &str, candidate: &str) -> bool {
     if pattern.contains('*') || pattern.contains('?') {
         wildcard_matches(pattern.as_bytes(), candidate.as_bytes())
@@ -1695,8 +1970,76 @@ fn append_history_messages(messages: &mut Vec<OpenAIChatMessage>, tasks: &[api::
                     truncate_message_content(&output.text, MAX_LOCAL_DIRECT_MESSAGE_CHARS),
                 ));
             }
+            Some(api::message::Message::ToolCall(tool_call)) => {
+                if let Some(tool_call) = openai_tool_call_from_api(tool_call) {
+                    messages.push(openai_assistant_tool_call_message(vec![tool_call]));
+                }
+            }
+            Some(api::message::Message::ToolCallResult(tool_call_result)) => {
+                if let Some(message) = openai_tool_message_from_api(tool_call_result) {
+                    messages.push(message);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+fn openai_tool_call_from_api(tool_call: &api::message::ToolCall) -> Option<OpenAIChatToolCall> {
+    let tool = tool_call.tool.as_ref()?;
+    match tool {
+        api::message::tool_call::Tool::RunShellCommand(command) => Some(OpenAIChatToolCall {
+            id: tool_call.tool_call_id.clone(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: "run_shell_command".to_string(),
+                arguments: json!({
+                    "command": command.command,
+                    "is_read_only": command.is_read_only,
+                    "is_risky": command.is_risky,
+                    "uses_pager": command.uses_pager,
+                })
+                .to_string(),
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn openai_tool_message_from_api(
+    tool_call_result: &api::message::ToolCallResult,
+) -> Option<OpenAIChatMessage> {
+    let result = tool_call_result.result.as_ref()?;
+    match result {
+        api::message::tool_call_result::Result::RunShellCommand(result) => {
+            Some(openai_tool_message(
+                tool_call_result.tool_call_id.clone(),
+                shell_command_api_result_for_provider(result),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn shell_command_api_result_for_provider(result: &api::RunShellCommandResult) -> String {
+    match result.result.as_ref() {
+        Some(api::run_shell_command_result::Result::CommandFinished(finished)) => format!(
+            "run_shell_command result\nStatus: completed\nCommand: {}\nExit code: {}\nOutput:\n{}",
+            result.command,
+            finished.exit_code,
+            truncate_shell_output_for_provider(&finished.output)
+        ),
+        Some(api::run_shell_command_result::Result::LongRunningCommandSnapshot(snapshot)) => {
+            format!(
+                "run_shell_command result\nStatus: long-running snapshot\nCommand: {}\nOutput snapshot:\n{}",
+                result.command,
+                truncate_shell_output_for_provider(&snapshot.output)
+            )
+        }
+        Some(api::run_shell_command_result::Result::PermissionDenied(_)) | None => format!(
+            "run_shell_command result\nStatus: permission-denied/cancelled before execution\nCommand: {}\nOutput:\n",
+            result.command
+        ),
     }
 }
 
@@ -2345,19 +2688,22 @@ fn stream_finished_done() -> api::ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_output_content_events, chat_completions_url, drain_sse_events,
-        empty_local_provider_response_resolution, execute_apply_file_diff_tool,
+        agent_output_content_events, chat_completions_url, clamped_shell_timeout_ms,
+        drain_sse_events, empty_local_provider_response_resolution, execute_apply_file_diff_tool,
         execute_edit_file_tool, execute_glob_tool, execute_grep_tool, execute_list_directory_tool,
         execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
-        execute_suggest_shell_command_tool, execute_write_file_tool, fallback_tool_results_message,
-        generate_openai_compatible_output, is_mutating_local_tool, local_read_only_tools,
+        execute_run_shell_command_tool, execute_suggest_shell_command_tool,
+        execute_write_file_tool, fallback_tool_results_message, generate_openai_compatible_output,
+        is_mutating_local_tool, local_read_only_tools, local_shell_action_result,
         local_tool_result_summary, local_tools, openai_message,
-        openai_messages_from_inputs_and_tasks, root_task_id, EmptyLocalProviderResponseResolution,
-        LocalDirectConfig, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
-        OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
+        openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
+        structured_tool_call_event, truncate_shell_output_for_provider,
+        EmptyLocalProviderResponseResolution, LocalDirectConfig, OpenAIChatRequest,
+        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
+        OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
-        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -2365,7 +2711,8 @@ mod tests {
             apply_file_diff::ApplyFileDiffSummary,
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
-        AIAgentContext, AIAgentInput,
+        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput,
+        RequestCommandOutputResult,
     };
     use crate::features::FeatureFlag;
     use ai::agent::action_result::{AnyFileContent, FileContext};
@@ -2376,8 +2723,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
     use uuid::Uuid;
+    use warp_core::command::ExitCode;
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
+    use warp_terminal::model::BlockId;
 
     fn tool_call(name: &str, arguments: &str) -> OpenAIChatToolCall {
         OpenAIChatToolCall {
@@ -2723,6 +3072,7 @@ mod tests {
     #[test]
     fn local_tools_advertises_mutating_file_tools_only_when_flag_enabled() {
         let _disabled = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let _shell_disabled = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
         let disabled_names = local_tools()
             .into_iter()
             .map(|tool| tool.function.name)
@@ -2730,6 +3080,7 @@ mod tests {
         assert!(!disabled_names.contains(&"apply_file_diff"));
         assert!(!disabled_names.contains(&"write_file"));
         assert!(!disabled_names.contains(&"edit_file"));
+        assert!(!disabled_names.contains(&"run_shell_command"));
         drop(_disabled);
 
         let _enabled = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
@@ -2740,6 +3091,15 @@ mod tests {
         assert!(enabled_names.contains(&"apply_file_diff"));
         assert!(enabled_names.contains(&"write_file"));
         assert!(enabled_names.contains(&"edit_file"));
+        assert!(!enabled_names.contains(&"run_shell_command"));
+        drop(_shell_disabled);
+
+        let _shell_enabled = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let shell_enabled_names = local_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(shell_enabled_names.contains(&"run_shell_command"));
     }
 
     #[test]
@@ -2853,6 +3213,160 @@ mod tests {
         assert!(result.text.contains("NOT executed"));
         assert!(result.text.contains("Stop calling tools"));
         assert!(result.text.contains("cargo test"));
+    }
+
+    #[test]
+    fn run_shell_command_tool_is_disabled_without_flag() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let error = execute_run_shell_command_tool(
+            r#"{"command":"cargo test","is_read_only":true}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disabled by feature flag"));
+    }
+
+    #[test]
+    fn run_shell_command_tool_validates_command_and_cwd_before_confirmation() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let empty = execute_run_shell_command_tool(r#"{"command":"  "}"#, Some(temp_dir.path()))
+            .unwrap_err();
+        assert!(empty.to_string().contains("command cannot be empty"));
+
+        let nul_args = serde_json::json!({"command": "echo \u{0}"}).to_string();
+        let nul = execute_run_shell_command_tool(&nul_args, Some(temp_dir.path())).unwrap_err();
+        assert!(nul.to_string().contains("NUL"));
+
+        let no_cwd = execute_run_shell_command_tool(r#"{"command":"pwd"}"#, None).unwrap_err();
+        assert!(no_cwd.to_string().contains("current working directory"));
+
+        let outside_args = serde_json::json!({
+            "command": "pwd",
+            "cwd": outside.path(),
+        })
+        .to_string();
+        let outside_error =
+            execute_run_shell_command_tool(&outside_args, Some(temp_dir.path())).unwrap_err();
+        assert!(outside_error.to_string().contains("outside writable root"));
+    }
+
+    #[test]
+    fn run_shell_command_tool_requests_out_of_band_action_when_valid() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"cargo test","rationale":"verify","is_read_only":true,"is_risky":false,"timeout_ms":999999}"#,
+        );
+
+        let result = execute_local_tool(&tool_call, Some(temp_dir.path()), &suggestions);
+
+        assert!(result.pending_tool_call);
+        assert!(result.text.contains("waiting for user approval"));
+        assert!(result.text.contains("cargo test"));
+        assert!(result.text.contains(&format!(
+            "Timeout ms: {}",
+            clamped_shell_timeout_ms(Some(999999))
+        )));
+    }
+
+    #[test]
+    fn run_shell_command_tool_card_uses_existing_proto_shape() {
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"cargo test","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(call.tool_call_id, "call_1");
+        assert_eq!(command.command, "cargo test");
+        assert!(command.is_read_only);
+        assert!(!command.is_risky);
+    }
+
+    #[test]
+    fn shell_command_provider_result_is_tail_truncated() {
+        let output = format!(
+            "{}TAIL",
+            "x".repeat(MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES + 100)
+        );
+        let truncated = truncate_shell_output_for_provider(&output);
+
+        assert!(truncated.contains("provider output truncated"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.len() < output.len());
+    }
+
+    #[test]
+    fn shell_action_result_becomes_openai_tool_message() {
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_shell".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::RequestCommandOutput(
+                RequestCommandOutputResult::Completed {
+                    block_id: BlockId::from("block".to_string()),
+                    command: "echo ok".to_string(),
+                    output: "ok\n".to_string(),
+                    exit_code: ExitCode::from(0),
+                },
+            ),
+        };
+        let input = AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+        };
+
+        assert!(local_shell_action_result(&input));
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[]).unwrap();
+        assert_eq!(messages[messages.len() - 2].role, "assistant");
+        assert_eq!(
+            messages[messages.len() - 2].tool_calls.as_ref().unwrap()[0].id,
+            "call_shell"
+        );
+        let message = messages.last().unwrap();
+
+        assert_eq!(message.role, "tool");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_shell"));
+        assert!(message.content.contains("Status: completed"));
+        assert!(message.content.contains("Exit code: 0"));
+        assert!(message.content.contains("ok"));
+    }
+
+    #[test]
+    fn shell_command_provider_result_maps_rejection_and_denylist() {
+        let cancelled = shell_command_result_for_provider(
+            &RequestCommandOutputResult::CancelledBeforeExecution,
+        );
+        assert!(cancelled.contains("permission-denied/cancelled"));
+
+        let denylisted =
+            shell_command_result_for_provider(&RequestCommandOutputResult::Denylisted {
+                command: "rm -rf /".to_string(),
+            });
+        assert!(denylisted.contains("permission-denied/denylisted"));
+        assert!(denylisted.contains("rm -rf /"));
     }
 
     #[test]
@@ -3179,7 +3693,7 @@ mod tests {
         assert_eq!(results[0].0.function.name, "apply_file_diff");
         assert_eq!(results[1].0.function.name, "read_file");
         assert_eq!(results[2].0.function.name, "apply_file_diff");
-        assert!(results[1].1.contains("old2"));
+        assert!(results[1].1.text.contains("old2"));
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("second.txt")).unwrap(),
             "new2\n"
@@ -3213,11 +3727,37 @@ mod tests {
         assert_eq!(results[0].0.function.name, "write_file");
         assert_eq!(results[1].0.function.name, "read_file");
         assert_eq!(results[2].0.function.name, "edit_file");
-        assert!(results[1].1.contains("old"));
+        assert!(results[1].1.text.contains("old"));
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("existing.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_pauses_at_shell_action_before_later_mutations() {
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let results = execute_local_tool_batch(
+            vec![
+                tool_call("run_shell_command", r#"{"command":"echo hi"}"#),
+                tool_call(
+                    "write_file",
+                    r#"{"path":"created.txt","content":"created\n"}"#,
+                ),
+            ],
+            Some(temp_dir.path().to_path_buf()),
+            suggestions,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.function.name, "run_shell_command");
+        assert!(results[0].1.pending_tool_call);
+        assert!(!temp_dir.path().join("created.txt").exists());
     }
 
     #[test]
