@@ -1,4 +1,5 @@
 mod apply_file_diff;
+mod mcp_tools;
 mod tool_card;
 
 use std::{
@@ -28,6 +29,7 @@ use self::{
     },
     tool_card::{structured_tool_call_event, structured_tool_card_events},
 };
+use mcp_tools::mcp_tool_catalog;
 
 use crate::{
     ai::agent::{
@@ -47,7 +49,7 @@ pub struct LocalDirectConfig {
     pub model: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalMcpContext {
     servers: Vec<LocalMcpServerContext>,
 }
@@ -55,10 +57,11 @@ pub struct LocalMcpContext {
 impl LocalMcpContext {
     /// Build local-agent MCP lifecycle metadata from Warp's existing request MCP context.
     ///
-    /// M2.1 intentionally keeps only server-level metadata and counts. It does not copy raw tool
-    /// schemas into OpenAI tool definitions, retain MCP process handles, or start any local-agent
-    /// stdio runner. M2.2/M2.3 can extend this adapter to expose and invoke tools through the
-    /// existing Warp MCP managers.
+    /// Build a provider-safe MCP catalog snapshot from Warp's existing request MCP context.
+    ///
+    /// This copies server/tool display metadata and input schemas only. It does not retain MCP
+    /// process handles, raw server config, environment variables, resolved secrets, or start any
+    /// local-agent stdio runner.
     pub fn from_mcp_context(context: MCPContext) -> Option<Self> {
         let servers = context
             .servers
@@ -72,19 +75,24 @@ impl LocalMcpContext {
         self.servers.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn servers(&self) -> &[LocalMcpServerContext] {
         &self.servers
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalMcpServerContext {
     id: String,
     name: String,
-    description: String,
     resource_count: usize,
-    tool_count: usize,
+    tools: Vec<LocalMcpToolContext>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalMcpToolContext {
+    name: String,
+    description: Option<String>,
+    input_schema: serde_json::Map<String, Value>,
 }
 
 impl From<crate::ai::agent::MCPServer> for LocalMcpServerContext {
@@ -92,17 +100,51 @@ impl From<crate::ai::agent::MCPServer> for LocalMcpServerContext {
         Self {
             id: server.id,
             name: server.name,
-            description: server.description,
             resource_count: server.resources.len(),
-            tool_count: server.tools.len(),
+            tools: server
+                .tools
+                .into_iter()
+                .map(LocalMcpToolContext::from)
+                .collect(),
         }
     }
 }
 
-impl LocalMcpServerContext {
-    #[cfg(test)]
+impl From<rmcp::model::Tool> for LocalMcpToolContext {
+    fn from(tool: rmcp::model::Tool) -> Self {
+        Self {
+            name: tool.name.to_string(),
+            description: tool.description.map(|description| description.to_string()),
+            input_schema: tool.input_schema.as_ref().clone(),
+        }
+    }
+}
+
+impl LocalMcpToolContext {
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub(crate) fn input_schema(&self) -> &serde_json::Map<String, Value> {
+        &self.input_schema
+    }
+}
+
+impl LocalMcpServerContext {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn tools(&self) -> &[LocalMcpToolContext] {
+        &self.tools
     }
 }
 
@@ -164,8 +206,8 @@ struct OpenAIChatTool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct OpenAIChatToolFunction {
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
     parameters: Value,
 }
 
@@ -308,6 +350,7 @@ pub fn generate_openai_compatible_output(
                 &config,
                 messages.clone(),
                 RequestMode::ToolUse,
+                mcp_context.as_ref(),
             )
             .await
             {
@@ -504,6 +547,7 @@ pub fn generate_openai_compatible_output(
             &config,
             messages,
             RequestMode::Finalize,
+            mcp_context.as_ref(),
         )
         .await
         {
@@ -649,13 +693,14 @@ async fn request_openai_compatible_completion(
     config: &LocalDirectConfig,
     messages: Vec<OpenAIChatMessage>,
     mode: RequestMode,
+    mcp_context: Option<&LocalMcpContext>,
 ) -> anyhow::Result<reqwest::Response> {
     let request = OpenAIChatRequest {
         model: config.model.clone(),
         messages,
         stream: true,
         tools: match mode {
-            RequestMode::ToolUse => local_tools(),
+            RequestMode::ToolUse => local_tools_for_context(mcp_context),
             RequestMode::Finalize => Vec::new(),
         },
         tool_choice: match mode {
@@ -958,7 +1003,12 @@ impl OpenAIToolCallAccumulator {
     }
 }
 
+#[cfg(test)]
 fn local_tools() -> Vec<OpenAIChatTool> {
+    local_tools_for_context(None)
+}
+
+fn local_tools_for_context(mcp_context: Option<&LocalMcpContext>) -> Vec<OpenAIChatTool> {
     let mut tools = local_read_only_tools();
     if FeatureFlag::LocalAgentFileWrites.is_enabled() {
         tools.push(apply_file_diff_tool_definition());
@@ -968,6 +1018,11 @@ fn local_tools() -> Vec<OpenAIChatTool> {
     if FeatureFlag::LocalAgentShellExecution.is_enabled() {
         tools.push(run_shell_command_tool_definition());
     }
+    if FeatureFlag::LocalAgentMcp.is_enabled() {
+        if let Some(catalog) = mcp_context.and_then(|context| mcp_tool_catalog(context, &tools)) {
+            tools.extend(catalog.into_tool_definitions());
+        }
+    }
     tools
 }
 
@@ -976,8 +1031,8 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
         OpenAIChatTool {
             r#type: "function",
             function: OpenAIChatToolFunction {
-                name: "read_file",
-                description: "Read a UTF-8 text file from the local filesystem. Use only for read-only inspection.",
+                name: "read_file".to_string(),
+                description: "Read a UTF-8 text file from the local filesystem. Use only for read-only inspection.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -992,8 +1047,8 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
         OpenAIChatTool {
             r#type: "function",
             function: OpenAIChatToolFunction {
-                name: "grep",
-                description: "Search UTF-8 text files under a file or directory. Returns bounded matching lines.",
+                name: "grep".to_string(),
+                description: "Search UTF-8 text files under a file or directory. Returns bounded matching lines.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1008,8 +1063,8 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
         OpenAIChatTool {
             r#type: "function",
             function: OpenAIChatToolFunction {
-                name: "glob",
-                description: "List files under a directory whose path contains or wildcard-matches a simple pattern.",
+                name: "glob".to_string(),
+                description: "List files under a directory whose path contains or wildcard-matches a simple pattern.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1023,8 +1078,8 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
         OpenAIChatTool {
             r#type: "function",
             function: OpenAIChatToolFunction {
-                name: "suggest_shell_command",
-                description: "Suggest a shell command for the user to run manually. The command is not executed automatically.",
+                name: "suggest_shell_command".to_string(),
+                description: "Suggest a shell command for the user to run manually. The command is not executed automatically.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1041,8 +1096,8 @@ fn local_read_only_tools() -> Vec<OpenAIChatTool> {
         OpenAIChatTool {
             r#type: "function",
             function: OpenAIChatToolFunction {
-                name: "list_directory",
-                description: "List files and directories under a local directory. Use only for read-only inspection.",
+                name: "list_directory".to_string(),
+                description: "List files and directories under a local directory. Use only for read-only inspection.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1060,8 +1115,8 @@ fn apply_file_diff_tool_definition() -> OpenAIChatTool {
     OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
-            name: "apply_file_diff",
-            description: "Apply a unified diff patch to existing UTF-8 files under the current writable workspace. Creates, deletes, renames, binary patches, and fuzzy matching are not supported.",
+            name: "apply_file_diff".to_string(),
+            description: "Apply a unified diff patch to existing UTF-8 files under the current writable workspace. Creates, deletes, renames, binary patches, and fuzzy matching are not supported.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1078,8 +1133,8 @@ fn write_file_tool_definition() -> OpenAIChatTool {
     OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
-            name: "write_file",
-            description: "Create or replace a small UTF-8 text file under the current writable workspace. Does not create missing parent directories. Defaults to refusing overwrites.",
+            name: "write_file".to_string(),
+            description: "Create or replace a small UTF-8 text file under the current writable workspace. Does not create missing parent directories. Defaults to refusing overwrites.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1097,8 +1152,8 @@ fn edit_file_tool_definition() -> OpenAIChatTool {
     OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
-            name: "edit_file",
-            description: "Edit an existing UTF-8 text file under the current writable workspace by exact string replacement. Refuses ambiguous replacements unless replace_all is true.",
+            name: "edit_file".to_string(),
+            description: "Edit an existing UTF-8 text file under the current writable workspace by exact string replacement. Refuses ambiguous replacements unless replace_all is true.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1117,8 +1172,8 @@ fn run_shell_command_tool_definition() -> OpenAIChatTool {
     OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
-            name: "run_shell_command",
-            description: "Request execution of an opaque shell command after visible user approval in the active terminal context.",
+            name: "run_shell_command".to_string(),
+            description: "Request execution of an opaque shell command after visible user approval in the active terminal context.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -2758,7 +2813,7 @@ mod tests {
         execute_run_shell_command_tool, execute_suggest_shell_command_tool,
         execute_write_file_tool, fallback_tool_results_message, generate_openai_compatible_output,
         is_mutating_local_tool, local_read_only_tools, local_shell_action_result,
-        local_tool_result_summary, local_tools, openai_message,
+        local_tool_result_summary, local_tools, local_tools_for_context, openai_message,
         openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
         structured_tool_call_event, truncate_shell_output_for_provider,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
@@ -3142,10 +3197,12 @@ mod tests {
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(!disabled_names.contains(&"apply_file_diff"));
-        assert!(!disabled_names.contains(&"write_file"));
-        assert!(!disabled_names.contains(&"edit_file"));
-        assert!(!disabled_names.contains(&"run_shell_command"));
+        assert!(!disabled_names.iter().any(|name| name == "apply_file_diff"));
+        assert!(!disabled_names.iter().any(|name| name == "write_file"));
+        assert!(!disabled_names.iter().any(|name| name == "edit_file"));
+        assert!(!disabled_names
+            .iter()
+            .any(|name| name == "run_shell_command"));
         drop(_disabled);
 
         let _enabled = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
@@ -3153,10 +3210,10 @@ mod tests {
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(enabled_names.contains(&"apply_file_diff"));
-        assert!(enabled_names.contains(&"write_file"));
-        assert!(enabled_names.contains(&"edit_file"));
-        assert!(!enabled_names.contains(&"run_shell_command"));
+        assert!(enabled_names.iter().any(|name| name == "apply_file_diff"));
+        assert!(enabled_names.iter().any(|name| name == "write_file"));
+        assert!(enabled_names.iter().any(|name| name == "edit_file"));
+        assert!(!enabled_names.iter().any(|name| name == "run_shell_command"));
         drop(_shell_disabled);
 
         let _shell_enabled = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
@@ -3164,11 +3221,13 @@ mod tests {
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(shell_enabled_names.contains(&"run_shell_command"));
+        assert!(shell_enabled_names
+            .iter()
+            .any(|name| name == "run_shell_command"));
     }
 
     #[test]
-    fn local_agent_mcp_flag_does_not_advertise_mcp_tools_in_m2_1() {
+    fn local_agent_mcp_without_context_does_not_advertise_mcp_tools() {
         let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
         let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
         let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
@@ -3212,6 +3271,57 @@ mod tests {
         assert!(local_tools()
             .iter()
             .all(|tool| !tool.function.name.starts_with("mcp")));
+    }
+
+    #[test]
+    fn local_tools_appends_mcp_tools_only_when_flag_enabled_and_context_has_tools() {
+        let _mcp_disabled = FeatureFlag::LocalAgentMcp.override_enabled(false);
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
+        #[allow(deprecated)]
+        let context = MCPContext {
+            resources: Vec::new(),
+            tools: Vec::new(),
+            servers: vec![MCPServer {
+                id: "server-id".to_string(),
+                name: "filesystem".to_string(),
+                description: "server config should not be shown".to_string(),
+                resources: Vec::new(),
+                tools: vec![rmcp::model::Tool::new(
+                    "read path".to_string(),
+                    "Reads paths".to_string(),
+                    serde_json::json!({ "type": "object" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )],
+            }],
+        };
+        let local_context = LocalMcpContext::from_mcp_context(context).unwrap();
+
+        let disabled_names = local_tools_for_context(Some(&local_context))
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(!disabled_names
+            .iter()
+            .any(|name| name == "mcp__filesystem__read_path"));
+        drop(_mcp_disabled);
+
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let enabled_tools = local_tools_for_context(Some(&local_context));
+        let mcp_tool = enabled_tools
+            .iter()
+            .find(|tool| tool.function.name == "mcp__filesystem__read_path")
+            .unwrap();
+
+        assert_eq!(mcp_tool.function.parameters["type"], "object");
+        assert!(mcp_tool
+            .function
+            .description
+            .contains("MCP tool from server `filesystem`"));
+        assert!(mcp_tool.function.description.contains("Reads paths"));
+        assert!(!mcp_tool.function.description.contains("server config"));
     }
 
     #[test]
