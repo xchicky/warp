@@ -39,6 +39,12 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         "apply_file_diff" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
             build_apply_file_diffs_tool_call(arguments),
         )),
+        "write_file" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
+            build_write_file_tool_call(arguments),
+        )),
+        "edit_file" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
+            build_edit_file_tool_call(arguments),
+        )),
         _ => None,
     }
 }
@@ -59,6 +65,9 @@ fn build_tool_call_result(
             file_glob_result_from_text(result),
         )),
         "apply_file_diff" => Some(api::message::tool_call_result::Result::ApplyFileDiffs(
+            apply_file_diffs_result_from_text(result, apply_file_diff_summary),
+        )),
+        "write_file" | "edit_file" => Some(api::message::tool_call_result::Result::ApplyFileDiffs(
             apply_file_diffs_result_from_text(result, apply_file_diff_summary),
         )),
         _ => None,
@@ -198,6 +207,38 @@ fn build_apply_file_diffs_tool_call(arguments: &str) -> api::message::tool_call:
     api::message::tool_call::ApplyFileDiffs {
         summary: optional_string_arg(&args, "summary").unwrap_or_default(),
         diffs: Vec::new(),
+        new_files: Vec::new(),
+        deleted_files: Vec::new(),
+        v4a_updates: Vec::new(),
+    }
+}
+
+fn build_write_file_tool_call(arguments: &str) -> api::message::tool_call::ApplyFileDiffs {
+    let args = parse_args(arguments);
+    let path = optional_string_arg(&args, "path").unwrap_or_default();
+    let content = optional_string_arg(&args, "content").unwrap_or_default();
+    api::message::tool_call::ApplyFileDiffs {
+        summary: format!("write_file: {path}"),
+        diffs: Vec::new(),
+        new_files: vec![api::message::tool_call::apply_file_diffs::NewFile {
+            file_path: path,
+            content,
+        }],
+        deleted_files: Vec::new(),
+        v4a_updates: Vec::new(),
+    }
+}
+
+fn build_edit_file_tool_call(arguments: &str) -> api::message::tool_call::ApplyFileDiffs {
+    let args = parse_args(arguments);
+    let path = optional_string_arg(&args, "path").unwrap_or_default();
+    api::message::tool_call::ApplyFileDiffs {
+        summary: format!("edit_file: {path}"),
+        diffs: vec![api::message::tool_call::apply_file_diffs::FileDiff {
+            file_path: path,
+            search: optional_string_arg(&args, "old_text").unwrap_or_default(),
+            replace: optional_string_arg(&args, "new_text").unwrap_or_default(),
+        }],
         new_files: Vec::new(),
         deleted_files: Vec::new(),
         v4a_updates: Vec::new(),

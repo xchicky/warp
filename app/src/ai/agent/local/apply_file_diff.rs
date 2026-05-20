@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
+use uuid::Uuid;
 
 const MAX_LOCAL_DIRECT_PATCH_BYTES: usize = 128 * 1024;
 const MAX_LOCAL_DIRECT_PATCH_FILES: usize = 20;
@@ -64,6 +65,13 @@ struct PreparedPatch {
     removals: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct WritableFileTarget {
+    pub path: PathBuf,
+    pub display_path: String,
+    pub exists: bool,
+}
+
 pub(super) fn apply_unified_diff(
     patch: &str,
     cwd: Option<&Path>,
@@ -76,7 +84,7 @@ pub(super) fn apply_unified_diff(
         bail!("patch is too large");
     }
 
-    let root = writable_root(cwd)?;
+    let root = writable_root(cwd, "apply_file_diff")?;
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.len() > MAX_LOCAL_DIRECT_PATCH_FILES {
         bail!("patch touches too many files");
@@ -90,7 +98,14 @@ pub(super) fn apply_unified_diff(
         if !seen_paths.insert(display_path.clone()) {
             bail!("duplicate file patch: {display_path}");
         }
-        let path = resolve_writable_existing_file(&display_path, &root)?;
+        let target = resolve_writable_file_target_with_root(&display_path, &root)?;
+        if !target.exists {
+            bail!(
+                "File does not exist for update-only patch: {}",
+                target.path.display()
+            );
+        }
+        let path = target.path;
         let metadata =
             fs::metadata(&path).map_err(|_| anyhow!("File is not readable: {}", path.display()))?;
         if !metadata.is_file() {
@@ -141,6 +156,96 @@ fn write_prepared_patches(prepared: &[PreparedPatch]) -> anyhow::Result<()> {
             return Err(anyhow!("Failed to write {}: {error}", patch.path.display()));
         }
         written.push(patch);
+    }
+    Ok(())
+}
+
+pub(super) fn resolve_writable_file_target(
+    path: &str,
+    cwd: Option<&Path>,
+    tool_name: &str,
+) -> anyhow::Result<WritableFileTarget> {
+    let root = writable_root(cwd, tool_name)?;
+    resolve_writable_file_target_with_root(path, &root)
+}
+
+fn resolve_writable_file_target_with_root(
+    path: &str,
+    root: &Path,
+) -> anyhow::Result<WritableFileTarget> {
+    if path.is_empty() {
+        bail!("path cannot be empty");
+    }
+
+    let raw_path = PathBuf::from(path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        root.join(raw_path)
+    };
+    let display_path = candidate
+        .strip_prefix(root)
+        .ok()
+        .map(|path| path.display().to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| candidate.display().to_string());
+
+    match candidate.canonicalize() {
+        Ok(canonical) => {
+            if !canonical.starts_with(root) {
+                bail!("Path is outside writable root: {}", candidate.display());
+            }
+            Ok(WritableFileTarget {
+                path: canonical,
+                display_path,
+                exists: true,
+            })
+        }
+        Err(_) => {
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| anyhow!("Target path has no parent: {}", candidate.display()))?;
+            let canonical_parent = parent
+                .canonicalize()
+                .map_err(|_| anyhow!("Parent directory is not readable: {}", parent.display()))?;
+            if !canonical_parent.starts_with(root) {
+                bail!("Path is outside writable root: {}", candidate.display());
+            }
+            let file_name = candidate
+                .file_name()
+                .ok_or_else(|| anyhow!("Target path has no file name: {}", candidate.display()))?;
+            Ok(WritableFileTarget {
+                path: canonical_parent.join(file_name),
+                display_path,
+                exists: false,
+            })
+        }
+    }
+}
+
+pub(super) fn atomic_write_text(path: &Path, content: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Target path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Target path has no valid file name: {}", path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.warp-local-agent-{}.tmp",
+        Uuid::new_v4()
+    ));
+
+    if let Err(error) = fs::write(&temp_path, content) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(anyhow!(
+            "Failed to write temporary file {}: {error}",
+            temp_path.display()
+        ));
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(anyhow!("Failed to replace {}: {error}", path.display()));
     }
     Ok(())
 }
@@ -335,8 +440,8 @@ fn normalize_diff_path(path: &str) -> anyhow::Result<String> {
     Ok(normalized.to_string())
 }
 
-fn writable_root(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let cwd = cwd.ok_or_else(|| anyhow!("apply_file_diff requires a current working directory"))?;
+fn writable_root(cwd: Option<&Path>, tool_name: &str) -> anyhow::Result<PathBuf> {
+    let cwd = cwd.ok_or_else(|| anyhow!("{tool_name} requires a current working directory"))?;
     let root = cwd
         .canonicalize()
         .map_err(|_| anyhow!("Writable root is not readable: {}", cwd.display()))?;
@@ -344,24 +449,6 @@ fn writable_root(cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
         bail!("Writable root is not a directory: {}", root.display());
     }
     Ok(root)
-}
-
-fn resolve_writable_existing_file(path: &str, root: &Path) -> anyhow::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
-    let canonical = candidate.canonicalize().map_err(|_| {
-        anyhow!(
-            "File does not exist for update-only patch: {}",
-            candidate.display()
-        )
-    })?;
-    if !canonical.starts_with(root) {
-        bail!("Path is outside writable root: {}", candidate.display());
-    }
-    Ok(canonical)
 }
 
 fn apply_file_patch(original: &str, patch: &FilePatch) -> anyhow::Result<(String, usize, usize)> {
