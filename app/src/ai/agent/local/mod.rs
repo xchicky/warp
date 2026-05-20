@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod apply_file_diff;
 mod tool_card;
 
 use std::{
