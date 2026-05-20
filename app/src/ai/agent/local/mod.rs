@@ -22,7 +22,10 @@ use uuid::Uuid;
 use warp_multi_agent_api as api;
 
 use self::{
-    apply_file_diff::{apply_file_diff_result_text, apply_unified_diff, ApplyFileDiffSummary},
+    apply_file_diff::{
+        apply_file_diff_result_text, apply_unified_diff, atomic_write_text,
+        resolve_writable_file_target, AppliedFileDiff, ApplyFileDiffSummary,
+    },
     tool_card::structured_tool_card_events,
 };
 
@@ -158,7 +161,7 @@ const MAX_LOCAL_DIRECT_TOOL_RESULTS: usize = 100;
 const MAX_LOCAL_DIRECT_TOOL_SCAN_FILES: usize = 10_000;
 const MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS: usize = 12 * 1024;
-const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff is available, you may use it to update existing files under the current workspace. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
+const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. If you need the user to run a shell command, use suggest_shell_command; commands are only suggested to the user and are never executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
@@ -745,6 +748,8 @@ fn local_tools() -> Vec<OpenAIChatTool> {
     let mut tools = local_read_only_tools();
     if FeatureFlag::LocalAgentFileWrites.is_enabled() {
         tools.push(apply_file_diff_tool_definition());
+        tools.push(write_file_tool_definition());
+        tools.push(edit_file_tool_definition());
     }
     tools
 }
@@ -852,6 +857,45 @@ fn apply_file_diff_tool_definition() -> OpenAIChatTool {
     }
 }
 
+fn write_file_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "write_file",
+            description: "Create or replace a small UTF-8 text file under the current writable workspace. Does not create missing parent directories. Defaults to refusing overwrites.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path, or path relative to the current terminal cwd." },
+                    "content": { "type": "string", "description": "UTF-8 text content to write." },
+                    "overwrite": { "type": "boolean", "description": "Whether to replace an existing file. Defaults to false." }
+                },
+                "required": ["path", "content"]
+            }),
+        },
+    }
+}
+
+fn edit_file_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "edit_file",
+            description: "Edit an existing UTF-8 text file under the current writable workspace by exact string replacement. Refuses ambiguous replacements unless replace_all is true.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path, or path relative to the current terminal cwd." },
+                    "old_text": { "type": "string", "description": "Exact UTF-8 text to replace. Must not be empty." },
+                    "new_text": { "type": "string", "description": "UTF-8 replacement text." },
+                    "replace_all": { "type": "boolean", "description": "Whether to replace all matches. Defaults to false." }
+                },
+                "required": ["path", "old_text", "new_text"]
+            }),
+        },
+    }
+}
+
 async fn execute_local_tool_batch(
     tool_calls: Vec<OpenAIChatToolCall>,
     cwd: Option<PathBuf>,
@@ -947,6 +991,8 @@ fn execute_local_tool(
         }
         "apply_file_diff" => execute_apply_file_diff_tool(&tool_call.function.arguments, cwd)
             .map(|summary| (apply_file_diff_result_text(&summary), Some(summary))),
+        "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd),
+        "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
@@ -979,6 +1025,172 @@ fn execute_apply_file_diff_tool(
         .map_err(|_| anyhow!("Invalid apply_file_diff arguments"))?;
     let patch = required_string_arg(&args, "patch")?;
     apply_unified_diff(patch, cwd, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES)
+}
+
+fn execute_write_file_tool(
+    arguments: &str,
+    cwd: Option<&Path>,
+) -> anyhow::Result<(String, Option<ApplyFileDiffSummary>)> {
+    if !FeatureFlag::LocalAgentFileWrites.is_enabled() {
+        return Err(anyhow!("write_file is disabled by feature flag"));
+    }
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid write_file arguments"))?;
+    let path = required_string_arg(&args, "path")?;
+    let content = required_string_arg(&args, "content")?;
+    reject_binary_text(content, "content")?;
+    ensure_text_within_limit(content, "content")?;
+    let overwrite = optional_bool_arg(&args, "overwrite").unwrap_or(false);
+    let target = resolve_writable_file_target(path, cwd, "write_file")?;
+    let mut status = "created";
+    let mut removed_lines = 0;
+
+    if target.exists {
+        let metadata = fs::metadata(&target.path)
+            .map_err(|_| anyhow!("File is not readable: {}", target.path.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("Path is not a file: {}", target.path.display()));
+        }
+        if !overwrite {
+            return Err(anyhow!(
+                "File already exists: {}. Use edit_file or apply_file_diff for targeted edits, or retry write_file with overwrite: true only if full replacement is intended.",
+                target.display_path
+            ));
+        }
+        if metadata.len() > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+            return Err(anyhow!(
+                "File is too large to overwrite: {}",
+                target.path.display()
+            ));
+        }
+        let existing = fs::read_to_string(&target.path)
+            .map_err(|_| anyhow!("File is not valid UTF-8: {}", target.path.display()))?;
+        removed_lines = count_text_lines(&existing);
+        status = "updated";
+    }
+
+    atomic_write_text(&target.path, content)?;
+    let summary = ApplyFileDiffSummary {
+        files: vec![AppliedFileDiff {
+            path: target.display_path.clone(),
+            additions: count_text_lines(content),
+            removals: removed_lines,
+            content: content.to_string(),
+        }],
+    };
+    let text = format!(
+        "Wrote file successfully.\nPath: {}\nStatus: {}\nBytes written: {}\nLines added: {}\nLines removed: {}",
+        target.display_path,
+        status,
+        content.len(),
+        summary.files[0].additions,
+        summary.files[0].removals,
+    );
+    Ok((text, Some(summary)))
+}
+
+fn execute_edit_file_tool(
+    arguments: &str,
+    cwd: Option<&Path>,
+) -> anyhow::Result<(String, Option<ApplyFileDiffSummary>)> {
+    if !FeatureFlag::LocalAgentFileWrites.is_enabled() {
+        return Err(anyhow!("edit_file is disabled by feature flag"));
+    }
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid edit_file arguments"))?;
+    let path = required_string_arg(&args, "path")?;
+    let old_text = required_string_arg(&args, "old_text")?;
+    let new_text = required_string_arg(&args, "new_text")?;
+    if old_text.is_empty() {
+        return Err(anyhow!("old_text cannot be empty"));
+    }
+    reject_binary_text(old_text, "old_text")?;
+    reject_binary_text(new_text, "new_text")?;
+    ensure_text_within_limit(new_text, "new_text")?;
+    let replace_all = optional_bool_arg(&args, "replace_all").unwrap_or(false);
+    let target = resolve_writable_file_target(path, cwd, "edit_file")?;
+    if !target.exists {
+        return Err(anyhow!(
+            "File does not exist for edit: {}",
+            target.path.display()
+        ));
+    }
+    let metadata = fs::metadata(&target.path)
+        .map_err(|_| anyhow!("File is not readable: {}", target.path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("Path is not a file: {}", target.path.display()));
+    }
+    if metadata.len() > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+        return Err(anyhow!(
+            "File is too large to edit: {}",
+            target.path.display()
+        ));
+    }
+    let content = fs::read_to_string(&target.path)
+        .map_err(|_| anyhow!("File is not valid UTF-8: {}", target.path.display()))?;
+    let matches = content.match_indices(old_text).count();
+    match matches {
+        0 => return Err(anyhow!("old_text was not found in {}", target.display_path)),
+        1 => {}
+        _ if !replace_all => {
+            return Err(anyhow!(
+                "old_text matched {matches} times in {}. Set replace_all: true to replace every match, or provide more specific old_text.",
+                target.display_path
+            ));
+        }
+        _ => {}
+    }
+    let updated = if replace_all {
+        content.replace(old_text, new_text)
+    } else {
+        content.replacen(old_text, new_text, 1)
+    };
+    if updated.len() as u64 > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+        return Err(anyhow!(
+            "Edited file would be too large: {}",
+            target.path.display()
+        ));
+    }
+    atomic_write_text(&target.path, &updated)?;
+    let summary = ApplyFileDiffSummary {
+        files: vec![AppliedFileDiff {
+            path: target.display_path.clone(),
+            additions: count_text_lines(new_text) * matches,
+            removals: count_text_lines(old_text) * matches,
+            content: updated,
+        }],
+    };
+    let text = format!(
+        "Edited file successfully.\nPath: {}\nReplacements: {}\nBytes written: {}\nLines added: {}\nLines removed: {}",
+        target.display_path,
+        matches,
+        summary.files[0].content.len(),
+        summary.files[0].additions,
+        summary.files[0].removals,
+    );
+    Ok((text, Some(summary)))
+}
+
+fn reject_binary_text(text: &str, name: &str) -> anyhow::Result<()> {
+    if text.contains('\0') {
+        return Err(anyhow!("{name} appears to contain binary data"));
+    }
+    Ok(())
+}
+
+fn ensure_text_within_limit(text: &str, name: &str) -> anyhow::Result<()> {
+    if text.len() as u64 > MAX_LOCAL_DIRECT_TOOL_FILE_BYTES {
+        return Err(anyhow!("{name} is too large"));
+    }
+    Ok(())
+}
+
+fn count_text_lines(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2134,16 +2346,18 @@ fn stream_finished_done() -> api::ResponseEvent {
 mod tests {
     use super::{
         agent_output_content_events, chat_completions_url, drain_sse_events,
-        empty_local_provider_response_resolution, execute_apply_file_diff_tool, execute_glob_tool,
-        execute_grep_tool, execute_list_directory_tool, execute_local_tool,
-        execute_local_tool_batch, execute_read_file_tool, execute_suggest_shell_command_tool,
-        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
-        local_read_only_tools, local_tool_result_summary, local_tools, openai_message,
+        empty_local_provider_response_resolution, execute_apply_file_diff_tool,
+        execute_edit_file_tool, execute_glob_tool, execute_grep_tool, execute_list_directory_tool,
+        execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
+        execute_suggest_shell_command_tool, execute_write_file_tool, fallback_tool_results_message,
+        generate_openai_compatible_output, is_mutating_local_tool, local_read_only_tools,
+        local_tool_result_summary, local_tools, openai_message,
         openai_messages_from_inputs_and_tasks, root_task_id, EmptyLocalProviderResponseResolution,
         LocalDirectConfig, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
         OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
+        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -2507,13 +2721,15 @@ mod tests {
     }
 
     #[test]
-    fn local_tools_advertises_apply_file_diff_only_when_flag_enabled() {
+    fn local_tools_advertises_mutating_file_tools_only_when_flag_enabled() {
         let _disabled = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
         let disabled_names = local_tools()
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(!disabled_names.contains(&"apply_file_diff"));
+        assert!(!disabled_names.contains(&"write_file"));
+        assert!(!disabled_names.contains(&"edit_file"));
         drop(_disabled);
 
         let _enabled = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
@@ -2522,6 +2738,8 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
         assert!(enabled_names.contains(&"apply_file_diff"));
+        assert!(enabled_names.contains(&"write_file"));
+        assert!(enabled_names.contains(&"edit_file"));
     }
 
     #[test]
@@ -2692,6 +2910,238 @@ mod tests {
     }
 
     #[test]
+    fn write_file_tool_is_disabled_without_flag() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+
+        let error = execute_write_file_tool(
+            r#"{"path":"sample.txt","content":"hello\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disabled by feature flag"));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn write_file_tool_creates_new_file() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+
+        let (result, summary) = execute_write_file_tool(
+            r#"{"path":"sample.txt","content":"hello\nworld\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\nworld\n");
+        assert!(result.contains("Status: created"));
+        let summary = summary.unwrap();
+        assert_eq!(summary.files[0].path, "sample.txt");
+        assert_eq!(summary.files[0].additions, 2);
+        assert_eq!(summary.files[0].removals, 0);
+    }
+
+    #[test]
+    fn write_file_tool_refuses_existing_file_without_overwrite() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let error = execute_write_file_tool(
+            r#"{"path":"sample.txt","content":"new\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("File already exists"));
+        assert!(error.to_string().contains("overwrite: true"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn write_file_tool_overwrites_when_explicit() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let (result, summary) = execute_write_file_tool(
+            r#"{"path":"sample.txt","content":"new\n","overwrite":true}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert!(result.contains("Status: updated"));
+        assert_eq!(summary.unwrap().files[0].removals, 1);
+    }
+
+    #[test]
+    fn write_file_tool_rejects_missing_parent_path_escape_and_oversize() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let missing_parent = execute_write_file_tool(
+            r#"{"path":"missing/sample.txt","content":"new\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(missing_parent.to_string().contains("Parent directory"));
+
+        let escape_args = serde_json::json!({
+            "path": outside.path().join("outside.txt"),
+            "content": "new\n",
+        })
+        .to_string();
+        let escape = execute_write_file_tool(&escape_args, Some(temp_dir.path())).unwrap_err();
+        assert!(escape.to_string().contains("outside writable root"));
+
+        let huge = "x".repeat(MAX_LOCAL_DIRECT_TOOL_FILE_BYTES as usize + 1);
+        let huge_args = serde_json::json!({
+            "path": "huge.txt",
+            "content": huge,
+        })
+        .to_string();
+        let oversized = execute_write_file_tool(&huge_args, Some(temp_dir.path())).unwrap_err();
+        assert!(oversized.to_string().contains("content is too large"));
+    }
+
+    #[test]
+    fn edit_file_tool_is_disabled_without_flag() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let error = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"old","new_text":"new"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disabled by feature flag"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn edit_file_tool_replaces_exact_match() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+
+        let (result, summary) = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"beta\n","new_text":"BETA\n"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert!(result.contains("Replacements: 1"));
+        let summary = summary.unwrap();
+        assert_eq!(summary.files[0].additions, 1);
+        assert_eq!(summary.files[0].removals, 1);
+    }
+
+    #[test]
+    fn edit_file_tool_rejects_zero_or_ambiguous_matches_without_writing() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "alpha\nbeta\nbeta\n").unwrap();
+
+        let zero = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"missing","new_text":"new"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(zero.to_string().contains("was not found"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\nbeta\n"
+        );
+
+        let multiple = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"beta","new_text":"BETA"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(multiple.to_string().contains("matched 2 times"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\nbeta\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_tool_replace_all_updates_every_match() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "beta\nbeta\n").unwrap();
+
+        let (result, summary) = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"beta","new_text":"BETA","replace_all":true}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "BETA\nBETA\n");
+        assert!(result.contains("Replacements: 2"));
+        assert_eq!(summary.unwrap().files[0].additions, 2);
+    }
+
+    #[test]
+    fn edit_file_tool_rejects_empty_old_text_missing_file_non_utf8_and_binary_text() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("sample.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+
+        let empty = execute_edit_file_tool(
+            r#"{"path":"sample.txt","old_text":"","new_text":"new"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(empty.to_string().contains("old_text cannot be empty"));
+
+        let missing = execute_edit_file_tool(
+            r#"{"path":"missing.txt","old_text":"old","new_text":"new"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("does not exist"));
+
+        let binary_args = serde_json::json!({
+            "path": "sample.txt",
+            "old_text": "alpha",
+            "new_text": "has\u{0}nul",
+        })
+        .to_string();
+        let binary = execute_edit_file_tool(&binary_args, Some(temp_dir.path())).unwrap_err();
+        assert!(binary.to_string().contains("binary data"));
+
+        let non_utf8 = temp_dir.path().join("binary.txt");
+        std::fs::write(&non_utf8, [0xff, 0xfe]).unwrap();
+        let non_utf8_error = execute_edit_file_tool(
+            r#"{"path":"binary.txt","old_text":"old","new_text":"new"}"#,
+            Some(temp_dir.path()),
+        )
+        .unwrap_err();
+        assert!(non_utf8_error.to_string().contains("not valid UTF-8"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+    }
+
+    #[test]
     fn mutating_tool_detection_switches_scheduler_path() {
         assert!(is_mutating_local_tool("apply_file_diff"));
         assert!(is_mutating_local_tool("write_file"));
@@ -2733,6 +3183,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("second.txt")).unwrap(),
             "new2\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_orders_write_and_edit_with_other_mutations() {
+        let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("existing.txt"), "old\n").unwrap();
+
+        let results = execute_local_tool_batch(
+            vec![
+                tool_call(
+                    "write_file",
+                    r#"{"path":"created.txt","content":"created\n"}"#,
+                ),
+                tool_call("read_file", r#"{"path":"existing.txt"}"#),
+                tool_call(
+                    "edit_file",
+                    r#"{"path":"existing.txt","old_text":"old","new_text":"new"}"#,
+                ),
+            ],
+            Some(temp_dir.path().to_path_buf()),
+            suggestions,
+        )
+        .await;
+
+        assert_eq!(results[0].0.function.name, "write_file");
+        assert_eq!(results[1].0.function.name, "read_file");
+        assert_eq!(results[2].0.function.name, "edit_file");
+        assert!(results[1].1.contains("old"));
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("existing.txt")).unwrap(),
+            "new\n"
         );
     }
 
@@ -3009,6 +3493,117 @@ mod tests {
             success.updated_files_v2[0].file.as_ref().unwrap().file_path,
             "sample.txt"
         );
+    }
+
+    #[test]
+    fn execute_write_file_tool_emits_apply_file_diffs_card() {
+        let tool_call = tool_call("write_file", r#"{"path":"sample.txt","content":"hello\n"}"#);
+        let summary = ApplyFileDiffSummary {
+            files: vec![super::apply_file_diff::AppliedFileDiff {
+                path: "sample.txt".to_string(),
+                additions: 1,
+                removals: 0,
+                content: "hello\n".to_string(),
+            }],
+        };
+
+        let events = structured_tool_card_events(
+            "task",
+            "request",
+            &tool_call,
+            "Wrote file.",
+            Some(&summary),
+        )
+        .unwrap();
+
+        let api::response_event::Type::ClientActions(actions) = events[0].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCall(tool_call_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(call)) =
+            tool_call_message.tool.as_ref()
+        else {
+            panic!("expected apply file diffs call");
+        };
+        assert_eq!(call.summary, "write_file: sample.txt");
+        assert_eq!(call.new_files[0].file_path, "sample.txt");
+
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool result");
+        };
+        assert!(matches!(
+            result_message.result.as_ref(),
+            Some(api::message::tool_call_result::Result::ApplyFileDiffs(_))
+        ));
+    }
+
+    #[test]
+    fn execute_edit_file_tool_emits_apply_file_diffs_card() {
+        let tool_call = tool_call(
+            "edit_file",
+            r#"{"path":"sample.txt","old_text":"old","new_text":"new"}"#,
+        );
+        let summary = ApplyFileDiffSummary {
+            files: vec![super::apply_file_diff::AppliedFileDiff {
+                path: "sample.txt".to_string(),
+                additions: 1,
+                removals: 1,
+                content: "new\n".to_string(),
+            }],
+        };
+
+        let events = structured_tool_card_events(
+            "task",
+            "request",
+            &tool_call,
+            "Edited file.",
+            Some(&summary),
+        )
+        .unwrap();
+
+        let api::response_event::Type::ClientActions(actions) = events[0].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCall(tool_call_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(call)) =
+            tool_call_message.tool.as_ref()
+        else {
+            panic!("expected apply file diffs call");
+        };
+        assert_eq!(call.summary, "edit_file: sample.txt");
+        assert_eq!(call.diffs[0].search, "old");
+        assert_eq!(call.diffs[0].replace, "new");
     }
 
     #[test]
