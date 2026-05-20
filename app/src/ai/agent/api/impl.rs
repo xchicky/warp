@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     ai::agent::{
-        local::{generate_openai_compatible_output, LocalDirectConfig},
+        local::{generate_openai_compatible_output, LocalDirectConfig, LocalMcpContext},
         redaction,
     },
     terminal::model::session::SessionType,
@@ -25,12 +25,14 @@ pub async fn generate_multi_agent_output(
     }
 
     if let Some(local_config) = local_direct_config_for_request(&params) {
+        let local_mcp_context = local_mcp_context_for_request(params.mcp_context.take());
         return Ok(Box::pin(
             generate_openai_compatible_output(
                 local_config,
                 params.input,
                 params.tasks,
                 params.conversation_token.clone(),
+                local_mcp_context,
             )
             .take_until(cancellation_rx),
         ));
@@ -166,6 +168,15 @@ pub async fn generate_multi_agent_output(
             Ok(Box::pin(rx))
         }
     }
+}
+
+fn local_mcp_context_for_request(
+    mcp_context: Option<super::MCPContext>,
+) -> Option<LocalMcpContext> {
+    if !FeatureFlag::LocalAgentMcp.is_enabled() {
+        return None;
+    }
+    mcp_context.and_then(LocalMcpContext::from_mcp_context)
 }
 
 fn local_direct_config_for_request(params: &RequestParams) -> Option<LocalDirectConfig> {
