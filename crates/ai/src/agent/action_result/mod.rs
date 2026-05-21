@@ -814,7 +814,14 @@ impl AIAgentActionResultType {
             | Self::FileGlob(FileGlobResult::Error(_))
             | Self::FileGlobV2(FileGlobV2Result::Error(_))
             | Self::ReadMCPResource(ReadMCPResourceResult::Error(_))
-            | Self::CallMCPTool(CallMCPToolResult::Error(_))
+            | Self::CallMCPTool(
+                CallMCPToolResult::Error(_)
+                | CallMCPToolResult::Unavailable(_)
+                | CallMCPToolResult::Timeout(_)
+                | CallMCPToolResult::UnsupportedContent(_)
+                | CallMCPToolResult::ServerError(_)
+                | CallMCPToolResult::TransportError(_),
+            )
             | Self::ReadDocuments(ReadDocumentsResult::Error(_))
             | Self::EditDocuments(EditDocumentsResult::Error(_))
             | Self::CreateDocuments(CreateDocumentsResult::Error(_))
@@ -1040,6 +1047,11 @@ impl Display for FileGlobV2Match {
 pub enum CallMCPToolResult {
     Success { result: rmcp::model::CallToolResult },
     Error(String),
+    Unavailable(String),
+    Timeout(String),
+    UnsupportedContent(String),
+    ServerError(String),
+    TransportError(String),
     Cancelled,
 }
 
@@ -1054,6 +1066,19 @@ impl Display for CallMCPToolResult {
                 )
             }
             CallMCPToolResult::Error(error) => write!(f, "MCP tool call error: {error}"),
+            CallMCPToolResult::Unavailable(error) => {
+                write!(f, "MCP tool call unavailable: {error}")
+            }
+            CallMCPToolResult::Timeout(error) => write!(f, "MCP tool call timed out: {error}"),
+            CallMCPToolResult::UnsupportedContent(error) => {
+                write!(f, "MCP tool call returned unsupported content: {error}")
+            }
+            CallMCPToolResult::ServerError(error) => {
+                write!(f, "MCP tool call server error: {error}")
+            }
+            CallMCPToolResult::TransportError(error) => {
+                write!(f, "MCP tool call transport error: {error}")
+            }
             CallMCPToolResult::Cancelled => write!(f, "MCP tool call cancelled"),
         }
     }

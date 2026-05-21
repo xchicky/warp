@@ -1,6 +1,7 @@
 use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 use crate::terminal::model::session::active_session::ActiveSession;
 use futures::{future::BoxFuture, FutureExt};
+use std::time::Duration;
 use warpui::{Entity, EntityId, ModelContext, ModelHandle};
 
 #[cfg(not(target_family = "wasm"))]
@@ -18,6 +19,9 @@ use crate::{
 use itertools::Itertools;
 #[cfg(not(target_family = "wasm"))]
 use warpui::SingletonEntity;
+
+#[cfg(not(target_family = "wasm"))]
+const MCP_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct CallMCPToolExecutor {
     _active_session: ModelHandle<ActiveSession>,
@@ -133,21 +137,29 @@ impl CallMCPToolExecutor {
 
             let Some(reconnecting_peer) = templatable_peer else {
                 return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
-                    CallMCPToolResult::Error("MCP server for tool not found".to_owned()),
+                    CallMCPToolResult::Unavailable(
+                        "status: unavailable\nMCP server for tool not found".to_owned(),
+                    ),
                 ));
             };
 
             let name_owned_inner = name_owned.clone();
             ActionExecution::new_async(
                 async move {
-                    reconnecting_peer
-                        .call_tool(rmcp::model::CallToolRequestParam {
+                    match tokio::time::timeout(
+                        MCP_TOOL_CALL_TIMEOUT,
+                        reconnecting_peer.call_tool(rmcp::model::CallToolRequestParam {
                             name: name_owned_inner.into(),
                             arguments: Some(arguments),
-                        })
-                        .await
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(result) => LocalMcpCallOutcome::Completed(result),
+                        Err(_) => LocalMcpCallOutcome::TimedOut(MCP_TOOL_CALL_TIMEOUT),
+                    }
                 },
-                move |res, ctx| handle_call_tool_result(res, server_output_id, name_clone, ctx),
+                move |res, ctx| handle_call_tool_outcome(res, server_output_id, name_clone, ctx),
             )
         }
     }
@@ -202,6 +214,34 @@ pub(crate) fn coerce_integer_args(
 #[path = "call_mcp_tool_tests.rs"]
 mod tests;
 
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+enum LocalMcpCallOutcome {
+    Completed(Result<rmcp::model::CallToolResult, rmcp::ServiceError>),
+    TimedOut(Duration),
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn handle_call_tool_outcome(
+    outcome: LocalMcpCallOutcome,
+    server_output_id: Option<crate::ai::blocklist::action_model::execute::ServerOutputId>,
+    tool_name: String,
+    ctx: &warpui::AppContext,
+) -> AIAgentActionResultType {
+    match outcome {
+        LocalMcpCallOutcome::Completed(result) => {
+            handle_call_tool_result(result, server_output_id, tool_name, ctx)
+        }
+        LocalMcpCallOutcome::TimedOut(timeout) => {
+            log::warn!("Executing MCP tool timed out after {timeout:?}");
+            AIAgentActionResultType::CallMCPTool(CallMCPToolResult::Timeout(format!(
+                "status: timeout\nMCP tool call timed out after {} seconds.",
+                timeout.as_secs()
+            )))
+        }
+    }
+}
+
 /// Handles the result of a call_tool request, converting it to an AIAgentActionResultType.
 #[cfg(not(target_family = "wasm"))]
 fn handle_call_tool_result(
@@ -250,7 +290,7 @@ fn handle_call_tool_result(
                     },
                     ctx
                 );
-                CallMCPToolResult::Error(error_message)
+                CallMCPToolResult::ServerError(format!("status: server-error\n{error_message}"))
             } else {
                 send_telemetry_from_app_ctx!(
                     TelemetryEvent::MCPToolCallAccepted {
@@ -264,8 +304,11 @@ fn handle_call_tool_result(
             }
         }
         Err(e) => {
-            let error_message = e.to_string();
-            log::warn!("Executing MCP tool resulted in error: {e:?}");
+            let action_result = call_mcp_tool_error_result(&e);
+            log::warn!(
+                "Executing MCP tool resulted in {}",
+                call_mcp_tool_service_error_kind(&e)
+            );
             send_telemetry_from_app_ctx!(
                 TelemetryEvent::MCPToolCallAccepted {
                     server_output_id,
@@ -274,8 +317,65 @@ fn handle_call_tool_result(
                 },
                 ctx
             );
-            CallMCPToolResult::Error(error_message)
+            action_result
         }
     };
     AIAgentActionResultType::CallMCPTool(action_result)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn call_mcp_tool_error_result(error: &rmcp::ServiceError) -> CallMCPToolResult {
+    match error {
+        rmcp::ServiceError::TransportClosed => CallMCPToolResult::Unavailable(
+            "status: unavailable\nMCP transport closed after one reconnect retry.".to_string(),
+        ),
+        rmcp::ServiceError::Timeout { timeout } => CallMCPToolResult::Timeout(format!(
+            "status: timeout\nMCP tool call timed out after {} seconds.",
+            timeout.as_secs()
+        )),
+        rmcp::ServiceError::Cancelled { reason } => CallMCPToolResult::Error(format!(
+            "status: cancelled\nMCP tool call was cancelled{}.",
+            reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default()
+        )),
+        rmcp::ServiceError::TransportSend(_) => CallMCPToolResult::TransportError(
+            "status: transport-error\nMCP transport failed while sending the request.".to_string(),
+        ),
+        rmcp::ServiceError::UnexpectedResponse => CallMCPToolResult::ServerError(
+            "status: server-error\nMCP server returned an unexpected response type.".to_string(),
+        ),
+        rmcp::ServiceError::McpError(error) => {
+            let message = error.message.to_string();
+            if message.starts_with("Reconnection failed") || message.contains("Reconnection failed")
+            {
+                CallMCPToolResult::Unavailable(format!("status: unavailable\n{message}"))
+            } else {
+                CallMCPToolResult::ServerError(format!("status: server-error\n{message}"))
+            }
+        }
+        _ => CallMCPToolResult::ServerError(format!(
+            "status: server-error\nMCP tool call failed: {error}"
+        )),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn call_mcp_tool_service_error_kind(error: &rmcp::ServiceError) -> &'static str {
+    match error {
+        rmcp::ServiceError::TransportClosed => "transport-closed",
+        rmcp::ServiceError::Timeout { .. } => "timeout",
+        rmcp::ServiceError::Cancelled { .. } => "cancelled",
+        rmcp::ServiceError::TransportSend(_) => "transport-send-error",
+        rmcp::ServiceError::UnexpectedResponse => "unexpected-response",
+        rmcp::ServiceError::McpError(error) => {
+            if error.message.contains("Reconnection failed") {
+                "reconnect-failure"
+            } else {
+                "server-error"
+            }
+        }
+        _ => "unknown-error",
+    }
 }

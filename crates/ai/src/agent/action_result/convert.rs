@@ -485,7 +485,12 @@ impl TryFrom<CallMCPToolResult> for api::request::input::tool_call_result::Resul
                     },
                 ))
             }
-            CallMCPToolResult::Error(error) => {
+            CallMCPToolResult::Error(error)
+            | CallMCPToolResult::Unavailable(error)
+            | CallMCPToolResult::Timeout(error)
+            | CallMCPToolResult::UnsupportedContent(error)
+            | CallMCPToolResult::ServerError(error)
+            | CallMCPToolResult::TransportError(error) => {
                 Ok(api::request::input::tool_call_result::Result::CallMcpTool(
                     api::CallMcpToolResult {
                         result: Some(api::call_mcp_tool_result::Result::Error(

@@ -3,6 +3,7 @@ mod mcp_tools;
 mod tool_card;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
@@ -1346,6 +1347,7 @@ fn is_mutating_local_tool(name: &str) -> bool {
 
 fn is_sequential_local_tool(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCatalog>) -> bool {
     is_mutating_local_tool(name)
+        || name.starts_with("mcp__")
         || mcp_tool_catalog.is_some_and(|catalog| catalog.find_openai_name(name).is_some())
 }
 
@@ -1425,6 +1427,12 @@ fn execute_mcp_tool_request(
     }
     let Some(entry) = mcp_tool_catalog.and_then(|catalog| catalog.find_openai_name(openai_name))
     else {
+        if openai_name.starts_with("mcp__") {
+            return Ok(mcp_unavailable_result_for_provider(
+                openai_name,
+                "The MCP tool was not found in the current active catalog. The server or tool may have been disabled, renamed, or disconnected since it was advertised.",
+            ));
+        }
         return Err(anyhow!("Unknown local tool: {openai_name}"));
     };
     let args: Value =
@@ -1441,6 +1449,26 @@ fn execute_mcp_tool_request(
         entry.server_id,
         formatted_args,
     ))
+}
+
+fn mcp_unavailable_result_for_provider(openai_name: &str, reason: &str) -> String {
+    let (server_name, tool_name) = parse_mcp_openai_name(openai_name);
+    format!(
+        "MCP tool result\nServer: {}\nTool: {}\nStatus: unavailable\nError:\n{}",
+        server_name.as_deref().unwrap_or("unknown"),
+        tool_name.as_deref().unwrap_or("unknown"),
+        truncate_mcp_output_for_provider(reason)
+    )
+}
+
+fn parse_mcp_openai_name(openai_name: &str) -> (Option<String>, Option<String>) {
+    let mut parts = openai_name.splitn(4, "__");
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("mcp"), Some(server), Some(tool)) if !server.is_empty() && !tool.is_empty() => {
+            (Some(server.to_string()), Some(tool.to_string()))
+        }
+        _ => (None, Some(openai_name.to_string())),
+    }
 }
 
 fn execute_apply_file_diff_tool(
@@ -2391,8 +2419,13 @@ fn mcp_tool_result_for_provider(
     result: &CallMCPToolResult,
 ) -> String {
     let status = match result {
-        CallMCPToolResult::Success { .. } => "success",
-        CallMCPToolResult::Error(_) => "error",
+        CallMCPToolResult::Success { result } => mcp_success_status(result),
+        CallMCPToolResult::Error(error) => mcp_status_from_error_message(error).unwrap_or("error"),
+        CallMCPToolResult::Unavailable(_) => "unavailable",
+        CallMCPToolResult::Timeout(_) => "timeout",
+        CallMCPToolResult::UnsupportedContent(_) => "unsupported-content",
+        CallMCPToolResult::ServerError(_) => "server-error",
+        CallMCPToolResult::TransportError(_) => "transport-error",
         CallMCPToolResult::Cancelled => "cancelled",
     };
     let mut sections = vec![format!(
@@ -2404,10 +2437,15 @@ fn mcp_tool_result_for_provider(
         CallMCPToolResult::Success { result } => {
             sections.push(mcp_call_tool_result_content_for_provider(result));
         }
-        CallMCPToolResult::Error(error) => {
+        CallMCPToolResult::Error(error)
+        | CallMCPToolResult::Unavailable(error)
+        | CallMCPToolResult::Timeout(error)
+        | CallMCPToolResult::UnsupportedContent(error)
+        | CallMCPToolResult::ServerError(error)
+        | CallMCPToolResult::TransportError(error) => {
             sections.push(format!(
                 "Error:\n{}",
-                truncate_mcp_output_for_provider(error)
+                truncate_mcp_output_for_provider(&strip_mcp_status_prefix(error))
             ));
         }
         CallMCPToolResult::Cancelled => {
@@ -2424,8 +2462,12 @@ fn mcp_tool_api_result_for_provider(
     result: &api::CallMcpToolResult,
 ) -> String {
     let status = match result.result.as_ref() {
-        Some(api::call_mcp_tool_result::Result::Success(_)) => "success",
-        Some(api::call_mcp_tool_result::Result::Error(_)) => "error",
+        Some(api::call_mcp_tool_result::Result::Success(success)) => {
+            mcp_api_success_status(success)
+        }
+        Some(api::call_mcp_tool_result::Result::Error(error)) => {
+            mcp_status_from_error_message(&error.message).unwrap_or("error")
+        }
         None => "unavailable",
     };
     let mut sections = vec![format!(
@@ -2440,12 +2482,67 @@ fn mcp_tool_api_result_for_provider(
         Some(api::call_mcp_tool_result::Result::Error(error)) => {
             sections.push(format!(
                 "Error:\n{}",
-                truncate_mcp_output_for_provider(&error.message)
+                truncate_mcp_output_for_provider(&strip_mcp_status_prefix(&error.message))
             ));
         }
         None => sections.push("No MCP result payload was returned.".to_string()),
     }
     sections.join("\n")
+}
+
+fn mcp_success_status(result: &rmcp::model::CallToolResult) -> &'static str {
+    if result.content.iter().any(|content| {
+        matches!(
+            &content.raw,
+            rmcp::model::RawContent::Image(_)
+                | rmcp::model::RawContent::Resource(_)
+                | rmcp::model::RawContent::Audio(_)
+                | rmcp::model::RawContent::ResourceLink(_)
+        )
+    }) {
+        "unsupported-content"
+    } else {
+        "success"
+    }
+}
+
+fn mcp_api_success_status(success: &api::call_mcp_tool_result::Success) -> &'static str {
+    if success.results.iter().any(|result| {
+        matches!(
+            &result.result,
+            Some(
+                api::call_mcp_tool_result::success::result::Result::Image(_)
+                    | api::call_mcp_tool_result::success::result::Result::Resource(_)
+            )
+        )
+    }) {
+        "unsupported-content"
+    } else {
+        "success"
+    }
+}
+
+fn mcp_status_from_error_message(message: &str) -> Option<&'static str> {
+    let status = message
+        .strip_prefix("status: ")
+        .and_then(|rest| rest.lines().next())?;
+    match status.trim() {
+        "cancelled" => Some("cancelled"),
+        "timeout" => Some("timeout"),
+        "transport-error" => Some("transport-error"),
+        "unavailable" => Some("unavailable"),
+        "server-error" => Some("server-error"),
+        "unsupported-content" => Some("unsupported-content"),
+        _ => None,
+    }
+}
+
+fn strip_mcp_status_prefix(message: &str) -> Cow<'_, str> {
+    if message.starts_with("status: ") {
+        Cow::Owned(message.lines().skip(1).collect::<Vec<_>>().join("\n"))
+    } else {
+        Cow::Borrowed(message)
+    }
 }
 
 fn mcp_call_tool_result_content_for_provider(result: &rmcp::model::CallToolResult) -> String {
@@ -3287,16 +3384,17 @@ mod tests {
         execute_write_file_tool, fallback_tool_results_message, generate_openai_compatible_output,
         is_mutating_local_tool, local_mcp_tool_catalog, local_read_only_tools,
         local_shell_action_result, local_tool_result_summary, local_tools, local_tools_for_context,
-        mcp_tool_result_for_provider, openai_message, openai_messages_from_inputs_and_tasks,
+        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        mcp_unavailable_result_for_provider, openai_message, openai_messages_from_inputs_and_tasks,
         root_task_id, shell_command_result_for_provider, structured_mcp_tool_call_event,
-        structured_tool_call_event, truncate_shell_output_for_provider,
-        EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
-        OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent,
-        OpenAIToolCallAccumulator, RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT,
-        MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
-        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
-        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES,
-        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        structured_tool_call_event, truncate_mcp_output_for_provider,
+        truncate_shell_output_for_provider, EmptyLocalProviderResponseResolution,
+        LocalDirectConfig, LocalMcpContext, OpenAIChatRequest, OpenAIChatToolCall,
+        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
+        LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
+        MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
+        MAX_LOCAL_DIRECT_MCP_RESULT_BYTES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
+        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -3955,6 +4053,20 @@ mod tests {
         assert!(result
             .text
             .contains("MCP tool arguments must be a JSON object"));
+    }
+
+    #[test]
+    fn mcp_tool_call_missing_from_catalog_returns_unavailable_result() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let tool_call = tool_call("mcp__filesystem__read_path", r#"{"path":"Cargo.toml"}"#);
+
+        let result = execute_local_tool(&tool_call, None, &suggestions, None);
+
+        assert!(!result.pending_tool_call);
+        assert!(result.text.contains("Status: unavailable"));
+        assert!(result.text.contains("Server: filesystem"));
+        assert!(result.text.contains("Tool: read_path"));
     }
 
     #[test]
@@ -4860,11 +4972,93 @@ mod tests {
 
         let formatted = mcp_tool_result_for_provider(Some("server"), Some("tool"), &result);
 
-        assert!(formatted.contains("Status: success"));
+        assert!(formatted.contains("Status: unsupported-content"));
         assert!(formatted.contains("truncated"));
         assert!(formatted.contains("TAIL"));
         assert!(formatted.contains("Unsupported image content: mime_type=image/png"));
         assert!(!formatted.contains("abc123"));
+    }
+
+    #[test]
+    fn stale_mcp_catalog_tool_call_returns_unavailable_tool_result() {
+        let result = mcp_unavailable_result_for_provider(
+            "mcp__filesystem__read_path",
+            "server disappeared before execution",
+        );
+
+        assert!(result.contains("Status: unavailable"));
+        assert!(result.contains("Server: filesystem"));
+        assert!(result.contains("Tool: read_path"));
+        assert!(result.contains("server disappeared"));
+    }
+
+    #[test]
+    fn mcp_error_status_prefix_controls_provider_status() {
+        let result = CallMCPToolResult::Error(
+            "status: timeout\nMCP tool call timed out after 60 seconds.".to_string(),
+        );
+
+        let formatted = mcp_tool_result_for_provider(Some("server"), Some("tool"), &result);
+
+        assert!(formatted.contains("Status: timeout"));
+        assert!(formatted.contains("timed out after 60 seconds"));
+        assert!(!formatted.contains("status: timeout\n"));
+    }
+
+    #[test]
+    fn mcp_api_error_status_prefix_controls_provider_status() {
+        let result = api::CallMcpToolResult {
+            result: Some(api::call_mcp_tool_result::Result::Error(
+                api::call_mcp_tool_result::Error {
+                    message: "status: unavailable\nserver not active".to_string(),
+                },
+            )),
+        };
+
+        let formatted = mcp_tool_api_result_for_provider(Some("server"), Some("tool"), &result);
+
+        assert!(formatted.contains("Status: unavailable"));
+        assert!(formatted.contains("server not active"));
+    }
+
+    #[test]
+    fn mcp_api_unsupported_content_is_metadata_only_for_provider() {
+        let result = api::CallMcpToolResult {
+            result: Some(api::call_mcp_tool_result::Result::Success(
+                api::call_mcp_tool_result::Success {
+                    results: vec![api::call_mcp_tool_result::success::Result {
+                        result: Some(api::call_mcp_tool_result::success::result::Result::Image(
+                            api::call_mcp_tool_result::success::result::Image {
+                                data: b"raw-image-bytes".to_vec(),
+                                mime_type: "image/png".to_string(),
+                            },
+                        )),
+                    }],
+                },
+            )),
+        };
+
+        let formatted = mcp_tool_api_result_for_provider(Some("server"), Some("tool"), &result);
+
+        assert!(formatted.contains("Status: unsupported-content"));
+        assert!(formatted.contains("Unsupported image content: mime_type=image/png"));
+        assert!(formatted.contains("bytes=15"));
+        assert!(!formatted.contains("raw-image-bytes"));
+    }
+
+    #[test]
+    fn mcp_truncation_uses_byte_and_char_tails() {
+        let byte_limited = truncate_mcp_output_for_provider(&format!(
+            "{}TAIL",
+            "x".repeat(MAX_LOCAL_DIRECT_MCP_RESULT_BYTES + 100)
+        ));
+        assert!(byte_limited.contains("truncated"));
+        assert!(byte_limited.ends_with("TAIL"));
+
+        let char_limited =
+            truncate_mcp_output_for_provider(&"界".repeat(MAX_LOCAL_DIRECT_MCP_RESULT_BYTES));
+        assert!(char_limited.contains("truncated"));
+        assert!(char_limited.chars().count() < MAX_LOCAL_DIRECT_MCP_RESULT_BYTES);
     }
 
     #[test]
