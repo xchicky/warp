@@ -1258,6 +1258,9 @@ async fn read_binary_file_context(
                 log::warn!("Image file too large after processing: {}", path.display());
                 return Ok(BinaryFileReadResult::Missing);
             }
+            ProcessImageResult::UnsupportedMimeType => {
+                return Ok(BinaryFileReadResult::Missing);
+            }
             ProcessImageResult::Error(err) => {
                 log::warn!("Error processing image file {}: {err:?}", path.display());
                 return Ok(BinaryFileReadResult::Missing);

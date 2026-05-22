@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use image::{GenericImageView, ImageError};
+use image::{GenericImageView, ImageError, ImageFormat};
 use mime_guess::from_path;
 
 /// Max image size is 3.75 MB.
@@ -62,6 +62,40 @@ pub fn is_supported_image_mime_type(mime_type: &str) -> bool {
     SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type)
 }
 
+fn image_format_for_mime_type(mime_type: &str) -> Option<ImageFormat> {
+    match mime_type {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::WebP),
+        _ => None,
+    }
+}
+
+/// Normalizes an image for local provider passthrough.
+///
+/// This decodes and re-encodes supported image formats to strip metadata such as
+/// EXIF/GPS/device fields before bytes are sent to an AI provider. It also
+/// applies the same resize and size cap used for other agent image paths.
+pub fn normalize_image_for_agent(image_data: &[u8], mime_type: &str) -> ProcessImageResult {
+    let Some(format) = image_format_for_mime_type(mime_type) else {
+        return ProcessImageResult::UnsupportedMimeType;
+    };
+
+    let decoded = match image::load_from_memory(image_data) {
+        Ok(decoded) => decoded,
+        Err(err) => return ProcessImageResult::Error(err),
+    };
+
+    let mut normalized_bytes = Vec::new();
+    let mut writer = std::io::Cursor::new(&mut normalized_bytes);
+    if let Err(err) = decoded.write_to(&mut writer, format) {
+        return ProcessImageResult::Error(err);
+    }
+
+    process_image_for_agent(&normalized_bytes)
+}
+
 /// Resizes an image if it exceeds the maximum pixel count, and ensures
 /// resized outputs also respect the maximum dimension (width or height).
 ///
@@ -112,6 +146,8 @@ pub enum ProcessImageResult {
     },
     /// Image is too large even after resizing.
     TooLarge,
+    /// MIME type is not supported for provider image input.
+    UnsupportedMimeType,
     /// Error processing the image.
     Error(ImageError),
 }

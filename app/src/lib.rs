@@ -2778,6 +2778,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LocalAgentShellExecution,
         #[cfg(feature = "local_agent_mcp")]
         FeatureFlag::LocalAgentMcp,
+        #[cfg(feature = "local_agent_image_input")]
+        FeatureFlag::LocalAgentImageInput,
         #[cfg(feature = "interactive_conversation_management_view")]
         FeatureFlag::InteractiveConversationManagementView,
         #[cfg(feature = "agent_tips")]
