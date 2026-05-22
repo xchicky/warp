@@ -998,10 +998,14 @@ fn openai_messages_from_inputs_and_tasks(
     if let Some(context) = local_context_text(input) {
         user_query = format!("{context}\n\nUser message:\n{user_query}");
     }
-    if messages
-        .last()
-        .is_none_or(|message| message.role != "user" || message.content != user_query.as_str())
-    {
+    let should_push_user_message = if local_images.is_empty() {
+        messages
+            .last()
+            .is_none_or(|message| message.role != "user" || message.content != user_query.as_str())
+    } else {
+        true
+    };
+    if should_push_user_message {
         messages.push(openai_user_message(user_query, local_images));
     }
 
@@ -5917,6 +5921,50 @@ mod tests {
                 ("user", "what did I say?"),
             ]
         );
+    }
+
+    #[test]
+    fn openai_messages_do_not_dedupe_current_query_when_images_are_attached() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let tasks = vec![api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages: vec![api::Message {
+                id: "user-1".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: "describe image".to_string(),
+                    context: None,
+                    referenced_attachments: Default::default(),
+                    mode: None,
+                    intended_agent: 0,
+                })),
+            }],
+            summary: String::new(),
+            server_data: String::new(),
+        }];
+        let input = vec![user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
+        let user_messages = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 2);
+        assert!(!user_messages[0].content.contains_image_url());
+        assert!(user_messages[1].content.contains_image_url());
     }
 
     #[test]
