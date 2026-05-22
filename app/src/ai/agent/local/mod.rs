@@ -1357,6 +1357,11 @@ struct LocalToolExecutionResult {
     pending_tool_call: bool,
 }
 
+struct McpLocalToolExecutionResult {
+    text: String,
+    pending_tool_call: bool,
+}
+
 impl LocalToolExecutionResult {
     fn tool_error(error: impl fmt::Display) -> Self {
         Self {
@@ -1374,64 +1379,71 @@ fn execute_local_tool(
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
 ) -> LocalToolExecutionResult {
     let result = match tool_call.function.name.as_str() {
-        "read_file" => {
-            execute_read_file_tool(&tool_call.function.arguments, cwd).map(|text| (text, None))
+        "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd)
+            .map(|text| (text, None, false)),
+        "grep" => {
+            execute_grep_tool(&tool_call.function.arguments, cwd).map(|text| (text, None, false))
         }
-        "grep" => execute_grep_tool(&tool_call.function.arguments, cwd).map(|text| (text, None)),
-        "glob" => execute_glob_tool(&tool_call.function.arguments, cwd).map(|text| (text, None)),
-        "list_directory" => {
-            execute_list_directory_tool(&tool_call.function.arguments, cwd).map(|text| (text, None))
+        "glob" => {
+            execute_glob_tool(&tool_call.function.arguments, cwd).map(|text| (text, None, false))
         }
+        "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd)
+            .map(|text| (text, None, false)),
         "apply_file_diff" => execute_apply_file_diff_tool(&tool_call.function.arguments, cwd)
-            .map(|summary| (apply_file_diff_result_text(&summary), Some(summary))),
-        "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd),
-        "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd),
+            .map(|summary| (apply_file_diff_result_text(&summary), Some(summary), false)),
+        "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd)
+            .map(|result| (result.0, result.1, false)),
+        "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd)
+            .map(|result| (result.0, result.1, false)),
         "run_shell_command" => execute_run_shell_command_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None)),
+            .map(|text| (text, None, true)),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
                 &mut suggested_shell_commands,
             )
-            .map(|text| (text, None)),
+            .map(|text| (text, None, false)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
         name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
-            .map(|text| (text, None)),
+            .map(|result| (result.text, None, result.pending_tool_call)),
     };
 
-    let (text, apply_file_diff_summary) = match result {
-        Ok((text, apply_file_diff_summary)) => (text, apply_file_diff_summary),
-        Err(error) => (format!("Tool error: {error}"), None),
+    let (text, apply_file_diff_summary, pending_tool_call) = match result {
+        Ok((text, apply_file_diff_summary, pending_tool_call)) => {
+            (text, apply_file_diff_summary, pending_tool_call)
+        }
+        Err(error) => (format!("Tool error: {error}"), None, false),
     };
     LocalToolExecutionResult {
         text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
         apply_file_diff_summary,
-        pending_tool_call: (tool_call.function.name == "run_shell_command"
-            || is_mcp_tool_call(&tool_call.function.name, mcp_tool_catalog))
-            && !text.starts_with("Tool error:"),
+        pending_tool_call: if tool_call.function.name == "run_shell_command" {
+            !text.starts_with("Tool error:")
+        } else {
+            pending_tool_call
+        },
     }
-}
-
-fn is_mcp_tool_call(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCatalog>) -> bool {
-    mcp_tool_catalog.is_some_and(|catalog| catalog.find_openai_name(name).is_some())
 }
 
 fn execute_mcp_tool_request(
     openai_name: &str,
     arguments: &str,
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<McpLocalToolExecutionResult> {
     if !FeatureFlag::LocalAgentMcp.is_enabled() {
         return Err(anyhow!("MCP tools are disabled by feature flag"));
     }
     let Some(entry) = mcp_tool_catalog.and_then(|catalog| catalog.find_openai_name(openai_name))
     else {
         if openai_name.starts_with("mcp__") {
-            return Ok(mcp_unavailable_result_for_provider(
+            return Ok(McpLocalToolExecutionResult {
+                text: mcp_unavailable_result_for_provider(
                 openai_name,
                 "The MCP tool was not found in the current active catalog. The server or tool may have been disabled, renamed, or disconnected since it was advertised.",
-            ));
+                ),
+                pending_tool_call: false,
+            });
         }
         return Err(anyhow!("Unknown local tool: {openai_name}"));
     };
@@ -1441,14 +1453,17 @@ fn execute_mcp_tool_request(
         return Err(anyhow!("MCP tool arguments must be a JSON object"));
     }
     let formatted_args = truncate_message_content(arguments, 4 * 1024);
-    Ok(format!(
-        "MCP tool call requires user approval.\nServer: {}\nTool: {}\nLocal function: {}\nExternal MCP server id: {}\nArguments:\n{}",
-        entry.server_name,
-        entry.mcp_tool_name,
-        entry.openai_name,
-        entry.server_id,
-        formatted_args,
-    ))
+    Ok(McpLocalToolExecutionResult {
+        text: format!(
+            "MCP tool call requires user approval.\nServer: {}\nTool: {}\nLocal function: {}\nExternal MCP server id: {}\nArguments:\n{}",
+            entry.server_name,
+            entry.mcp_tool_name,
+            entry.openai_name,
+            entry.server_id,
+            formatted_args,
+        ),
+        pending_tool_call: true,
+    })
 }
 
 fn mcp_unavailable_result_for_provider(openai_name: &str, reason: &str) -> String {
