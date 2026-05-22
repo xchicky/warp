@@ -1425,7 +1425,12 @@ impl View for RequestedCommandView {
                 let result_text = match result {
                     CallMCPToolResult::Success { result } => serde_json::to_string_pretty(result)
                         .unwrap_or_else(|_| "Error formatting JSON".to_string()),
-                    CallMCPToolResult::Error(error) => {
+                    CallMCPToolResult::Error(error)
+                    | CallMCPToolResult::Unavailable(error)
+                    | CallMCPToolResult::Timeout(error)
+                    | CallMCPToolResult::UnsupportedContent(error)
+                    | CallMCPToolResult::ServerError(error)
+                    | CallMCPToolResult::TransportError(error) => {
                         format!("Error: {error}")
                     }
                     CallMCPToolResult::Cancelled => "Tool call was cancelled".to_string(),

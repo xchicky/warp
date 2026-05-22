@@ -251,7 +251,12 @@ pub mod text {
                             }
                             Ok(())
                         }
-                        CallMCPToolResult::Error(error) => {
+                        CallMCPToolResult::Error(error)
+                        | CallMCPToolResult::Unavailable(error)
+                        | CallMCPToolResult::Timeout(error)
+                        | CallMCPToolResult::UnsupportedContent(error)
+                        | CallMCPToolResult::ServerError(error)
+                        | CallMCPToolResult::TransportError(error) => {
                             writeln!(w, "Calling MCP tool failed: {error}")
                         }
                         CallMCPToolResult::Cancelled => writeln!(w, "{CANCELLED_MESSAGE}"),
@@ -992,7 +997,12 @@ pub mod json {
                     CallMCPToolResult::Success { result } => Some(JsonMessage::ToolResult(
                         JsonToolResult::CallMcpTool(JsonCallMcpToolResult { result }),
                     )),
-                    CallMCPToolResult::Error(error) => Some(JsonMessage::ToolError {
+                    CallMCPToolResult::Error(error)
+                    | CallMCPToolResult::Unavailable(error)
+                    | CallMCPToolResult::Timeout(error)
+                    | CallMCPToolResult::UnsupportedContent(error)
+                    | CallMCPToolResult::ServerError(error)
+                    | CallMCPToolResult::TransportError(error) => Some(JsonMessage::ToolError {
                         error: Cow::Borrowed(error.as_str()),
                     }),
                     CallMCPToolResult::Cancelled => Some(JsonMessage::ToolCanceled),
