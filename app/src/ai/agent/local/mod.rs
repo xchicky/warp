@@ -1,5 +1,6 @@
 mod apply_file_diff;
 mod mcp_tools;
+mod pricing;
 mod tool_card;
 
 use std::{
@@ -29,6 +30,9 @@ use self::{
         apply_file_diff_result_text, apply_unified_diff, atomic_write_text,
         resolve_writable_file_target, AppliedFileDiff, ApplyFileDiffSummary,
     },
+    pricing::{
+        estimate_local_request_cost_cents, LocalAgentCostTelemetryConfig, LocalAgentUsageCounts,
+    },
     tool_card::{
         structured_mcp_tool_call_event, structured_tool_call_event, structured_tool_card_events,
     },
@@ -43,6 +47,7 @@ use crate::{
         AIAgentInput, CallMCPToolResult, ImageContext, MCPContext, RequestCommandOutputResult,
     },
     features::FeatureFlag,
+    persistence::model::PRIMARY_AGENT_CATEGORY,
     server::server_api::AIApiError,
     util::image::{
         is_supported_image_mime_type, normalize_image_for_agent, ProcessImageResult,
@@ -50,12 +55,13 @@ use crate::{
     },
 };
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct LocalDirectConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
     pub vision_supported: bool,
+    pub cost_telemetry: LocalAgentCostTelemetryConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +170,10 @@ impl fmt::Debug for LocalDirectConfig {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("vision_supported", &self.vision_supported)
+            .field(
+                "cost_telemetry_overrides",
+                &self.cost_telemetry.pricing_overrides.len(),
+            )
             .finish()
     }
 }
@@ -173,6 +183,8 @@ struct OpenAIChatRequest {
     model: String,
     messages: Vec<OpenAIChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAIChatStreamOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAIChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +195,11 @@ struct OpenAIChatRequest {
 enum RequestMode {
     ToolUse,
     Finalize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -356,7 +373,20 @@ struct OpenAIChatToolFunction {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamResponse {
+    #[serde(default)]
     choices: Vec<OpenAIStreamChoice>,
+    #[serde(default, deserialize_with = "deserialize_optional_openai_stream_usage")]
+    usage: Option<OpenAIStreamUsage>,
+}
+
+fn deserialize_optional_openai_stream_usage<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenAIStreamUsage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +400,26 @@ struct OpenAIStreamDelta {
     reasoning_content: Option<String>,
     reasoning: Option<String>,
     tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct OpenAIUsageTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+    #[serde(default, alias = "cache_creation_tokens")]
+    cache_creation_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct OpenAIStreamUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAIUsageTokenDetails>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -391,6 +441,7 @@ enum OpenAIStreamEvent {
     Delta(String),
     ReasoningDelta(String),
     ToolCallDelta(OpenAIStreamToolCallDelta),
+    Usage(OpenAIStreamUsage),
     Done,
 }
 
@@ -411,6 +462,80 @@ const MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS: usize = 32 * 1024;
 const MAX_LOCAL_DIRECT_MCP_RESULT_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_DIRECT_MCP_RESULT_CHARS: usize = 32 * 1024;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. When run_shell_command is advertised, use it for shell commands that should run after visible user approval. Otherwise, if you need the user to run a shell command, use suggest_shell_command; suggested commands are not executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
+
+#[derive(Clone, Debug)]
+struct LocalUsageTelemetry {
+    enabled: bool,
+    unavailable: bool,
+    counts: LocalAgentUsageCounts,
+}
+
+impl LocalUsageTelemetry {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            unavailable: false,
+            counts: LocalAgentUsageCounts::default(),
+        }
+    }
+
+    fn mark_unavailable(&mut self) {
+        if self.enabled {
+            self.unavailable = true;
+        }
+    }
+
+    fn add_usage(&mut self, usage: OpenAIStreamUsage) {
+        if !self.enabled || self.unavailable {
+            return;
+        }
+        self.counts.prompt_tokens = self
+            .counts
+            .prompt_tokens
+            .saturating_add(usage.prompt_tokens.unwrap_or_default());
+        self.counts.completion_tokens = self
+            .counts
+            .completion_tokens
+            .saturating_add(usage.completion_tokens.unwrap_or_default());
+        self.counts.total_tokens =
+            self.counts
+                .total_tokens
+                .saturating_add(usage.total_tokens.unwrap_or_else(|| {
+                    usage
+                        .prompt_tokens
+                        .unwrap_or_default()
+                        .saturating_add(usage.completion_tokens.unwrap_or_default())
+                }));
+        if let Some(details) = usage.prompt_tokens_details {
+            self.counts.prompt_cache_read_tokens = self
+                .counts
+                .prompt_cache_read_tokens
+                .saturating_add(details.cached_tokens.unwrap_or_default());
+            self.counts.prompt_cache_write_tokens = self
+                .counts
+                .prompt_cache_write_tokens
+                .saturating_add(details.cache_creation_tokens.unwrap_or_default());
+        }
+    }
+
+    fn summary(&self, config: &LocalDirectConfig) -> Option<LocalUsageSummary> {
+        if !self.enabled || self.unavailable || self.counts.total_tokens == 0 {
+            return None;
+        }
+        let estimated_cost_cents =
+            estimate_local_request_cost_cents(&config.model, self.counts, &config.cost_telemetry);
+        Some(LocalUsageSummary {
+            counts: self.counts,
+            estimated_cost_cents,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalUsageSummary {
+    counts: LocalAgentUsageCounts,
+    estimated_cost_cents: Option<f64>,
+}
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
@@ -444,8 +569,10 @@ pub fn generate_openai_compatible_output(
         }
         let has_user_query = input.iter().any(|input| input.user_query().is_some());
         let has_shell_action_result = input.iter().any(local_shell_action_result);
+        let mut usage_telemetry =
+            LocalUsageTelemetry::new(FeatureFlag::LocalAgentCostTelemetry.is_enabled());
         if !has_user_query && !has_shell_action_result {
-            yield Ok(stream_finished_done());
+            yield Ok(stream_finished_done(&config, &usage_telemetry));
             return;
         }
 
@@ -512,7 +639,12 @@ pub fn generate_openai_compatible_output(
                 }
             };
 
-            let mut body = response.bytes_stream();
+            let request_usage_available = response.usage_available;
+            if !request_usage_available {
+                usage_telemetry.mark_unavailable();
+            }
+            let mut request_usage_seen = false;
+            let mut body = response.response.bytes_stream();
             let mut pending = String::new();
             let mut bytes_read = 0u64;
             let mut stream_done = false;
@@ -555,6 +687,12 @@ pub fn generate_openai_compatible_output(
                         }
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
+                        }
+                        OpenAIStreamEvent::Usage(usage) => {
+                            if request_usage_available {
+                                request_usage_seen = true;
+                                usage_telemetry.add_usage(usage);
+                            }
                         }
                         OpenAIStreamEvent::Done => {
                             stream_done = true;
@@ -606,9 +744,18 @@ pub fn generate_openai_compatible_output(
                         OpenAIStreamEvent::ToolCallDelta(delta) => {
                             tool_call_accumulator.push(delta);
                         }
+                        OpenAIStreamEvent::Usage(usage) => {
+                            if request_usage_available {
+                                request_usage_seen = true;
+                                usage_telemetry.add_usage(usage);
+                            }
+                        }
                         OpenAIStreamEvent::Done => break,
                     }
                 }
+            }
+            if request_usage_available && !request_usage_seen {
+                usage_telemetry.mark_unavailable();
             }
 
             let tool_calls = tool_call_accumulator.into_tool_calls();
@@ -623,7 +770,7 @@ pub fn generate_openai_compatible_output(
                 }
                 match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
                     EmptyLocalProviderResponseResolution::Finish => {
-                        yield Ok(stream_finished_done());
+                        yield Ok(stream_finished_done(&config, &usage_telemetry));
                         return;
                     }
                     EmptyLocalProviderResponseResolution::Fallback(fallback) => {
@@ -631,7 +778,7 @@ pub fn generate_openai_compatible_output(
                             "Local direct provider returned empty final answer after tool results; emitting fallback summary"
                         );
                         yield_agent_output_content!(fallback);
-                        yield Ok(stream_finished_done());
+                        yield Ok(stream_finished_done(&config, &usage_telemetry));
                         return;
                     }
                     EmptyLocalProviderResponseResolution::Error => {
@@ -693,7 +840,7 @@ pub fn generate_openai_compatible_output(
             }
 
             if waiting_for_out_of_band_action {
-                yield Ok(stream_finished_done());
+                yield Ok(stream_finished_done(&config, &usage_telemetry));
                 return;
             }
 
@@ -717,7 +864,12 @@ pub fn generate_openai_compatible_output(
             }
         };
 
-        let mut body = response.bytes_stream();
+        let request_usage_available = response.usage_available;
+        if !request_usage_available {
+            usage_telemetry.mark_unavailable();
+        }
+        let mut request_usage_seen = false;
+        let mut body = response.response.bytes_stream();
         let mut pending = String::new();
         let mut bytes_read = 0u64;
         let mut stream_done = false;
@@ -759,6 +911,12 @@ pub fn generate_openai_compatible_output(
                         }
                     }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
+                    OpenAIStreamEvent::Usage(usage) => {
+                        if request_usage_available {
+                            request_usage_seen = true;
+                            usage_telemetry.add_usage(usage);
+                        }
+                    }
                     OpenAIStreamEvent::Done => {
                         stream_done = true;
                         break;
@@ -807,9 +965,18 @@ pub fn generate_openai_compatible_output(
                         }
                     }
                     OpenAIStreamEvent::ToolCallDelta(_) => {}
+                    OpenAIStreamEvent::Usage(usage) => {
+                        if request_usage_available {
+                            request_usage_seen = true;
+                            usage_telemetry.add_usage(usage);
+                        }
+                    }
                     OpenAIStreamEvent::Done => break,
                 }
             }
+        }
+        if request_usage_available && !request_usage_seen {
+            usage_telemetry.mark_unavailable();
         }
 
         if let (Some(reasoning_id), Some(started_at)) = (&reasoning_message_id, reasoning_started_at) {
@@ -822,7 +989,7 @@ pub fn generate_openai_compatible_output(
         }
 
         if finalize_received_token {
-            yield Ok(stream_finished_done());
+            yield Ok(stream_finished_done(&config, &usage_telemetry));
             return;
         }
 
@@ -836,7 +1003,7 @@ pub fn generate_openai_compatible_output(
                 );
             }
         }
-        yield Ok(stream_finished_done());
+        yield Ok(stream_finished_done(&config, &usage_telemetry));
     })
 }
 
@@ -853,11 +1020,47 @@ async fn request_openai_compatible_completion(
     messages: Vec<OpenAIChatMessage>,
     mode: RequestMode,
     mcp_context: Option<&LocalMcpContext>,
-) -> anyhow::Result<reqwest::Response> {
-    let request = OpenAIChatRequest {
+) -> anyhow::Result<LocalProviderResponse> {
+    let include_usage = FeatureFlag::LocalAgentCostTelemetry.is_enabled();
+    let request = openai_chat_request(config, messages.clone(), mode, mcp_context, include_usage);
+    match send_openai_compatible_request(config, request).await {
+        Ok(response) => Ok(LocalProviderResponse {
+            response,
+            usage_available: include_usage,
+        }),
+        Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
+            let request = openai_chat_request(config, messages, mode, mcp_context, false);
+            let response = send_openai_compatible_request(config, request)
+                .await
+                .map_err(LocalProviderRequestError::into_anyhow)?;
+            Ok(LocalProviderResponse {
+                response,
+                usage_available: false,
+            })
+        }
+        Err(error) => Err(error.into_anyhow()),
+    }
+}
+
+struct LocalProviderResponse {
+    response: reqwest::Response,
+    usage_available: bool,
+}
+
+fn openai_chat_request(
+    config: &LocalDirectConfig,
+    messages: Vec<OpenAIChatMessage>,
+    mode: RequestMode,
+    mcp_context: Option<&LocalMcpContext>,
+    include_usage: bool,
+) -> OpenAIChatRequest {
+    OpenAIChatRequest {
         model: config.model.clone(),
         messages,
         stream: true,
+        stream_options: include_usage.then_some(OpenAIChatStreamOptions {
+            include_usage: true,
+        }),
         tools: match mode {
             RequestMode::ToolUse => local_tools_for_context(mcp_context),
             RequestMode::Finalize => Vec::new(),
@@ -866,34 +1069,83 @@ async fn request_openai_compatible_completion(
             RequestMode::ToolUse => None,
             RequestMode::Finalize => Some("none"),
         },
-    };
+    }
+}
+
+async fn send_openai_compatible_request(
+    config: &LocalDirectConfig,
+    request: OpenAIChatRequest,
+) -> Result<reqwest::Response, LocalProviderRequestError> {
     let request_contains_images = request_contains_images(&request);
+    let request_contains_stream_options = request.stream_options.is_some();
 
     let endpoint = chat_completions_url(&config.base_url);
     let response = reqwest::Client::builder()
         .timeout(LOCAL_DIRECT_REQUEST_TIMEOUT)
         .build()
-        .map_err(|_| anyhow!("Failed to initialize local direct provider client"))?
+        .map_err(|_| {
+            LocalProviderRequestError::Other(anyhow!(
+                "Failed to initialize local direct provider client"
+            ))
+        })?
         .post(endpoint)
         .bearer_auth(&config.api_key)
         .json(&request)
         .send()
         .await
-        .map_err(|_| anyhow!("Failed to send request to local direct provider"))?;
+        .map_err(|_| {
+            LocalProviderRequestError::Other(anyhow!(
+                "Failed to send request to local direct provider"
+            ))
+        })?;
 
     let status = response.status();
     if !status.is_success() {
-        if request_contains_images {
-            return Err(anyhow!(
-                "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
-            ));
+        let body = response.text().await.unwrap_or_default();
+        if request_contains_stream_options && unsupported_stream_options_response(status, &body) {
+            return Err(LocalProviderRequestError::UnsupportedStreamOptions);
         }
-        return Err(anyhow!(
+        if request_contains_images {
+            return Err(LocalProviderRequestError::Other(anyhow!(
+                "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
+            )));
+        }
+        return Err(LocalProviderRequestError::Other(anyhow!(
             "Local direct provider request failed with status {status}"
-        ));
+        )));
     }
 
     Ok(response)
+}
+
+enum LocalProviderRequestError {
+    UnsupportedStreamOptions,
+    Other(anyhow::Error),
+}
+
+impl LocalProviderRequestError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::UnsupportedStreamOptions => {
+                anyhow!("Local provider rejected stream usage options before streaming began")
+            }
+            Self::Other(error) => error,
+        }
+    }
+}
+
+fn unsupported_stream_options_response(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST
+        && status != reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    (body.contains("stream_options") || body.contains("include_usage"))
+        && (body.contains("unsupported")
+            || body.contains("unknown")
+            || body.contains("unrecognized")
+            || body.contains("invalid"))
 }
 
 fn request_contains_images(request: &OpenAIChatRequest) -> bool {
@@ -3363,9 +3615,15 @@ fn drain_sse_events(pending: &mut String) -> anyhow::Result<Vec<OpenAIStreamEven
             continue;
         }
         let Ok(event) = serde_json::from_str::<OpenAIStreamResponse>(data) else {
-            log::debug!("Ignoring non-OpenAI local provider stream payload: {data}");
+            log::debug!(
+                "Ignoring non-OpenAI local provider stream payload ({} bytes)",
+                data.len()
+            );
             continue;
         };
+        if let Some(usage) = event.usage {
+            events.push(OpenAIStreamEvent::Usage(usage));
+        }
         for choice in event.choices {
             if let Some(reasoning) = choice
                 .delta
@@ -3642,26 +3900,69 @@ fn finish_agent_reasoning_message(
     }
 }
 
-fn stream_finished_done() -> api::ResponseEvent {
+fn stream_finished_done(
+    config: &LocalDirectConfig,
+    usage_telemetry: &LocalUsageTelemetry,
+) -> api::ResponseEvent {
+    let usage_summary = usage_telemetry.summary(config);
+    let (token_usage, request_cost, credits_spent, byok_token_usage) = match usage_summary.as_ref()
+    {
+        Some(summary) => {
+            let cost_in_cents = summary.estimated_cost_cents.unwrap_or_default() as f32;
+            let mut usage_by_category = HashMap::new();
+            usage_by_category.insert(
+                PRIMARY_AGENT_CATEGORY.to_string(),
+                summary.counts.total_tokens,
+            );
+            #[allow(deprecated)]
+            let model_usage = api::response_event::stream_finished::ModelTokenUsage {
+                model_id: config.model.clone(),
+                total_tokens: summary.counts.total_tokens,
+                token_usage_by_category: usage_by_category,
+            };
+            let mut byok_token_usage = HashMap::new();
+            byok_token_usage.insert(config.model.clone(), model_usage);
+            (
+                vec![api::response_event::stream_finished::TokenUsage {
+                    model_id: config.model.clone(),
+                    total_input: summary.counts.prompt_tokens,
+                    output: summary.counts.completion_tokens,
+                    input_cache_read: summary.counts.prompt_cache_read_tokens,
+                    input_cache_write: summary.counts.prompt_cache_write_tokens,
+                    cost_in_cents,
+                }],
+                summary.estimated_cost_cents.map(|cost| {
+                    api::response_event::stream_finished::RequestCost {
+                        exact: cost as f32,
+                        platform_credits: 0.,
+                    }
+                }),
+                cost_in_cents,
+                byok_token_usage,
+            )
+        }
+        None => (Vec::new(), None, 0., HashMap::new()),
+    };
+
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::Finished(
             api::response_event::StreamFinished {
                 reason: Some(api::response_event::stream_finished::Reason::Done(
                     api::response_event::stream_finished::Done {},
                 )),
-                token_usage: vec![],
+                token_usage,
                 should_refresh_model_config: false,
-                request_cost: None,
+                request_cost,
                 conversation_usage_metadata: Some(
                     api::response_event::stream_finished::ConversationUsageMetadata {
                         context_window_usage: 0.,
                         summarized: false,
-                        credits_spent: 0.,
+                        credits_spent,
                         #[allow(deprecated)]
                         token_usage: vec![],
                         tool_usage_metadata: None,
                         warp_token_usage: Default::default(),
-                        byok_token_usage: Default::default(),
+                        byok_token_usage,
                     },
                 ),
             },
@@ -3681,12 +3982,14 @@ mod tests {
         is_mutating_local_tool, local_mcp_tool_catalog, local_read_only_tools,
         local_shell_action_result, local_tool_result_summary, local_tools, local_tools_for_context,
         mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
-        mcp_unavailable_result_for_provider, openai_message, openai_messages_from_inputs_and_tasks,
-        root_task_id, shell_command_result_for_provider, structured_mcp_tool_call_event,
-        structured_tool_call_event, truncate_mcp_output_for_provider,
-        truncate_shell_output_for_provider, EmptyLocalProviderResponseResolution,
-        LocalDirectConfig, LocalMcpContext, OpenAIChatRequest, OpenAIChatToolCall,
-        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIToolCallAccumulator, RequestMode,
+        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
+        openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
+        stream_finished_done, structured_mcp_tool_call_event, structured_tool_call_event,
+        truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
+        unsupported_stream_options_response, EmptyLocalProviderResponseResolution,
+        LocalDirectConfig, LocalMcpContext, LocalUsageTelemetry, OpenAIChatRequest,
+        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
+        OpenAIToolCallAccumulator, OpenAIUsageTokenDetails, RequestMode,
         LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
         MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
         MAX_LOCAL_DIRECT_MCP_RESULT_BYTES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
@@ -3702,6 +4005,7 @@ mod tests {
         MCPContext, MCPServer, RequestCommandOutputResult,
     };
     use crate::features::FeatureFlag;
+    use crate::persistence::model::PRIMARY_AGENT_CATEGORY;
     use ai::agent::action_result::{AnyFileContent, FileContext};
     use base64::{engine::general_purpose, Engine as _};
     use chrono::{Local, TimeZone};
@@ -3775,6 +4079,7 @@ mod tests {
             base_url: "http://127.0.0.1:1/v1".to_string(),
             model: "test-model".to_string(),
             vision_supported: true,
+            cost_telemetry: Default::default(),
         }
     }
 
@@ -4085,6 +4390,47 @@ mod tests {
         let events = drain_sse_events(&mut pending).unwrap();
 
         assert!(events.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_sse_events_extracts_usage_from_final_chunk() {
+        let mut pending = concat!(
+            "data: {\"choices\":[],\"usage\":{",
+            "\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2}",
+            "}}\n",
+            "data: [DONE]\n"
+        )
+        .to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                OpenAIStreamEvent::Usage(OpenAIStreamUsage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    total_tokens: Some(15),
+                    prompt_tokens_details: Some(OpenAIUsageTokenDetails {
+                        cached_tokens: Some(3),
+                        cache_creation_tokens: Some(2),
+                    }),
+                }),
+                OpenAIStreamEvent::Done,
+            ]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_sse_events_ignores_malformed_usage_without_dropping_content() {
+        let mut pending = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"prompt_tokens\":\"bad\"}}\n".to_string();
+
+        let events = drain_sse_events(&mut pending).unwrap();
+
+        assert_eq!(events, vec![OpenAIStreamEvent::Delta("hello".to_string())]);
         assert!(pending.is_empty());
     }
 
@@ -4414,6 +4760,7 @@ mod tests {
             model: "local-model".to_string(),
             messages: vec![openai_message("user", "hello")],
             stream: true,
+            stream_options: None,
             tools: match RequestMode::Finalize {
                 RequestMode::ToolUse => local_read_only_tools(),
                 RequestMode::Finalize => Vec::new(),
@@ -4436,6 +4783,7 @@ mod tests {
             model: "local-model".to_string(),
             messages: vec![openai_message("user", "hello")],
             stream: true,
+            stream_options: None,
             tools: match RequestMode::ToolUse {
                 RequestMode::ToolUse => local_read_only_tools(),
                 RequestMode::Finalize => Vec::new(),
@@ -4450,6 +4798,111 @@ mod tests {
 
         assert!(!value["tools"].as_array().unwrap().is_empty());
         assert!(!value.as_object().unwrap().contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn openai_chat_request_usage_stream_options_are_opt_in() {
+        let config = local_direct_config();
+        let request = openai_chat_request(
+            &config,
+            vec![openai_message("user", "hello")],
+            RequestMode::Finalize,
+            None,
+            true,
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["stream_options"]["include_usage"], true);
+
+        let request = openai_chat_request(
+            &config,
+            vec![openai_message("user", "hello")],
+            RequestMode::Finalize,
+            None,
+            false,
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("stream_options"));
+    }
+
+    #[test]
+    fn unsupported_stream_options_response_detects_pre_stream_retriable_errors() {
+        assert!(unsupported_stream_options_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unknown parameter: stream_options"
+        ));
+        assert!(unsupported_stream_options_response(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "include_usage is unsupported"
+        ));
+        assert!(!unsupported_stream_options_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown parameter: stream_options"
+        ));
+    }
+
+    #[test]
+    fn stream_finished_done_maps_provider_usage_to_byok_metadata() {
+        let mut config = local_direct_config();
+        config.model = "gpt-4o".to_string();
+        let mut usage = LocalUsageTelemetry::new(true);
+        usage.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            prompt_tokens_details: Some(OpenAIUsageTokenDetails {
+                cached_tokens: Some(3),
+                cache_creation_tokens: Some(2),
+            }),
+        });
+
+        let event = stream_finished_done(&config, &usage);
+        let finished = match event.r#type.unwrap() {
+            api::response_event::Type::Finished(finished) => finished,
+            _ => panic!("expected finished event"),
+        };
+
+        assert_eq!(finished.token_usage.len(), 1);
+        assert_eq!(finished.token_usage[0].model_id, "gpt-4o");
+        assert_eq!(finished.token_usage[0].total_input, 10);
+        assert_eq!(finished.token_usage[0].output, 5);
+        assert_eq!(finished.token_usage[0].input_cache_read, 3);
+        assert_eq!(finished.token_usage[0].input_cache_write, 2);
+        assert!(finished.request_cost.unwrap().exact > 0.0);
+
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        assert!(metadata.credits_spent > 0.0);
+        assert!(metadata.warp_token_usage.is_empty());
+        let byok_usage = metadata.byok_token_usage.get("gpt-4o").unwrap();
+        assert_eq!(byok_usage.total_tokens, 15);
+        assert_eq!(
+            byok_usage.token_usage_by_category[PRIMARY_AGENT_CATEGORY],
+            15
+        );
+    }
+
+    #[test]
+    fn stream_finished_done_omits_usage_when_provider_usage_unavailable() {
+        let config = local_direct_config();
+        let mut usage = LocalUsageTelemetry::new(true);
+        usage.mark_unavailable();
+        usage.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            prompt_tokens_details: None,
+        });
+
+        let event = stream_finished_done(&config, &usage);
+        let finished = match event.r#type.unwrap() {
+            api::response_event::Type::Finished(finished) => finished,
+            _ => panic!("expected finished event"),
+        };
+
+        assert!(finished.token_usage.is_empty());
+        assert!(finished.request_cost.is_none());
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        assert_eq!(metadata.credits_spent, 0.0);
+        assert!(metadata.byok_token_usage.is_empty());
     }
 
     #[test]

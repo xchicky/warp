@@ -6,7 +6,9 @@ use crate::ai::blocklist::{RequestInput, ResponseStreamId, SerializedBlockListIt
 use crate::ai::skills::SkillDescriptor;
 use crate::code_review::CodeReviewTelemetryEvent;
 use crate::notebooks::NotebookId;
-use crate::persistence::model::{ConversationUsageMetadata, ModelTokenUsage, ToolUsageMetadata};
+use crate::persistence::model::{
+    ConversationUsageMetadata, ModelTokenUsage, ToolUsageMetadata, PRIMARY_AGENT_CATEGORY,
+};
 use crate::server::ids::ServerId;
 use crate::terminal::general_settings::GeneralSettings;
 use crate::terminal::model::block::{
@@ -1619,6 +1621,7 @@ impl AIConversation {
         usage_metadata: Option<stream_finished::ConversationUsageMetadata>,
         was_user_initiated_request: bool,
     ) -> Result<(), UpdateConversationError> {
+        let has_request_cost = request_cost.is_some();
         for usage in token_usage.into_iter() {
             let entry = self
                 .total_token_usage_by_model
@@ -1657,9 +1660,15 @@ impl AIConversation {
         }
 
         if let Some(usage_metadata) = usage_metadata {
+            let use_accumulated_byok_usage =
+                has_request_cost && is_byok_primary_agent_usage_delta(&usage_metadata);
             self.conversation_usage_metadata.context_window_usage =
                 usage_metadata.context_window_usage;
-            self.conversation_usage_metadata.credits_spent = usage_metadata.credits_spent;
+            self.conversation_usage_metadata.credits_spent = if use_accumulated_byok_usage {
+                self.total_request_cost.value() as f32
+            } else {
+                usage_metadata.credits_spent
+            };
 
             let mut token_usage: HashMap<_, ModelTokenUsage> = HashMap::new();
             for (model_id, usage) in usage_metadata.warp_token_usage {
@@ -1681,6 +1690,28 @@ impl AIConversation {
                         .entry(category)
                         .or_default() += tokens;
                 }
+            }
+
+            if use_accumulated_byok_usage {
+                token_usage = self
+                    .total_token_usage_by_model
+                    .iter()
+                    .map(|(model_id, usage)| {
+                        let total_tokens = usage.total_input.saturating_add(usage.output);
+                        let mut usage_by_category = HashMap::new();
+                        usage_by_category.insert(PRIMARY_AGENT_CATEGORY.to_string(), total_tokens);
+                        (
+                            model_id.clone(),
+                            ModelTokenUsage {
+                                model_id: model_id.clone(),
+                                warp_tokens: 0,
+                                byok_tokens: total_tokens,
+                                warp_token_usage_by_category: HashMap::new(),
+                                byok_token_usage_by_category: usage_by_category,
+                            },
+                        )
+                    })
+                    .collect();
             }
 
             self.conversation_usage_metadata.token_usage = token_usage
@@ -3463,6 +3494,20 @@ impl AIConversation {
 
         Ok(exchanges_to_remove)
     }
+}
+
+fn is_byok_primary_agent_usage_delta(
+    usage_metadata: &stream_finished::ConversationUsageMetadata,
+) -> bool {
+    !usage_metadata.byok_token_usage.is_empty()
+        && usage_metadata.warp_token_usage.is_empty()
+        && usage_metadata.byok_token_usage.values().all(|usage| {
+            usage.token_usage_by_category.len() == 1
+                && usage
+                    .token_usage_by_category
+                    .get(PRIMARY_AGENT_CATEGORY)
+                    .is_some_and(|tokens| *tokens == usage.total_tokens)
+        })
 }
 
 fn parse_orchestration_harness_type(value: &str) -> Harness {
