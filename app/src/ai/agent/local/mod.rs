@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::anyhow;
 use async_stream::stream;
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
 use futures_lite::Stream;
 use futures_util::{future::join_all, StreamExt as _};
@@ -39,10 +40,14 @@ use crate::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, CallMCPToolResult, MCPContext, RequestCommandOutputResult,
+        AIAgentInput, CallMCPToolResult, ImageContext, MCPContext, RequestCommandOutputResult,
     },
     features::FeatureFlag,
     server::server_api::AIApiError,
+    util::image::{
+        is_supported_image_mime_type, normalize_image_for_agent, ProcessImageResult,
+        MAX_IMAGE_COUNT_FOR_QUERY, MAX_IMAGE_SIZE_BYTES,
+    },
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -50,6 +55,7 @@ pub struct LocalDirectConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub vision_supported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,6 +163,7 @@ impl fmt::Debug for LocalDirectConfig {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("vision_supported", &self.vision_supported)
             .finish()
     }
 }
@@ -181,11 +188,144 @@ enum RequestMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct OpenAIChatMessage {
     role: &'static str,
-    content: String,
+    content: OpenAIChatContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIChatToolCall>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum OpenAIChatContent {
+    Text(String),
+    Parts(Vec<OpenAIChatContentPart>),
+}
+
+impl OpenAIChatContent {
+    fn text(content: impl Into<String>) -> Self {
+        Self::Text(content.into())
+    }
+
+    fn text_char_count(&self) -> usize {
+        match self {
+            Self::Text(text) => text.chars().count(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    OpenAIChatContentPart::Text { text, .. } => Some(text.chars().count()),
+                    OpenAIChatContentPart::ImageUrl { .. } => None,
+                })
+                .sum(),
+        }
+    }
+
+    fn truncate_text(&self, max_chars: usize) -> Self {
+        match self {
+            Self::Text(text) => Self::Text(truncate_message_content(text, max_chars)),
+            Self::Parts(parts) => {
+                let mut remaining = max_chars;
+                let parts = parts
+                    .iter()
+                    .map(|part| match part {
+                        OpenAIChatContentPart::Text { r#type, text } => {
+                            let text = if remaining == 0 {
+                                String::new()
+                            } else {
+                                let truncated = truncate_message_content(text, remaining);
+                                remaining = remaining.saturating_sub(truncated.chars().count());
+                                truncated
+                            };
+                            OpenAIChatContentPart::Text { r#type, text }
+                        }
+                        OpenAIChatContentPart::ImageUrl { r#type, image_url } => {
+                            OpenAIChatContentPart::ImageUrl {
+                                r#type,
+                                image_url: image_url.clone(),
+                            }
+                        }
+                    })
+                    .collect();
+                Self::Parts(parts)
+            }
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Parts(parts) => parts
+                .iter()
+                .find_map(|part| match part {
+                    OpenAIChatContentPart::Text { text, .. } => Some(text.as_str()),
+                    OpenAIChatContentPart::ImageUrl { .. } => None,
+                })
+                .unwrap_or(""),
+        }
+    }
+
+    fn contains_image_url(&self) -> bool {
+        matches!(self, Self::Parts(parts) if parts.iter().any(|part| matches!(part, OpenAIChatContentPart::ImageUrl { .. })))
+    }
+}
+
+impl fmt::Debug for OpenAIChatContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.debug_tuple("Text").field(text).finish(),
+            Self::Parts(parts) => f
+                .debug_struct("Parts")
+                .field("text_chars", &self.text_char_count())
+                .field(
+                    "image_count",
+                    &parts
+                        .iter()
+                        .filter(|part| matches!(part, OpenAIChatContentPart::ImageUrl { .. }))
+                        .count(),
+                )
+                .finish(),
+        }
+    }
+}
+
+impl std::ops::Deref for OpenAIChatContent {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for OpenAIChatContent {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum OpenAIChatContentPart {
+    Text {
+        r#type: &'static str,
+        text: String,
+    },
+    ImageUrl {
+        r#type: &'static str,
+        image_url: OpenAIChatImageUrl,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+struct OpenAIChatImageUrl {
+    url: String,
+}
+
+impl fmt::Debug for OpenAIChatImageUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAIChatImageUrl")
+            .field("url", &"REDACTED_IMAGE_DATA_URL_UGC")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -338,6 +478,7 @@ pub fn generate_openai_compatible_output(
             &input,
             &tasks,
             mcp_context.as_ref(),
+            config.vision_supported,
         ) {
             Ok(messages) => messages,
             Err(error) => {
@@ -726,6 +867,7 @@ async fn request_openai_compatible_completion(
             RequestMode::Finalize => Some("none"),
         },
     };
+    let request_contains_images = request_contains_images(&request);
 
     let endpoint = chat_completions_url(&config.base_url);
     let response = reqwest::Client::builder()
@@ -741,12 +883,24 @@ async fn request_openai_compatible_completion(
 
     let status = response.status();
     if !status.is_success() {
+        if request_contains_images {
+            return Err(anyhow!(
+                "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
+            ));
+        }
         return Err(anyhow!(
             "Local direct provider request failed with status {status}"
         ));
     }
 
     Ok(response)
+}
+
+fn request_contains_images(request: &OpenAIChatRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| message.content.contains_image_url())
 }
 
 fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
@@ -796,6 +950,7 @@ fn openai_messages_from_inputs_and_tasks(
     input: &[AIAgentInput],
     tasks: &[api::Task],
     mcp_context: Option<&LocalMcpContext>,
+    vision_supported: bool,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
     let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context);
@@ -838,15 +993,20 @@ fn openai_messages_from_inputs_and_tasks(
             "Local direct agent only supports user query inputs"
         ));
     }
+    let local_images = local_images_from_user_query_inputs(input, vision_supported)?;
     let mut user_query = truncate_message_content(&user_query, MAX_LOCAL_DIRECT_MESSAGE_CHARS);
     if let Some(context) = local_context_text(input) {
         user_query = format!("{context}\n\nUser message:\n{user_query}");
     }
-    if messages
-        .last()
-        .is_none_or(|message| message.role != "user" || message.content != user_query)
-    {
-        messages.push(openai_message("user", user_query));
+    let should_push_user_message = if local_images.is_empty() {
+        messages
+            .last()
+            .is_none_or(|message| message.role != "user" || message.content != user_query.as_str())
+    } else {
+        true
+    };
+    if should_push_user_message {
+        messages.push(openai_user_message(user_query, local_images));
     }
 
     truncate_messages_to_char_budget(&mut messages, MAX_LOCAL_DIRECT_MESSAGE_CHARS);
@@ -857,7 +1017,35 @@ fn openai_messages_from_inputs_and_tasks(
 fn openai_message(role: &'static str, content: impl Into<String>) -> OpenAIChatMessage {
     OpenAIChatMessage {
         role,
-        content: content.into(),
+        content: OpenAIChatContent::text(content),
+        tool_call_id: None,
+        tool_calls: None,
+    }
+}
+
+fn openai_user_message(content: String, images: Vec<LocalOpenAIImage>) -> OpenAIChatMessage {
+    if images.is_empty() {
+        return openai_message("user", content);
+    }
+
+    let mut parts = vec![OpenAIChatContentPart::Text {
+        r#type: "text",
+        text: content,
+    }];
+    parts.extend(
+        images
+            .into_iter()
+            .map(|image| OpenAIChatContentPart::ImageUrl {
+                r#type: "image_url",
+                image_url: OpenAIChatImageUrl {
+                    url: format!("data:{};base64,{}", image.mime_type, image.base64_data),
+                },
+            }),
+    );
+
+    OpenAIChatMessage {
+        role: "user",
+        content: OpenAIChatContent::Parts(parts),
         tool_call_id: None,
         tool_calls: None,
     }
@@ -866,7 +1054,7 @@ fn openai_message(role: &'static str, content: impl Into<String>) -> OpenAIChatM
 fn openai_tool_message(tool_call_id: String, content: String) -> OpenAIChatMessage {
     OpenAIChatMessage {
         role: "tool",
-        content,
+        content: OpenAIChatContent::text(content),
         tool_call_id: Some(tool_call_id),
         tool_calls: None,
     }
@@ -875,7 +1063,7 @@ fn openai_tool_message(tool_call_id: String, content: String) -> OpenAIChatMessa
 fn openai_assistant_tool_call_message(tool_calls: Vec<OpenAIChatToolCall>) -> OpenAIChatMessage {
     OpenAIChatMessage {
         role: "assistant",
-        content: String::new(),
+        content: OpenAIChatContent::text(String::new()),
         tool_call_id: None,
         tool_calls: Some(tool_calls),
     }
@@ -1484,6 +1672,97 @@ fn parse_mcp_openai_name(openai_name: &str) -> (Option<String>, Option<String>) 
         }
         _ => (None, Some(openai_name.to_string())),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalOpenAIImage {
+    mime_type: String,
+    base64_data: String,
+}
+
+fn local_images_from_user_query_inputs(
+    input: &[AIAgentInput],
+    vision_supported: bool,
+) -> anyhow::Result<Vec<LocalOpenAIImage>> {
+    if !FeatureFlag::LocalAgentImageInput.is_enabled() {
+        return Ok(Vec::new());
+    }
+
+    let image_contexts = input
+        .iter()
+        .filter_map(|input| match input {
+            AIAgentInput::UserQuery { context, .. } => Some(context.as_ref()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|context| match context {
+            AIAgentContext::Image(image) => Some(image),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if image_contexts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !vision_supported {
+        return Err(anyhow!(
+            "The selected local model is known not to support image input. Choose a vision-capable model, or remove the image and resend for a text-only answer."
+        ));
+    }
+    if image_contexts.len() > MAX_IMAGE_COUNT_FOR_QUERY {
+        return Err(anyhow!(
+            "Too many images attached. Local agent image input supports up to {MAX_IMAGE_COUNT_FOR_QUERY} images per query."
+        ));
+    }
+
+    image_contexts
+        .into_iter()
+        .map(local_openai_image_from_context)
+        .collect()
+}
+
+fn local_openai_image_from_context(image: &ImageContext) -> anyhow::Result<LocalOpenAIImage> {
+    if image.mime_type.trim().is_empty() {
+        return Err(anyhow!("Image input is missing a MIME type."));
+    }
+    if !is_supported_image_mime_type(&image.mime_type) {
+        return Err(anyhow!(
+            "Unsupported image MIME type. Supported image types are PNG, JPEG, WebP, and GIF."
+        ));
+    }
+
+    let decoded = general_purpose::STANDARD
+        .decode(&image.data)
+        .map_err(|_| anyhow!("Image input is not valid base64."))?;
+    if decoded.len() > MAX_IMAGE_SIZE_BYTES {
+        return Err(anyhow!(
+            "Image input is too large. Maximum image size is {MAX_IMAGE_SIZE_BYTES} bytes."
+        ));
+    }
+
+    let normalized = match normalize_image_for_agent(&decoded, &image.mime_type) {
+        ProcessImageResult::Success { data } => data,
+        ProcessImageResult::TooLarge => {
+            return Err(anyhow!(
+                "Image input is too large after processing. Maximum image size is {MAX_IMAGE_SIZE_BYTES} bytes."
+            ));
+        }
+        ProcessImageResult::UnsupportedMimeType => {
+            return Err(anyhow!(
+                "Unsupported image MIME type. Supported image types are PNG, JPEG, WebP, and GIF."
+            ));
+        }
+        ProcessImageResult::Error(_) => {
+            return Err(anyhow!(
+                "Image input could not be safely decoded and normalized."
+            ));
+        }
+    };
+
+    Ok(LocalOpenAIImage {
+        mime_type: image.mime_type.clone(),
+        base64_data: general_purpose::STANDARD.encode(normalized),
+    })
 }
 
 fn execute_apply_file_diff_tool(
@@ -3017,7 +3296,7 @@ fn truncate_messages_to_char_budget(messages: &mut Vec<OpenAIChatMessage>, max_c
 
     let non_system_chars = messages[1..]
         .iter()
-        .map(|message| message.content.chars().count())
+        .map(|message| message.content.text_char_count())
         .sum::<usize>();
     if non_system_chars <= max_chars {
         return;
@@ -3035,15 +3314,17 @@ fn truncate_messages_to_char_budget(messages: &mut Vec<OpenAIChatMessage>, max_c
             break;
         }
 
-        let message_chars = message.content.chars().count();
+        let message_chars = message.content.text_char_count();
         if message_chars <= remaining_chars {
             remaining_chars -= message_chars;
             retained.push(message);
         } else {
-            retained.push(openai_message(
-                message.role,
-                truncate_message_content(&message.content, remaining_chars),
-            ));
+            retained.push(OpenAIChatMessage {
+                role: message.role,
+                content: message.content.truncate_text(remaining_chars),
+                tool_call_id: message.tool_call_id,
+                tool_calls: message.tool_calls,
+            });
             break;
         }
     }
@@ -3422,6 +3703,7 @@ mod tests {
     };
     use crate::features::FeatureFlag;
     use ai::agent::action_result::{AnyFileContent, FileContext};
+    use base64::{engine::general_purpose, Engine as _};
     use chrono::{Local, TimeZone};
     use futures_util::StreamExt as _;
     use std::{
@@ -3461,11 +3743,38 @@ mod tests {
         }
     }
 
+    fn test_png_image_context() -> crate::ai::agent::ImageContext {
+        test_image_context_with_color([255, 0, 0, 255], "image/png")
+    }
+
+    fn test_image_context_with_color(
+        color: [u8; 4],
+        mime_type: &str,
+    ) -> crate::ai::agent::ImageContext {
+        let image = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_fn(2, 2, |_, _| {
+            image::Rgba(color)
+        });
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        crate::ai::agent::ImageContext {
+            data: general_purpose::STANDARD.encode(bytes),
+            mime_type: mime_type.to_string(),
+            file_name: "redacted.png".to_string(),
+            is_figma: false,
+        }
+    }
+
     fn local_direct_config() -> LocalDirectConfig {
         LocalDirectConfig {
             api_key: "test-key".to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
             model: "test-model".to_string(),
+            vision_supported: true,
         }
     }
 
@@ -4356,7 +4665,7 @@ mod tests {
         };
 
         assert!(local_shell_action_result(&input));
-        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
         assert_eq!(messages[messages.len() - 2].role, "assistant");
         assert_eq!(
             messages[messages.len() - 2].tool_calls.as_ref().unwrap()[0].id,
@@ -4388,7 +4697,7 @@ mod tests {
         };
 
         assert!(local_shell_action_result(&input));
-        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
         assert_eq!(messages[messages.len() - 2].role, "assistant");
         assert_eq!(
             messages[messages.len() - 2].tool_calls.as_ref().unwrap()[0].id,
@@ -4427,7 +4736,8 @@ mod tests {
         )];
 
         let messages =
-            openai_messages_from_inputs_and_tasks(&[input], &tasks, Some(&local_context)).unwrap();
+            openai_messages_from_inputs_and_tasks(&[input], &tasks, Some(&local_context), true)
+                .unwrap();
         let assistant_tool_call = messages
             .iter()
             .filter_map(|message| message.tool_calls.as_ref())
@@ -4479,7 +4789,8 @@ mod tests {
         let input = vec![user_query_input("continue", Vec::new(), HashMap::new())];
 
         let messages =
-            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context)).unwrap();
+            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context), true)
+                .unwrap();
         let result_message = messages
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
@@ -4509,7 +4820,8 @@ mod tests {
         let input = vec![user_query_input("continue", Vec::new(), HashMap::new())];
 
         let messages =
-            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context)).unwrap();
+            openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context), true)
+                .unwrap();
         let result_message = messages
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
@@ -5594,7 +5906,7 @@ mod tests {
         }];
         let input = vec![user_query_input("what did I say?", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
 
         assert_eq!(messages[0].role, "system");
         assert_eq!(
@@ -5609,6 +5921,50 @@ mod tests {
                 ("user", "what did I say?"),
             ]
         );
+    }
+
+    #[test]
+    fn openai_messages_do_not_dedupe_current_query_when_images_are_attached() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let tasks = vec![api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages: vec![api::Message {
+                id: "user-1".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: "describe image".to_string(),
+                    context: None,
+                    referenced_attachments: Default::default(),
+                    mode: None,
+                    intended_agent: 0,
+                })),
+            }],
+            summary: String::new(),
+            server_data: String::new(),
+        }];
+        let input = vec![user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
+        let user_messages = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 2);
+        assert!(!user_messages[0].content.contains_image_url());
+        assert!(user_messages[1].content.contains_image_url());
     }
 
     #[test]
@@ -5640,7 +5996,7 @@ mod tests {
         }];
         let input = vec![user_query_input("current", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
 
         assert!(messages
             .iter()
@@ -5675,7 +6031,7 @@ mod tests {
         }];
         let input = vec![user_query_input("current", vec![], HashMap::new())];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
         let non_system_chars = messages[1..]
             .iter()
             .map(|message| message.content.chars().count())
@@ -5717,7 +6073,7 @@ mod tests {
             HashMap::new(),
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
         let message = &messages.last().unwrap().content;
 
         assert!(message.contains("User message:\nexplain the context"));
@@ -5775,7 +6131,7 @@ mod tests {
             attachments,
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
         let context = &messages.last().unwrap().content;
 
         assert!(context.contains("File context (src/main.rs (1-2))"));
@@ -5788,6 +6144,182 @@ mod tests {
         assert!(context.contains("document body"));
         assert!(context.contains("Attached file (attached.txt)"));
         assert!(context.contains("file attachment body"));
+    }
+
+    #[test]
+    fn openai_messages_ignore_images_when_flag_disabled() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(false);
+        let input = vec![user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
+        let value = serde_json::to_value(messages.last().unwrap()).unwrap();
+
+        assert_eq!(value["content"], "describe image");
+        assert!(!format!("{:?}", messages.last().unwrap()).contains("data:image"));
+    }
+
+    #[test]
+    fn openai_messages_include_text_then_image_parts_when_flag_enabled() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let input = vec![user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
+        let value = serde_json::to_value(messages.last().unwrap()).unwrap();
+        let content = value["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe image");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        assert!(general_purpose::STANDARD
+            .decode(url.trim_start_matches("data:image/png;base64,"))
+            .is_ok());
+        assert!(!format!("{:?}", messages.last().unwrap()).contains(url));
+        assert!(!format!("{:?}", messages.last().unwrap()).contains("data:image"));
+    }
+
+    #[test]
+    fn openai_messages_preserve_multiple_image_order() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let first = test_image_context_with_color([255, 0, 0, 255], "image/png");
+        let second = test_image_context_with_color([0, 255, 0, 255], "image/png");
+        let input = vec![user_query_input(
+            "compare images",
+            vec![
+                crate::ai::agent::AIAgentContext::Image(first),
+                crate::ai::agent::AIAgentContext::Image(second),
+            ],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
+        let value = serde_json::to_value(messages.last().unwrap()).unwrap();
+        let content = value["content"].as_array().unwrap();
+        let first_url = content[1]["image_url"]["url"].as_str().unwrap();
+        let second_url = content[2]["image_url"]["url"].as_str().unwrap();
+
+        assert_eq!(content[0]["text"], "compare images");
+        assert_ne!(first_url, second_url);
+    }
+
+    #[test]
+    fn openai_messages_reject_invalid_image_inputs_before_provider_request() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let unsupported = user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_image_context_with_color([255, 0, 0, 255], "image/bmp"),
+            )],
+            HashMap::new(),
+        );
+        let unsupported_error =
+            openai_messages_from_inputs_and_tasks(&[unsupported], &[], None, true).unwrap_err();
+        assert!(unsupported_error
+            .to_string()
+            .contains("Unsupported image MIME type"));
+
+        let invalid = user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                crate::ai::agent::ImageContext {
+                    data: "not valid base64".to_string(),
+                    mime_type: "image/png".to_string(),
+                    file_name: "redacted.png".to_string(),
+                    is_figma: false,
+                },
+            )],
+            HashMap::new(),
+        );
+        let invalid_error =
+            openai_messages_from_inputs_and_tasks(&[invalid], &[], None, true).unwrap_err();
+        assert!(invalid_error.to_string().contains("not valid base64"));
+
+        let oversized = user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                crate::ai::agent::ImageContext {
+                    data: general_purpose::STANDARD.encode(vec![
+                        0_u8;
+                        crate::util::image::MAX_IMAGE_SIZE_BYTES
+                            + 1
+                    ]),
+                    mime_type: "image/png".to_string(),
+                    file_name: "redacted.png".to_string(),
+                    is_figma: false,
+                },
+            )],
+            HashMap::new(),
+        );
+        let oversized_error =
+            openai_messages_from_inputs_and_tasks(&[oversized], &[], None, true).unwrap_err();
+        assert!(oversized_error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn openai_messages_reject_images_for_known_non_vision_model() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let input = vec![user_query_input(
+            "describe image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+
+        let error = openai_messages_from_inputs_and_tasks(&input, &[], None, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("known not to support image input"));
+        assert!(error.to_string().contains("remove the image and resend"));
+    }
+
+    #[test]
+    fn openai_messages_do_not_replay_images_for_action_result_resume() {
+        let _flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_shell".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::RequestCommandOutput(
+                RequestCommandOutputResult::Completed {
+                    block_id: BlockId::from("block".to_string()),
+                    command: "echo ok".to_string(),
+                    output: "ok\n".to_string(),
+                    exit_code: ExitCode::from(0),
+                },
+            ),
+        };
+        let input = AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(
+                vec![crate::ai::agent::AIAgentContext::Image(
+                    test_png_image_context(),
+                )]
+                .into_boxed_slice(),
+            ),
+        };
+
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
+
+        assert!(messages
+            .iter()
+            .all(|message| !message.content.contains_image_url()));
+        assert!(!serde_json::to_string(&messages)
+            .unwrap()
+            .contains("data:image"));
     }
 
     #[test]
@@ -5813,7 +6345,7 @@ mod tests {
             attachments,
         )];
 
-        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None).unwrap();
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages.last().unwrap().content, "hello");

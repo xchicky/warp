@@ -282,10 +282,15 @@ impl RequestParams {
                         .as_ref()
                         .and_then(|model| {
                             (request_input.model_id.as_str() == model).then(|| {
+                                let vision_supported = llm_preferences
+                                    .get_llm_info(&request_input.model_id)
+                                    .map(|info| info.vision_supported)
+                                    .unwrap_or(true);
                                 super::local::LocalDirectConfig {
                                     api_key: api_key.clone(),
                                     base_url: base_url.clone(),
                                     model: model.clone(),
+                                    vision_supported,
                                 }
                             })
                         })
