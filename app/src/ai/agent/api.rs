@@ -291,6 +291,7 @@ impl RequestParams {
                                     base_url: base_url.clone(),
                                     model: model.clone(),
                                     vision_supported,
+                                    cost_telemetry: Default::default(),
                                 }
                             })
                         })

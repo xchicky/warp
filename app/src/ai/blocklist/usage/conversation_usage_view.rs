@@ -124,6 +124,26 @@ impl ConversationUsageView {
         entries_by_category
     }
 
+    fn has_byok_usage(&self) -> bool {
+        self.usage_info.models.iter().any(|model| {
+            model.byok_tokens > 0
+                || model
+                    .byok_token_usage_by_category
+                    .values()
+                    .any(|&tokens| tokens > 0)
+        })
+    }
+
+    fn has_warp_usage(&self) -> bool {
+        self.usage_info.models.iter().any(|model| {
+            model.warp_tokens > 0
+                || model
+                    .warp_token_usage_by_category
+                    .values()
+                    .any(|&tokens| tokens > 0)
+        })
+    }
+
     fn render_unified_layout(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font_size = appearance.ui_font_size() + 2.;
@@ -143,24 +163,56 @@ impl ConversationUsageView {
             && self.usage_info.credits_spent_for_last_block.is_some()
         {
             let last_block_credits = self.usage_info.credits_spent_for_last_block.unwrap();
+            let byok_estimate_only = self.has_byok_usage() && !self.has_warp_usage();
             labels.push(render_label_text(
-                "Credits spent (last response)",
+                if byok_estimate_only {
+                    "Estimated BYOK cost (last response)"
+                } else {
+                    "Credits spent (last response)"
+                },
                 appearance,
             ));
             values.push(render_value_text(
-                format_credits(last_block_credits),
+                if byok_estimate_only {
+                    format_estimated_local_cost(last_block_credits)
+                } else {
+                    format_credits(last_block_credits)
+                },
                 appearance,
             ));
 
-            labels.push(render_label_text("Credits spent (total)", appearance));
+            labels.push(render_label_text(
+                if byok_estimate_only {
+                    "Estimated BYOK cost (total)"
+                } else {
+                    "Credits spent (total)"
+                },
+                appearance,
+            ));
             values.push(render_value_text(
-                format_credits(self.usage_info.credits_spent),
+                if byok_estimate_only {
+                    format_estimated_local_cost(self.usage_info.credits_spent)
+                } else {
+                    format_credits(self.usage_info.credits_spent)
+                },
                 appearance,
             ));
         } else {
-            labels.push(render_label_text("Credits spent", appearance));
+            let byok_estimate_only = self.has_byok_usage() && !self.has_warp_usage();
+            labels.push(render_label_text(
+                if byok_estimate_only {
+                    "Estimated BYOK cost"
+                } else {
+                    "Credits spent"
+                },
+                appearance,
+            ));
             values.push(render_value_text(
-                format_credits(self.usage_info.credits_spent),
+                if byok_estimate_only {
+                    format_estimated_local_cost(self.usage_info.credits_spent)
+                } else {
+                    format_credits(self.usage_info.credits_spent)
+                },
                 appearance,
             ));
         }
@@ -507,6 +559,10 @@ fn render_section_header(header_label: String, appearance: &Appearance) -> Box<d
 /// making the label plural if the value is not 1.
 fn format_value_text(value: i32, label: &str) -> String {
     format!("{} {}{}", value, label, if value == 1 { "" } else { "s" })
+}
+
+fn format_estimated_local_cost(cents: f32) -> String {
+    format!("estimated ${:.4}", cents / 100.0)
 }
 
 /// Helper to build a text element with consistent styling for labels.

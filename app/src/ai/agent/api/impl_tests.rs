@@ -56,6 +56,7 @@ fn local_direct_config() -> LocalDirectConfig {
         base_url: "http://127.0.0.1:1/v1".to_string(),
         model: "test-model".to_string(),
         vision_supported: true,
+        cost_telemetry: Default::default(),
     }
 }
 

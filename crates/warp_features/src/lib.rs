@@ -582,6 +582,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to pass user-attached images to vision-capable providers.
     LocalAgentImageInput,
 
+    /// Enables local OpenAI-compatible agents to surface provider token usage and local cost estimates.
+    LocalAgentCostTelemetry,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 

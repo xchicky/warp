@@ -3266,8 +3266,31 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
         Icon::ChevronRight
     };
 
+    let has_byok_usage = conversation.token_usage().iter().any(|usage| {
+        usage.byok_tokens > 0
+            || usage
+                .byok_token_usage_by_category
+                .values()
+                .any(|&tokens| tokens > 0)
+    });
+    let has_warp_usage = conversation.token_usage().iter().any(|usage| {
+        usage.warp_tokens > 0
+            || usage
+                .warp_token_usage_by_category
+                .values()
+                .any(|&tokens| tokens > 0)
+    });
+    let byok_estimate_only = has_byok_usage && !has_warp_usage;
+    let format_usage_cost = |cost: f32| {
+        if byok_estimate_only {
+            format!("Est. ${:.4}", cost / 100.0)
+        } else {
+            format_credits(cost)
+        }
+    };
+
     let total_credits_spent = conversation.credits_spent();
-    let mut credit_usage_text = format_credits(total_credits_spent);
+    let mut credit_usage_text = format_usage_cost(total_credits_spent);
     if let Some(credits_spent_for_last_block) = conversation.credits_spent_for_last_block() {
         // Only show the credits spent for the last block if it is different from the total credits spent
         // and we spent a non-zero amount of credits for the last block.
@@ -3281,11 +3304,21 @@ fn render_usage_button(props: Props, app: &AppContext) -> Box<dyn Element> {
             if credits_spent_for_last_block.fract() < 0.1 {
                 credit_usage_text = format!(
                     "{credit_usage_text} (+{})",
-                    credits_spent_for_last_block.trunc() as i32
+                    if byok_estimate_only {
+                        format!("${:.4}", credits_spent_for_last_block / 100.0)
+                    } else {
+                        (credits_spent_for_last_block.trunc() as i32).to_string()
+                    }
                 );
             } else {
-                credit_usage_text =
-                    format!("{credit_usage_text} (+{credits_spent_for_last_block:.1})");
+                credit_usage_text = format!(
+                    "{credit_usage_text} (+{})",
+                    if byok_estimate_only {
+                        format!("${:.4}", credits_spent_for_last_block / 100.0)
+                    } else {
+                        format!("{credits_spent_for_last_block:.1}")
+                    }
+                );
             }
         }
     }
