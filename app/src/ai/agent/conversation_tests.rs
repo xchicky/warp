@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use super::{
     artifact_from_fork_proto, AIConversation, AIConversationAutoexecuteMode, AIConversationId,
+    RequestCost,
 };
 use crate::ai::artifacts::Artifact;
-use crate::persistence::model::AgentConversationData;
+use crate::persistence::model::{AgentConversationData, PRIMARY_AGENT_CATEGORY};
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
@@ -58,6 +59,52 @@ fn agent_output_message(id: &str, request_id: &str) -> api::Message {
     }
 }
 
+fn local_byok_token_usage(
+    model_id: &str,
+    total_input: u32,
+    output: u32,
+    cost_in_cents: f32,
+) -> api::response_event::stream_finished::TokenUsage {
+    api::response_event::stream_finished::TokenUsage {
+        model_id: model_id.to_string(),
+        total_input,
+        output,
+        input_cache_read: 0,
+        input_cache_write: 0,
+        cost_in_cents,
+    }
+}
+
+#[allow(deprecated)]
+fn local_byok_usage_metadata(
+    model_id: &str,
+    total_tokens: u32,
+    cost_in_cents: f32,
+) -> api::response_event::stream_finished::ConversationUsageMetadata {
+    let mut usage_by_category = HashMap::new();
+    usage_by_category.insert(PRIMARY_AGENT_CATEGORY.to_string(), total_tokens);
+
+    let mut byok_token_usage = HashMap::new();
+    byok_token_usage.insert(
+        model_id.to_string(),
+        api::response_event::stream_finished::ModelTokenUsage {
+            model_id: model_id.to_string(),
+            total_tokens,
+            token_usage_by_category: usage_by_category,
+        },
+    );
+
+    api::response_event::stream_finished::ConversationUsageMetadata {
+        context_window_usage: 0.0,
+        summarized: false,
+        credits_spent: cost_in_cents,
+        token_usage: vec![],
+        tool_usage_metadata: None,
+        warp_token_usage: HashMap::new(),
+        byok_token_usage,
+    }
+}
+
 fn restored_conversation_with_queries(queries: &[&str]) -> AIConversation {
     let messages = queries
         .iter()
@@ -84,6 +131,39 @@ fn restored_conversation_with_queries(queries: &[&str]) -> AIConversation {
         None,
     )
     .unwrap()
+}
+
+#[test]
+fn local_byok_usage_metadata_accumulates_across_requests() {
+    let mut conversation = AIConversation::new(false);
+
+    conversation
+        .update_cost_and_usage_for_request(
+            Some(RequestCost::new(0.25)),
+            vec![local_byok_token_usage("local-model", 10, 5, 0.25)],
+            Some(local_byok_usage_metadata("local-model", 15, 0.25)),
+            true,
+        )
+        .unwrap();
+    conversation
+        .update_cost_and_usage_for_request(
+            Some(RequestCost::new(0.5)),
+            vec![local_byok_token_usage("local-model", 20, 10, 0.5)],
+            Some(local_byok_usage_metadata("local-model", 30, 0.5)),
+            true,
+        )
+        .unwrap();
+
+    let usage_metadata = conversation.usage_metadata();
+    assert_eq!(usage_metadata.credits_spent, 0.75);
+    assert_eq!(conversation.credits_spent_for_last_block(), Some(0.5));
+    assert_eq!(usage_metadata.token_usage.len(), 1);
+    assert_eq!(usage_metadata.token_usage[0].model_id, "local-model");
+    assert_eq!(usage_metadata.token_usage[0].byok_tokens, 45);
+    assert_eq!(
+        usage_metadata.token_usage[0].byok_token_usage_by_category[PRIMARY_AGENT_CATEGORY],
+        45
+    );
 }
 
 #[test]
