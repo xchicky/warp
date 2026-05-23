@@ -461,6 +461,10 @@ const MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_DIRECT_SHELL_RESULT_CHARS: usize = 32 * 1024;
 const MAX_LOCAL_DIRECT_MCP_RESULT_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_DIRECT_MCP_RESULT_CHARS: usize = 32 * 1024;
+const MAX_LOCAL_DIRECT_TODOS: usize = 100;
+const MAX_LOCAL_DIRECT_TODO_ID_CHARS: usize = 128;
+const MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS: usize = 512;
+const MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS: usize = 1024;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. When run_shell_command is advertised, use it for shell commands that should run after visible user approval. Otherwise, if you need the user to run a shell command, use suggest_shell_command; suggested commands are not executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
 
 #[derive(Clone, Debug)]
@@ -825,6 +829,10 @@ pub fn generate_openai_compatible_output(
                         &tool_call.function.arguments,
                         &result.text,
                     ));
+                } else if !result.todo_operations.is_empty() {
+                    for event in todo_update_events(&task_id, &request_id, &result.todo_operations) {
+                        yield Ok(event);
+                    }
                 } else if let Some(events) = structured_tool_card_events(
                     &task_id,
                     &request_id,
@@ -1529,6 +1537,9 @@ fn local_tools_without_mcp() -> Vec<OpenAIChatTool> {
     if FeatureFlag::LocalAgentShellExecution.is_enabled() {
         tools.push(run_shell_command_tool_definition());
     }
+    if FeatureFlag::LocalAgentTodoWrite.is_enabled() {
+        tools.push(todo_write_tool_definition());
+    }
     tools
 }
 
@@ -1695,6 +1706,46 @@ fn run_shell_command_tool_definition() -> OpenAIChatTool {
     }
 }
 
+fn todo_write_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "todo_write".to_string(),
+            description: "Replace the visible conversation todo list with a complete ordered list. Use this to keep multi-step work status current.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "maxItems": MAX_LOCAL_DIRECT_TODOS,
+                        "description": "Complete replacement todo list.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Stable non-empty todo id." },
+                                "content": { "type": "string", "description": "Non-empty todo title shown to the user." },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Todo status. At most one item may be in_progress."
+                                }
+                            },
+                            "required": ["id", "content", "status"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional short explanation of why the list changed."
+                    }
+                },
+                "required": ["todos"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
 async fn execute_local_tool_batch(
     tool_calls: Vec<OpenAIChatToolCall>,
     cwd: Option<PathBuf>,
@@ -1781,7 +1832,7 @@ async fn execute_local_tool_batch(
 fn is_mutating_local_tool(name: &str) -> bool {
     matches!(
         name,
-        "apply_file_diff" | "write_file" | "edit_file" | "run_shell_command"
+        "apply_file_diff" | "write_file" | "edit_file" | "run_shell_command" | "todo_write"
     )
 }
 
@@ -1794,6 +1845,7 @@ fn is_sequential_local_tool(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCa
 struct LocalToolExecutionResult {
     text: String,
     apply_file_diff_summary: Option<ApplyFileDiffSummary>,
+    todo_operations: Vec<api::message::update_todos::Operation>,
     pending_tool_call: bool,
 }
 
@@ -1807,6 +1859,7 @@ impl LocalToolExecutionResult {
         Self {
             text: format!("Tool error: {error}"),
             apply_file_diff_summary: None,
+            todo_operations: Vec::new(),
             pending_tool_call: false,
         }
     }
@@ -1820,44 +1873,56 @@ fn execute_local_tool(
 ) -> LocalToolExecutionResult {
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, false)),
-        "grep" => {
-            execute_grep_tool(&tool_call.function.arguments, cwd).map(|text| (text, None, false))
-        }
-        "glob" => {
-            execute_glob_tool(&tool_call.function.arguments, cwd).map(|text| (text, None, false))
-        }
+            .map(|text| (text, None, Vec::new(), false)),
+        "grep" => execute_grep_tool(&tool_call.function.arguments, cwd)
+            .map(|text| (text, None, Vec::new(), false)),
+        "glob" => execute_glob_tool(&tool_call.function.arguments, cwd)
+            .map(|text| (text, None, Vec::new(), false)),
         "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, false)),
-        "apply_file_diff" => execute_apply_file_diff_tool(&tool_call.function.arguments, cwd)
-            .map(|summary| (apply_file_diff_result_text(&summary), Some(summary), false)),
+            .map(|text| (text, None, Vec::new(), false)),
+        "apply_file_diff" => {
+            execute_apply_file_diff_tool(&tool_call.function.arguments, cwd).map(|summary| {
+                (
+                    apply_file_diff_result_text(&summary),
+                    Some(summary),
+                    Vec::new(),
+                    false,
+                )
+            })
+        }
         "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd)
-            .map(|result| (result.0, result.1, false)),
+            .map(|result| (result.0, result.1, Vec::new(), false)),
         "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd)
-            .map(|result| (result.0, result.1, false)),
+            .map(|result| (result.0, result.1, Vec::new(), false)),
         "run_shell_command" => execute_run_shell_command_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, true)),
+            .map(|text| (text, None, Vec::new(), true)),
+        "todo_write" => execute_todo_write_tool(&tool_call.function.arguments)
+            .map(|result| (result.text, None, result.operations, false)),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
                 &mut suggested_shell_commands,
             )
-            .map(|text| (text, None, false)),
+            .map(|text| (text, None, Vec::new(), false)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
         name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
-            .map(|result| (result.text, None, result.pending_tool_call)),
+            .map(|result| (result.text, None, Vec::new(), result.pending_tool_call)),
     };
 
-    let (text, apply_file_diff_summary, pending_tool_call) = match result {
-        Ok((text, apply_file_diff_summary, pending_tool_call)) => {
-            (text, apply_file_diff_summary, pending_tool_call)
-        }
-        Err(error) => (format!("Tool error: {error}"), None, false),
+    let (text, apply_file_diff_summary, todo_operations, pending_tool_call) = match result {
+        Ok((text, apply_file_diff_summary, todo_operations, pending_tool_call)) => (
+            text,
+            apply_file_diff_summary,
+            todo_operations,
+            pending_tool_call,
+        ),
+        Err(error) => (format!("Tool error: {error}"), None, Vec::new(), false),
     };
     LocalToolExecutionResult {
         text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
         apply_file_diff_summary,
+        todo_operations,
         pending_tool_call: if tool_call.function.name == "run_shell_command" {
             !text.starts_with("Tool error:")
         } else {
@@ -1904,6 +1969,139 @@ fn execute_mcp_tool_request(
         ),
         pending_tool_call: true,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct TodoWriteArgs {
+    todos: Vec<TodoWriteItem>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TodoWriteItem {
+    id: String,
+    content: String,
+    status: String,
+}
+
+struct TodoWriteResult {
+    text: String,
+    operations: Vec<api::message::update_todos::Operation>,
+}
+
+fn execute_todo_write_tool(arguments: &str) -> anyhow::Result<TodoWriteResult> {
+    if !FeatureFlag::LocalAgentTodoWrite.is_enabled() {
+        return Err(anyhow!("todo_write is disabled by feature flag"));
+    }
+
+    let args: TodoWriteArgs =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid todo_write arguments"))?;
+    todo_write_result(args)
+}
+
+fn todo_write_result(args: TodoWriteArgs) -> anyhow::Result<TodoWriteResult> {
+    if args.todos.len() > MAX_LOCAL_DIRECT_TODOS {
+        return Err(anyhow!(
+            "todo_write supports at most {MAX_LOCAL_DIRECT_TODOS} todos"
+        ));
+    }
+    if let Some(summary) = &args.summary {
+        if summary.chars().count() > MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS {
+            return Err(anyhow!(
+                "todo_write summary exceeds {MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS} characters"
+            ));
+        }
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut in_progress = Vec::new();
+    let mut pending = Vec::new();
+    let mut completed = Vec::new();
+
+    for item in args.todos {
+        let id = item.id.trim();
+        let content = item.content.trim();
+        if id.is_empty() {
+            return Err(anyhow!("todo_write todo id must not be empty"));
+        }
+        if content.is_empty() {
+            return Err(anyhow!("todo_write todo content must not be empty"));
+        }
+        if id.chars().count() > MAX_LOCAL_DIRECT_TODO_ID_CHARS {
+            return Err(anyhow!(
+                "todo_write todo id exceeds {MAX_LOCAL_DIRECT_TODO_ID_CHARS} characters"
+            ));
+        }
+        if content.chars().count() > MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS {
+            return Err(anyhow!(
+                "todo_write todo content exceeds {MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS} characters"
+            ));
+        }
+        if !seen_ids.insert(id.to_string()) {
+            return Err(anyhow!("todo_write todo ids must be unique"));
+        }
+
+        let todo = api::TodoItem {
+            id: id.to_string(),
+            title: content.to_string(),
+            description: String::new(),
+        };
+        match item.status.as_str() {
+            "in_progress" => in_progress.push(todo),
+            "pending" => pending.push(todo),
+            "completed" => completed.push(todo),
+            _ => {
+                return Err(anyhow!(
+                    "todo_write status must be pending, in_progress, or completed"
+                ));
+            }
+        }
+    }
+
+    if in_progress.len() > 1 {
+        return Err(anyhow!("todo_write supports at most one in_progress todo"));
+    }
+
+    let in_progress_title = in_progress.first().map(|todo| todo.title.clone());
+    let pending_count = pending.len();
+    let completed_count = completed.len();
+    let mut initial_todos = Vec::with_capacity(in_progress.len() + pending.len() + completed.len());
+    initial_todos.extend(in_progress);
+    initial_todos.extend(pending);
+    initial_todos.extend(completed.clone());
+
+    let mut operations = vec![api::message::update_todos::Operation::CreateTodoList(
+        api::CreateTodoList { initial_todos },
+    )];
+    if !completed.is_empty() {
+        operations.push(api::message::update_todos::Operation::MarkTodosCompleted(
+            api::MarkTodosCompleted {
+                todo_ids: completed.into_iter().map(|todo| todo.id).collect(),
+            },
+        ));
+    }
+
+    let mut text = format!(
+        "Todo list updated: pending={}, in_progress={}, completed={}.",
+        pending_count,
+        usize::from(in_progress_title.is_some()),
+        completed_count,
+    );
+    if let Some(title) = in_progress_title {
+        text.push_str(&format!(
+            " Current in-progress todo: {}.",
+            truncate_message_content(&title, 160)
+        ));
+    }
+    if let Some(summary) = args.summary.filter(|summary| !summary.trim().is_empty()) {
+        text.push_str(&format!(
+            " Summary: {}",
+            truncate_message_content(summary.trim(), 512)
+        ));
+    }
+
+    Ok(TodoWriteResult { text, operations })
 }
 
 fn mcp_unavailable_result_for_provider(openai_name: &str, reason: &str) -> String {
@@ -3782,6 +3980,53 @@ fn agent_output_content_events(
     events
 }
 
+fn todo_update_events(
+    task_id: &str,
+    request_id: &str,
+    operations: &[api::message::update_todos::Operation],
+) -> Vec<api::ResponseEvent> {
+    if operations.is_empty() {
+        return Vec::new();
+    }
+
+    let now = Local::now();
+    let messages = operations
+        .iter()
+        .cloned()
+        .map(|operation| api::Message {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            request_id: request_id.to_string(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: now.timestamp(),
+                nanos: now.timestamp_subsec_nanos() as i32,
+            }),
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::UpdateTodos(
+                api::message::UpdateTodos {
+                    operation: Some(operation),
+                },
+            )),
+        })
+        .collect();
+
+    vec![api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.to_string(),
+                            messages,
+                        },
+                    )),
+                }],
+            },
+        )),
+    }]
+}
+
 fn add_agent_reasoning_message(
     task_id: &str,
     request_id: &str,
@@ -3978,14 +4223,14 @@ mod tests {
         execute_edit_file_tool, execute_glob_tool, execute_grep_tool, execute_list_directory_tool,
         execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
         execute_run_shell_command_tool, execute_suggest_shell_command_tool,
-        execute_write_file_tool, fallback_tool_results_message, generate_openai_compatible_output,
-        is_mutating_local_tool, local_mcp_tool_catalog, local_read_only_tools,
-        local_shell_action_result, local_tool_result_summary, local_tools, local_tools_for_context,
-        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        execute_todo_write_tool, execute_write_file_tool, fallback_tool_results_message,
+        generate_openai_compatible_output, is_mutating_local_tool, local_mcp_tool_catalog,
+        local_read_only_tools, local_shell_action_result, local_tool_result_summary, local_tools,
+        local_tools_for_context, mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
         mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
         openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
         stream_finished_done, structured_mcp_tool_call_event, structured_tool_call_event,
-        truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
+        todo_update_events, truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, EmptyLocalProviderResponseResolution,
         LocalDirectConfig, LocalMcpContext, LocalUsageTelemetry, OpenAIChatRequest,
         OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
@@ -3993,7 +4238,8 @@ mod tests {
         LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
         MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
         MAX_LOCAL_DIRECT_MCP_RESULT_BYTES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
-        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
+        MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -4199,6 +4445,7 @@ mod tests {
             Some(api::message::Message::AgentOutput(_)) => "agent_output",
             Some(api::message::Message::ToolCall(_)) => "tool_call",
             Some(api::message::Message::ToolCallResult(_)) => "tool_call_result",
+            Some(api::message::Message::UpdateTodos(_)) => "update_todos",
             _ => "other",
         }
     }
@@ -4514,6 +4761,7 @@ mod tests {
     fn local_tools_advertises_mutating_file_tools_only_when_flag_enabled() {
         let _disabled = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
         let _shell_disabled = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
+        let _todo_disabled = FeatureFlag::LocalAgentTodoWrite.override_enabled(false);
         let disabled_names = local_tools()
             .into_iter()
             .map(|tool| tool.function.name)
@@ -4524,6 +4772,7 @@ mod tests {
         assert!(!disabled_names
             .iter()
             .any(|name| name == "run_shell_command"));
+        assert!(!disabled_names.iter().any(|name| name == "todo_write"));
         drop(_disabled);
 
         let _enabled = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
@@ -4548,10 +4797,35 @@ mod tests {
     }
 
     #[test]
+    fn local_tools_advertises_todo_write_only_when_flag_enabled() {
+        let _todo_disabled = FeatureFlag::LocalAgentTodoWrite.override_enabled(false);
+        let disabled_names = local_tools()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(!disabled_names.iter().any(|name| name == "todo_write"));
+        drop(_todo_disabled);
+
+        let _todo_enabled = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let todo_tool = local_tools()
+            .into_iter()
+            .find(|tool| tool.function.name == "todo_write")
+            .unwrap();
+
+        assert_eq!(todo_tool.function.parameters["required"][0], "todos");
+        assert_eq!(
+            todo_tool.function.parameters["properties"]["todos"]["items"]["properties"]["status"]
+                ["enum"],
+            serde_json::json!(["pending", "in_progress", "completed"])
+        );
+    }
+
+    #[test]
     fn local_agent_mcp_without_context_does_not_advertise_mcp_tools() {
         let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
         let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
         let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(false);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(false);
 
         let names = local_tools()
             .into_iter()
@@ -5369,6 +5643,115 @@ mod tests {
     }
 
     #[test]
+    fn todo_write_tool_is_disabled_without_flag() {
+        let _flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(false);
+
+        let error = match execute_todo_write_tool(
+            r#"{"todos":[{"id":"one","content":"Inspect","status":"pending"}]}"#,
+        ) {
+            Ok(_) => panic!("expected disabled todo_write to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("disabled by feature flag"));
+    }
+
+    #[test]
+    fn todo_write_tool_replaces_full_list_with_ordered_statuses() {
+        let _flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+
+        let result = execute_todo_write_tool(
+            r#"{"summary":"Start work","todos":[{"id":"todo-2","content":"Finish","status":"pending"},{"id":"todo-1","content":"Inspect repo","status":"in_progress"},{"id":"todo-3","content":"Report","status":"completed"}]}"#,
+        )
+        .unwrap();
+
+        assert!(result.text.contains("pending=1"));
+        assert!(result.text.contains("in_progress=1"));
+        assert!(result.text.contains("completed=1"));
+        assert!(result.text.contains("Inspect repo"));
+        assert_eq!(result.operations.len(), 2);
+
+        let api::message::update_todos::Operation::CreateTodoList(create) = &result.operations[0]
+        else {
+            panic!("expected create todo list");
+        };
+        assert_eq!(create.initial_todos[0].id, "todo-1");
+        assert_eq!(create.initial_todos[1].id, "todo-2");
+        assert_eq!(create.initial_todos[2].id, "todo-3");
+
+        let api::message::update_todos::Operation::MarkTodosCompleted(completed) =
+            &result.operations[1]
+        else {
+            panic!("expected completed operation");
+        };
+        assert_eq!(completed.todo_ids, vec!["todo-3"]);
+    }
+
+    #[test]
+    fn todo_write_tool_rejects_invalid_inputs_without_operations() {
+        let _flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+
+        for args in [
+            r#"{"todos":[{"id":"dup","content":"One","status":"pending"},{"id":"dup","content":"Two","status":"completed"}]}"#,
+            r#"{"todos":[{"id":"one","content":" ","status":"pending"}]}"#,
+            r#"{"todos":[{"id":"one","content":"One","status":"blocked"}]}"#,
+            r#"{"todos":[{"id":"one","content":"One","status":"in_progress"},{"id":"two","content":"Two","status":"in_progress"}]}"#,
+        ] {
+            assert!(execute_todo_write_tool(args).is_err());
+        }
+    }
+
+    #[test]
+    fn todo_write_tool_result_summary_is_bounded() {
+        let _flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let content = "x".repeat(MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS);
+        let summary = "s".repeat(MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS);
+        let args = serde_json::json!({
+            "summary": summary,
+            "todos": [
+                { "id": "one", "content": content, "status": "in_progress" }
+            ],
+        })
+        .to_string();
+
+        let result = execute_todo_write_tool(&args).unwrap();
+
+        assert!(result.text.len() < MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS);
+        assert!(result.text.contains("provider output truncated") || result.text.len() < 900);
+    }
+
+    #[test]
+    fn todo_update_events_emit_existing_update_todos_messages() {
+        let _flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let result = execute_todo_write_tool(
+            r#"{"todos":[{"id":"one","content":"Inspect","status":"in_progress"},{"id":"two","content":"Done","status":"completed"}]}"#,
+        )
+        .unwrap();
+
+        let events = todo_update_events("task", "request", &result.operations);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(message_kind(&events[0]), "update_todos");
+        let Some(api::response_event::Type::ClientActions(actions)) = &events[0].r#type else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        assert_eq!(add.messages.len(), 2);
+        assert!(matches!(
+            add.messages[0].message,
+            Some(api::message::Message::UpdateTodos(_))
+        ));
+        assert!(matches!(
+            add.messages[1].message,
+            Some(api::message::Message::UpdateTodos(_))
+        ));
+    }
+
+    #[test]
     fn write_file_tool_is_disabled_without_flag() {
         let _flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5606,6 +5989,7 @@ mod tests {
         assert!(is_mutating_local_tool("write_file"));
         assert!(is_mutating_local_tool("edit_file"));
         assert!(is_mutating_local_tool("run_shell_command"));
+        assert!(is_mutating_local_tool("todo_write"));
         assert!(!is_mutating_local_tool("read_file"));
         assert!(!is_mutating_local_tool("grep"));
     }
@@ -5679,6 +6063,36 @@ mod tests {
             std::fs::read_to_string(temp_dir.path().join("existing.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_preserves_todo_write_provider_order() {
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+
+        let results = execute_local_tool_batch(
+            vec![
+                tool_call(
+                    "todo_write",
+                    r#"{"todos":[{"id":"first","content":"First","status":"in_progress"}]}"#,
+                ),
+                tool_call("read_file", r#"{"path":"Cargo.toml"}"#),
+                tool_call(
+                    "todo_write",
+                    r#"{"todos":[{"id":"second","content":"Second","status":"completed"}]}"#,
+                ),
+            ],
+            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")),
+            suggestions,
+            None,
+        )
+        .await;
+
+        assert_eq!(results[0].0.function.name, "todo_write");
+        assert_eq!(results[1].0.function.name, "read_file");
+        assert_eq!(results[2].0.function.name, "todo_write");
+        assert_eq!(results[0].1.todo_operations.len(), 1);
+        assert_eq!(results[2].1.todo_operations.len(), 2);
     }
 
     #[tokio::test]
