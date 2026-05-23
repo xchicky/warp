@@ -45,6 +45,7 @@ use crate::{
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
         AIAgentInput, CallMCPToolResult, ImageContext, MCPContext, RequestCommandOutputResult,
+        UserQueryMode,
     },
     features::FeatureFlag,
     persistence::model::PRIMARY_AGENT_CATEGORY,
@@ -465,7 +466,63 @@ const MAX_LOCAL_DIRECT_TODOS: usize = 100;
 const MAX_LOCAL_DIRECT_TODO_ID_CHARS: usize = 128;
 const MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS: usize = 512;
 const MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS: usize = 1024;
+const MAX_LOCAL_DIRECT_PLAN_CHARS: usize = 16 * 1024;
+const MAX_LOCAL_DIRECT_PLAN_SUMMARY_CHARS: usize = 512;
 const LOCAL_DIRECT_SYSTEM_PROMPT: &str = "You are a helpful local coding assistant running inside Warp. Use only the tools advertised in the current request. Most local tools are read-only; when apply_file_diff, write_file, or edit_file are available, you may use them to update files under the current workspace. When run_shell_command is advertised, use it for shell commands that should run after visible user approval. Otherwise, if you need the user to run a shell command, use suggest_shell_command; suggested commands are not executed automatically. After calling suggest_shell_command, do not call any more tools in the same turn — reply with a short natural-language summary instead.";
+const LOCAL_DIRECT_PLAN_MODE_PROMPT: &str = "You are in plan mode. Inspect the workspace using only read-only tools and suggest_shell_command. Do not modify files, execute commands, call MCP tools, or update todos. When ready, call exit_plan_mode with the complete plan. No changes will be executed in plan mode.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalToolPolicy {
+    Normal,
+    Plan,
+}
+
+impl LocalToolPolicy {
+    fn from_inputs(input: &[AIAgentInput]) -> Self {
+        if FeatureFlag::LocalAgentPlanMode.is_enabled()
+            && input.iter().any(|input| {
+                matches!(
+                    input,
+                    AIAgentInput::UserQuery {
+                        user_query_mode: UserQueryMode::Plan,
+                        ..
+                    }
+                )
+            })
+        {
+            Self::Plan
+        } else {
+            Self::Normal
+        }
+    }
+
+    fn is_plan(self) -> bool {
+        matches!(self, Self::Plan)
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::Plan => matches!(
+                name,
+                "read_file"
+                    | "grep"
+                    | "glob"
+                    | "list_directory"
+                    | "suggest_shell_command"
+                    | "exit_plan_mode"
+            ),
+        }
+    }
+
+    fn denied_tool_error(self, name: &str) -> Option<String> {
+        (!self.allows_tool(name)).then(|| {
+            format!(
+                "Tool '{name}' is unavailable in plan mode. Plan mode only allows read-only inspection tools, suggest_shell_command, and exit_plan_mode."
+            )
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 struct LocalUsageTelemetry {
@@ -573,6 +630,7 @@ pub fn generate_openai_compatible_output(
         }
         let has_user_query = input.iter().any(|input| input.user_query().is_some());
         let has_shell_action_result = input.iter().any(local_shell_action_result);
+        let tool_policy = LocalToolPolicy::from_inputs(&input);
         let mut usage_telemetry =
             LocalUsageTelemetry::new(FeatureFlag::LocalAgentCostTelemetry.is_enabled());
         if !has_user_query && !has_shell_action_result {
@@ -605,11 +663,12 @@ pub fn generate_openai_compatible_output(
             };
         }
 
-        let mut messages = match openai_messages_from_inputs_and_tasks(
+        let mut messages = match openai_messages_from_inputs_and_tasks_with_policy(
             &input,
             &tasks,
             mcp_context.as_ref(),
             config.vision_supported,
+            tool_policy,
         ) {
             Ok(messages) => messages,
             Err(error) => {
@@ -627,12 +686,13 @@ pub fn generate_openai_compatible_output(
         let max_tool_rounds = if has_user_query { MAX_LOCAL_DIRECT_TOOL_ROUNDS } else { 0 };
         for round in 0..max_tool_rounds {
             log::debug!("Starting local direct tool loop round {}", round + 1);
-            let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context.as_ref());
+            let mcp_tool_catalog = local_mcp_tool_catalog_for_policy(mcp_context.as_ref(), tool_policy);
             let response = match request_openai_compatible_completion(
                 &config,
                 messages.clone(),
                 RequestMode::ToolUse,
                 mcp_context.as_ref(),
+                tool_policy,
             )
             .await
             {
@@ -772,6 +832,14 @@ pub fn generate_openai_compatible_output(
                         started_at.elapsed(),
                     ));
                 }
+                if tool_policy.is_plan() && received_token {
+                    yield_agent_output_content!(
+                        "\n\nPlan mode is still active. Finish the plan by calling exit_plan_mode before requesting or making changes."
+                            .to_string()
+                    );
+                    yield Ok(stream_finished_done(&config, &usage_telemetry));
+                    return;
+                }
                 match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
                     EmptyLocalProviderResponseResolution::Finish => {
                         yield Ok(stream_finished_done(&config, &usage_telemetry));
@@ -797,11 +865,12 @@ pub fn generate_openai_compatible_output(
             messages.push(openai_assistant_tool_call_message(tool_calls.clone()));
             let should_finalize = tool_calls_require_finalize(&tool_calls);
 
-            let tool_results = execute_local_tool_batch(
+            let tool_results = execute_local_tool_batch_with_policy(
                 tool_calls,
                 cwd.clone(),
                 Arc::clone(&suggested_shell_commands),
                 mcp_tool_catalog.clone().map(Arc::new),
+                tool_policy,
             )
             .await;
 
@@ -821,6 +890,12 @@ pub fn generate_openai_compatible_output(
                     }
                     waiting_for_out_of_band_action = true;
                     continue;
+                }
+                if result.exits_plan_mode {
+                    yield_agent_output_content!(result.text.clone());
+                    messages.push(openai_tool_message(tool_call.id, result.text));
+                    yield Ok(stream_finished_done(&config, &usage_telemetry));
+                    return;
                 }
 
                 tool_result_summaries.push(local_tool_result_summary(&tool_call, &result.text));
@@ -857,11 +932,21 @@ pub fn generate_openai_compatible_output(
             }
         }
 
+        if tool_policy.is_plan() {
+            yield_agent_output_content!(
+                "Plan mode reached the local tool-round limit before exit_plan_mode was called. No changes were executed. Please provide the complete plan with exit_plan_mode before making changes."
+                    .to_string()
+            );
+            yield Ok(stream_finished_done(&config, &usage_telemetry));
+            return;
+        }
+
         let response = match request_openai_compatible_completion(
             &config,
             messages,
             RequestMode::Finalize,
             mcp_context.as_ref(),
+            tool_policy,
         )
         .await
         {
@@ -1028,16 +1113,31 @@ async fn request_openai_compatible_completion(
     messages: Vec<OpenAIChatMessage>,
     mode: RequestMode,
     mcp_context: Option<&LocalMcpContext>,
+    tool_policy: LocalToolPolicy,
 ) -> anyhow::Result<LocalProviderResponse> {
     let include_usage = FeatureFlag::LocalAgentCostTelemetry.is_enabled();
-    let request = openai_chat_request(config, messages.clone(), mode, mcp_context, include_usage);
+    let request = openai_chat_request_with_policy(
+        config,
+        messages.clone(),
+        mode,
+        mcp_context,
+        include_usage,
+        tool_policy,
+    );
     match send_openai_compatible_request(config, request).await {
         Ok(response) => Ok(LocalProviderResponse {
             response,
             usage_available: include_usage,
         }),
         Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
-            let request = openai_chat_request(config, messages, mode, mcp_context, false);
+            let request = openai_chat_request_with_policy(
+                config,
+                messages,
+                mode,
+                mcp_context,
+                false,
+                tool_policy,
+            );
             let response = send_openai_compatible_request(config, request)
                 .await
                 .map_err(LocalProviderRequestError::into_anyhow)?;
@@ -1062,6 +1162,24 @@ fn openai_chat_request(
     mcp_context: Option<&LocalMcpContext>,
     include_usage: bool,
 ) -> OpenAIChatRequest {
+    openai_chat_request_with_policy(
+        config,
+        messages,
+        mode,
+        mcp_context,
+        include_usage,
+        LocalToolPolicy::Normal,
+    )
+}
+
+fn openai_chat_request_with_policy(
+    config: &LocalDirectConfig,
+    messages: Vec<OpenAIChatMessage>,
+    mode: RequestMode,
+    mcp_context: Option<&LocalMcpContext>,
+    include_usage: bool,
+    tool_policy: LocalToolPolicy,
+) -> OpenAIChatRequest {
     OpenAIChatRequest {
         model: config.model.clone(),
         messages,
@@ -1070,7 +1188,7 @@ fn openai_chat_request(
             include_usage: true,
         }),
         tools: match mode {
-            RequestMode::ToolUse => local_tools_for_context(mcp_context),
+            RequestMode::ToolUse => local_tools_for_context_with_policy(mcp_context, tool_policy),
             RequestMode::Finalize => Vec::new(),
         },
         tool_choice: match mode {
@@ -1212,8 +1330,29 @@ fn openai_messages_from_inputs_and_tasks(
     mcp_context: Option<&LocalMcpContext>,
     vision_supported: bool,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
-    let mut messages = vec![openai_message("system", LOCAL_DIRECT_SYSTEM_PROMPT)];
-    let mcp_tool_catalog = local_mcp_tool_catalog(mcp_context);
+    openai_messages_from_inputs_and_tasks_with_policy(
+        input,
+        tasks,
+        mcp_context,
+        vision_supported,
+        LocalToolPolicy::Normal,
+    )
+}
+
+fn openai_messages_from_inputs_and_tasks_with_policy(
+    input: &[AIAgentInput],
+    tasks: &[api::Task],
+    mcp_context: Option<&LocalMcpContext>,
+    vision_supported: bool,
+    tool_policy: LocalToolPolicy,
+) -> anyhow::Result<Vec<OpenAIChatMessage>> {
+    let system_prompt = if tool_policy.is_plan() {
+        format!("{LOCAL_DIRECT_SYSTEM_PROMPT}\n\n{LOCAL_DIRECT_PLAN_MODE_PROMPT}")
+    } else {
+        LOCAL_DIRECT_SYSTEM_PROMPT.to_string()
+    };
+    let mut messages = vec![openai_message("system", system_prompt)];
+    let mcp_tool_catalog = local_mcp_tool_catalog_for_policy(mcp_context, tool_policy);
     let mcp_tool_call_metadata_by_id =
         mcp_tool_call_metadata_by_id(tasks, mcp_tool_catalog.as_ref());
 
@@ -1510,6 +1649,19 @@ fn local_tools() -> Vec<OpenAIChatTool> {
 }
 
 fn local_tools_for_context(mcp_context: Option<&LocalMcpContext>) -> Vec<OpenAIChatTool> {
+    local_tools_for_context_with_policy(mcp_context, LocalToolPolicy::Normal)
+}
+
+fn local_tools_for_context_with_policy(
+    mcp_context: Option<&LocalMcpContext>,
+    tool_policy: LocalToolPolicy,
+) -> Vec<OpenAIChatTool> {
+    if tool_policy.is_plan() {
+        let mut tools = local_read_only_tools();
+        tools.push(exit_plan_mode_tool_definition());
+        return tools;
+    }
+
     let mut tools = local_tools_without_mcp();
     if FeatureFlag::LocalAgentMcp.is_enabled() {
         if let Some(catalog) = mcp_context.and_then(|context| mcp_tool_catalog(context, &tools)) {
@@ -1520,6 +1672,16 @@ fn local_tools_for_context(mcp_context: Option<&LocalMcpContext>) -> Vec<OpenAIC
 }
 
 fn local_mcp_tool_catalog(mcp_context: Option<&LocalMcpContext>) -> Option<LocalMcpToolCatalog> {
+    local_mcp_tool_catalog_for_policy(mcp_context, LocalToolPolicy::Normal)
+}
+
+fn local_mcp_tool_catalog_for_policy(
+    mcp_context: Option<&LocalMcpContext>,
+    tool_policy: LocalToolPolicy,
+) -> Option<LocalMcpToolCatalog> {
+    if tool_policy.is_plan() {
+        return None;
+    }
     if !FeatureFlag::LocalAgentMcp.is_enabled() {
         return None;
     }
@@ -1746,11 +1908,53 @@ fn todo_write_tool_definition() -> OpenAIChatTool {
     }
 }
 
+fn exit_plan_mode_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "exit_plan_mode".to_string(),
+            description: "Finish plan mode by presenting the complete plan to the user for review. This does not execute any changes.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "Complete proposed plan in markdown or plain text. Must be non-empty and bounded."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional short label for the plan."
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
 async fn execute_local_tool_batch(
     tool_calls: Vec<OpenAIChatToolCall>,
     cwd: Option<PathBuf>,
     suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
     mcp_tool_catalog: Option<Arc<LocalMcpToolCatalog>>,
+) -> Vec<(OpenAIChatToolCall, LocalToolExecutionResult)> {
+    execute_local_tool_batch_with_policy(
+        tool_calls,
+        cwd,
+        suggested_shell_commands,
+        mcp_tool_catalog,
+        LocalToolPolicy::Normal,
+    )
+    .await
+}
+
+async fn execute_local_tool_batch_with_policy(
+    tool_calls: Vec<OpenAIChatToolCall>,
+    cwd: Option<PathBuf>,
+    suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
+    mcp_tool_catalog: Option<Arc<LocalMcpToolCatalog>>,
+    tool_policy: LocalToolPolicy,
 ) -> Vec<(OpenAIChatToolCall, LocalToolExecutionResult)> {
     #[cfg(test)]
     let feature_flag_overrides = warp_core::features::get_overrides();
@@ -1769,11 +1973,12 @@ async fn execute_local_tool_batch(
             let result = tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result = execute_local_tool(
+                let result = execute_local_tool_with_policy(
                     &tool_call,
                     cwd.as_deref(),
                     &suggested_shell_commands,
                     mcp_tool_catalog.as_deref(),
+                    tool_policy,
                 );
                 (tool_call, result)
             })
@@ -1786,7 +1991,7 @@ async fn execute_local_tool_batch(
                     )),
                 )
             });
-            let should_pause_for_action = result.1.pending_tool_call;
+            let should_pause_for_action = result.1.pending_tool_call || result.1.exits_plan_mode;
             results.push(result);
             if should_pause_for_action {
                 break;
@@ -1806,11 +2011,12 @@ async fn execute_local_tool_batch(
             match tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result = execute_local_tool(
+                let result = execute_local_tool_with_policy(
                     &tool_call,
                     cwd.as_deref(),
                     &suggested_shell_commands,
                     mcp_tool_catalog.as_deref(),
+                    tool_policy,
                 );
                 (tool_call, result)
             })
@@ -1838,6 +2044,7 @@ fn is_mutating_local_tool(name: &str) -> bool {
 
 fn is_sequential_local_tool(name: &str, mcp_tool_catalog: Option<&LocalMcpToolCatalog>) -> bool {
     is_mutating_local_tool(name)
+        || name == "exit_plan_mode"
         || name.starts_with("mcp__")
         || mcp_tool_catalog.is_some_and(|catalog| catalog.find_openai_name(name).is_some())
 }
@@ -1847,6 +2054,7 @@ struct LocalToolExecutionResult {
     apply_file_diff_summary: Option<ApplyFileDiffSummary>,
     todo_operations: Vec<api::message::update_todos::Operation>,
     pending_tool_call: bool,
+    exits_plan_mode: bool,
 }
 
 struct McpLocalToolExecutionResult {
@@ -1861,6 +2069,7 @@ impl LocalToolExecutionResult {
             apply_file_diff_summary: None,
             todo_operations: Vec::new(),
             pending_tool_call: false,
+            exits_plan_mode: false,
         }
     }
 }
@@ -1871,6 +2080,26 @@ fn execute_local_tool(
     suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
 ) -> LocalToolExecutionResult {
+    execute_local_tool_with_policy(
+        tool_call,
+        cwd,
+        suggested_shell_commands,
+        mcp_tool_catalog,
+        LocalToolPolicy::Normal,
+    )
+}
+
+fn execute_local_tool_with_policy(
+    tool_call: &OpenAIChatToolCall,
+    cwd: Option<&Path>,
+    suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+    tool_policy: LocalToolPolicy,
+) -> LocalToolExecutionResult {
+    if let Some(error) = tool_policy.denied_tool_error(&tool_call.function.name) {
+        return LocalToolExecutionResult::tool_error(error);
+    }
+
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd)
             .map(|text| (text, None, Vec::new(), false)),
@@ -1898,6 +2127,8 @@ fn execute_local_tool(
             .map(|text| (text, None, Vec::new(), true)),
         "todo_write" => execute_todo_write_tool(&tool_call.function.arguments)
             .map(|result| (result.text, None, result.operations, false)),
+        "exit_plan_mode" => execute_exit_plan_mode_tool(&tool_call.function.arguments)
+            .map(|text| (text, None, Vec::new(), false)),
         "suggest_shell_command" => match suggested_shell_commands.lock() {
             Ok(mut suggested_shell_commands) => execute_suggest_shell_command_tool(
                 &tool_call.function.arguments,
@@ -1928,6 +2159,8 @@ fn execute_local_tool(
         } else {
             pending_tool_call
         },
+        exits_plan_mode: tool_call.function.name == "exit_plan_mode"
+            && !text.starts_with("Tool error:"),
     }
 }
 
@@ -1988,6 +2221,52 @@ struct TodoWriteItem {
 struct TodoWriteResult {
     text: String,
     operations: Vec<api::message::update_todos::Operation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExitPlanModeArgs {
+    plan: String,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+fn execute_exit_plan_mode_tool(arguments: &str) -> anyhow::Result<String> {
+    let args: ExitPlanModeArgs =
+        serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid exit_plan_mode arguments"))?;
+    let plan = args.plan.trim();
+    if plan.is_empty() {
+        return Err(anyhow!("exit_plan_mode plan must not be empty"));
+    }
+    if plan.chars().count() > MAX_LOCAL_DIRECT_PLAN_CHARS {
+        return Err(anyhow!(
+            "exit_plan_mode plan exceeds {MAX_LOCAL_DIRECT_PLAN_CHARS} characters"
+        ));
+    }
+    let summary = args
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
+    if summary
+        .map(|summary| summary.chars().count() > MAX_LOCAL_DIRECT_PLAN_SUMMARY_CHARS)
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "exit_plan_mode summary exceeds {MAX_LOCAL_DIRECT_PLAN_SUMMARY_CHARS} characters"
+        ));
+    }
+
+    let mut text = String::new();
+    if let Some(summary) = summary {
+        text.push_str(summary);
+        text.push_str("\n\n");
+    }
+    text.push_str("Plan ready for review:\n\n");
+    text.push_str(plan);
+    text.push_str(
+        "\n\nNo changes were executed. Review the plan and send a normal follow-up when ready to proceed.",
+    );
+    Ok(text)
 }
 
 fn execute_todo_write_tool(arguments: &str) -> anyhow::Result<TodoWriteResult> {
@@ -4220,26 +4499,30 @@ mod tests {
     use super::{
         agent_output_content_events, chat_completions_url, drain_sse_events,
         empty_local_provider_response_resolution, execute_apply_file_diff_tool,
-        execute_edit_file_tool, execute_glob_tool, execute_grep_tool, execute_list_directory_tool,
-        execute_local_tool, execute_local_tool_batch, execute_read_file_tool,
-        execute_run_shell_command_tool, execute_suggest_shell_command_tool,
+        execute_edit_file_tool, execute_exit_plan_mode_tool, execute_glob_tool, execute_grep_tool,
+        execute_list_directory_tool, execute_local_tool, execute_local_tool_batch,
+        execute_local_tool_batch_with_policy, execute_local_tool_with_policy,
+        execute_read_file_tool, execute_run_shell_command_tool, execute_suggest_shell_command_tool,
         execute_todo_write_tool, execute_write_file_tool, fallback_tool_results_message,
         generate_openai_compatible_output, is_mutating_local_tool, local_mcp_tool_catalog,
         local_read_only_tools, local_shell_action_result, local_tool_result_summary, local_tools,
-        local_tools_for_context, mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        local_tools_for_context, local_tools_for_context_with_policy,
+        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
         mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
-        openai_messages_from_inputs_and_tasks, root_task_id, shell_command_result_for_provider,
-        stream_finished_done, structured_mcp_tool_call_event, structured_tool_call_event,
-        todo_update_events, truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
+        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
+        root_task_id, shell_command_result_for_provider, stream_finished_done,
+        structured_mcp_tool_call_event, structured_tool_call_event, todo_update_events,
+        truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, EmptyLocalProviderResponseResolution,
-        LocalDirectConfig, LocalMcpContext, LocalUsageTelemetry, OpenAIChatRequest,
-        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
-        OpenAIToolCallAccumulator, OpenAIUsageTokenDetails, RequestMode,
-        LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
+        LocalDirectConfig, LocalMcpContext, LocalToolPolicy, LocalUsageTelemetry,
+        OpenAIChatContent, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
+        OpenAIStreamEvent, OpenAIStreamUsage, OpenAIToolCallAccumulator, OpenAIUsageTokenDetails,
+        RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
         MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
         MAX_LOCAL_DIRECT_MCP_RESULT_BYTES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
-        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
-        MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        MAX_LOCAL_DIRECT_PLAN_CHARS, MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES,
+        MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS, MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS,
+        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -4248,7 +4531,7 @@ mod tests {
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
         AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, CallMCPToolResult,
-        MCPContext, MCPServer, RequestCommandOutputResult,
+        MCPContext, MCPServer, RequestCommandOutputResult, UserQueryMode,
     };
     use crate::features::FeatureFlag;
     use crate::persistence::model::PRIMARY_AGENT_CATEGORY;
@@ -4256,6 +4539,7 @@ mod tests {
     use base64::{engine::general_purpose, Engine as _};
     use chrono::{Local, TimeZone};
     use futures_util::StreamExt as _;
+    use serde_json::json;
     use std::{
         collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
@@ -4821,6 +5105,99 @@ mod tests {
     }
 
     #[test]
+    fn local_plan_mode_policy_is_feature_gated_by_plan_query() {
+        let mut input = user_query_input("investigate first", Vec::new(), HashMap::new());
+        let AIAgentInput::UserQuery {
+            user_query_mode, ..
+        } = &mut input
+        else {
+            panic!("expected user query");
+        };
+        *user_query_mode = UserQueryMode::Plan;
+
+        let _flag_disabled = FeatureFlag::LocalAgentPlanMode.override_enabled(false);
+        assert_eq!(
+            LocalToolPolicy::from_inputs(&[input]),
+            LocalToolPolicy::Normal
+        );
+        drop(_flag_disabled);
+
+        let mut input = user_query_input("investigate first", Vec::new(), HashMap::new());
+        let AIAgentInput::UserQuery {
+            user_query_mode, ..
+        } = &mut input
+        else {
+            panic!("expected user query");
+        };
+        *user_query_mode = UserQueryMode::Plan;
+        let _flag_enabled = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        assert_eq!(
+            LocalToolPolicy::from_inputs(&[input]),
+            LocalToolPolicy::Plan
+        );
+    }
+
+    #[test]
+    fn local_plan_mode_advertises_only_allowed_tools_and_denies_mcp_catalog() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+
+        let names =
+            local_tools_for_context_with_policy(Some(&local_context), LocalToolPolicy::Plan)
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "grep",
+                "glob",
+                "suggest_shell_command",
+                "list_directory",
+                "exit_plan_mode",
+            ]
+        );
+        assert!(super::local_mcp_tool_catalog_for_policy(
+            Some(&local_context),
+            LocalToolPolicy::Plan
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn local_plan_mode_system_prompt_is_injected() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let mut input = user_query_input("inspect", Vec::new(), HashMap::new());
+        let AIAgentInput::UserQuery {
+            user_query_mode, ..
+        } = &mut input
+        else {
+            panic!("expected user query");
+        };
+        *user_query_mode = UserQueryMode::Plan;
+
+        let messages = openai_messages_from_inputs_and_tasks_with_policy(
+            &[input],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Plan,
+        )
+        .unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(system_prompt.contains("You are in plan mode"));
+    }
+
+    #[test]
     fn local_agent_mcp_without_context_does_not_advertise_mcp_tools() {
         let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
         let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(false);
@@ -5011,6 +5388,88 @@ mod tests {
         assert!(result.text.contains("Status: unavailable"));
         assert!(result.text.contains("Server: filesystem"));
         assert!(result.text.contains("Tool: read_path"));
+    }
+
+    #[test]
+    fn local_plan_mode_denies_direct_forbidden_tool_calls_without_side_effects() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("target.txt");
+        std::fs::write(&file, "old\n").unwrap();
+
+        let write = execute_local_tool_with_policy(
+            &tool_call(
+                "write_file",
+                r#"{"path":"target.txt","content":"new\n","overwrite":true}"#,
+            ),
+            Some(temp_dir.path()),
+            &suggestions,
+            None,
+            LocalToolPolicy::Plan,
+        );
+        assert!(write.text.contains("unavailable in plan mode"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+
+        let todo = execute_local_tool_with_policy(
+            &tool_call(
+                "todo_write",
+                r#"{"todos":[{"id":"one","content":"One","status":"in_progress"}]}"#,
+            ),
+            Some(temp_dir.path()),
+            &suggestions,
+            None,
+            LocalToolPolicy::Plan,
+        );
+        assert!(todo.text.contains("unavailable in plan mode"));
+        assert!(todo.todo_operations.is_empty());
+    }
+
+    #[test]
+    fn local_plan_mode_denies_mcp_even_when_provider_emits_hidden_name() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let catalog = local_mcp_tool_catalog(Some(&local_context)).unwrap();
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+
+        let result = execute_local_tool_with_policy(
+            &tool_call("mcp__filesystem__read_path", r#"{"path":"Cargo.toml"}"#),
+            None,
+            &suggestions,
+            Some(&catalog),
+            LocalToolPolicy::Plan,
+        );
+
+        assert!(!result.pending_tool_call);
+        assert!(result.text.contains("unavailable in plan mode"));
+        assert!(!result.text.contains("requires user approval"));
+    }
+
+    #[test]
+    fn exit_plan_mode_validates_and_returns_assistant_visible_plan() {
+        let empty = execute_exit_plan_mode_tool(r#"{"plan":"  "}"#).unwrap_err();
+        assert!(empty.to_string().contains("plan must not be empty"));
+
+        let oversized = execute_exit_plan_mode_tool(
+            &json!({
+                "plan": "x".repeat(MAX_LOCAL_DIRECT_PLAN_CHARS + 1)
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(oversized.to_string().contains("plan exceeds"));
+
+        let output = execute_exit_plan_mode_tool(
+            r#"{"summary":"Implementation plan","plan":"1. Inspect\n2. Patch\n3. Test"}"#,
+        )
+        .unwrap();
+        assert!(output.contains("Implementation plan"));
+        assert!(output.contains("Plan ready for review"));
+        assert!(output.contains("1. Inspect"));
+        assert!(output.contains("No changes were executed"));
     }
 
     #[test]
@@ -6148,6 +6607,37 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.function.name, "mcp__filesystem__read_path");
         assert!(results[0].1.pending_tool_call);
+        assert!(!temp_dir.path().join("created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn execute_local_tool_batch_stops_at_exit_plan_mode_before_later_mutations() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let results = execute_local_tool_batch_with_policy(
+            vec![
+                tool_call(
+                    "exit_plan_mode",
+                    r#"{"plan":"1. Make the change\n2. Test"}"#,
+                ),
+                tool_call(
+                    "write_file",
+                    r#"{"path":"created.txt","content":"created\n"}"#,
+                ),
+            ],
+            Some(temp_dir.path().to_path_buf()),
+            suggestions,
+            None,
+            LocalToolPolicy::Plan,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.function.name, "exit_plan_mode");
+        assert!(results[0].1.exits_plan_mode);
         assert!(!temp_dir.path().join("created.txt").exists());
     }
 

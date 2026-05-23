@@ -2784,6 +2784,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LocalAgentCostTelemetry,
         #[cfg(feature = "local_agent_todo_write")]
         FeatureFlag::LocalAgentTodoWrite,
+        #[cfg(feature = "local_agent_plan_mode")]
+        FeatureFlag::LocalAgentPlanMode,
         #[cfg(feature = "interactive_conversation_management_view")]
         FeatureFlag::InteractiveConversationManagementView,
         #[cfg(feature = "agent_tips")]
