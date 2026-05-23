@@ -585,6 +585,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to surface provider token usage and local cost estimates.
     LocalAgentCostTelemetry,
 
+    /// Enables local OpenAI-compatible agents to maintain the conversation todo list.
+    LocalAgentTodoWrite,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 
