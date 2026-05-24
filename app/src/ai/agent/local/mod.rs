@@ -44,8 +44,8 @@ use crate::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, CallMCPToolResult, ImageContext, MCPContext, RequestCommandOutputResult,
-        UserQueryMode,
+        AIAgentInput, AIAgentTodo, AIAgentTodoId, CallMCPToolResult, ImageContext, MCPContext,
+        RequestCommandOutputResult, UserQueryMode,
     },
     features::FeatureFlag,
     persistence::model::PRIMARY_AGENT_CATEGORY,
@@ -54,6 +54,7 @@ use crate::{
         is_supported_image_mime_type, normalize_image_for_agent, ProcessImageResult,
         MAX_IMAGE_COUNT_FOR_QUERY, MAX_IMAGE_SIZE_BYTES,
     },
+    AIAgentTodoList,
 };
 
 #[derive(Clone, PartialEq)]
@@ -1347,7 +1348,12 @@ fn openai_messages_from_inputs_and_tasks_with_policy(
     tool_policy: LocalToolPolicy,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let system_prompt = if tool_policy.is_plan() {
-        format!("{LOCAL_DIRECT_SYSTEM_PROMPT}\n\n{LOCAL_DIRECT_PLAN_MODE_PROMPT}")
+        let mut prompt = format!("{LOCAL_DIRECT_SYSTEM_PROMPT}\n\n{LOCAL_DIRECT_PLAN_MODE_PROMPT}");
+        if let Some(todo_context) = local_plan_mode_todo_context(tasks) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&todo_context);
+        }
+        prompt
     } else {
         LOCAL_DIRECT_SYSTEM_PROMPT.to_string()
     };
@@ -3769,6 +3775,89 @@ fn local_context_text(input: &[AIAgentInput]) -> Option<String> {
     })
 }
 
+fn local_plan_mode_todo_context(tasks: &[api::Task]) -> Option<String> {
+    let todo_list = local_todo_list_from_tasks(tasks)?;
+    let snapshot = local_todo_list_snapshot_text(&todo_list);
+    Some(format!(
+        "The current todo list is read-only context for plan mode and must not be edited directly.\n\n{}",
+        snapshot
+    ))
+}
+
+fn local_todo_list_from_tasks(tasks: &[api::Task]) -> Option<AIAgentTodoList> {
+    let root_task = root_task(tasks)?;
+    let mut todo_list = AIAgentTodoList::default();
+    let mut saw_todo_update = false;
+
+    for message in &root_task.messages {
+        let Some(api::message::Message::UpdateTodos(update)) = &message.message else {
+            continue;
+        };
+        let Some(operation) = &update.operation else {
+            continue;
+        };
+        saw_todo_update = true;
+        match operation {
+            api::message::update_todos::Operation::CreateTodoList(create) => {
+                todo_list.update_pending_items(
+                    create
+                        .initial_todos
+                        .iter()
+                        .map(|todo| {
+                            AIAgentTodo::new(
+                                AIAgentTodoId::from(todo.id.clone()),
+                                todo.title.clone(),
+                                todo.description.clone(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            api::message::update_todos::Operation::UpdatePendingTodos(update_pending_todos) => {
+                todo_list.update_pending_items(
+                    update_pending_todos
+                        .updated_pending_todos
+                        .iter()
+                        .map(|todo| {
+                            AIAgentTodo::new(
+                                AIAgentTodoId::from(todo.id.clone()),
+                                todo.title.clone(),
+                                todo.description.clone(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            api::message::update_todos::Operation::MarkTodosCompleted(completed) => {
+                todo_list.mark_todos_complete(completed.todo_ids.clone());
+            }
+        }
+    }
+
+    saw_todo_update.then_some(todo_list)
+}
+
+fn local_todo_list_snapshot_text(todo_list: &AIAgentTodoList) -> String {
+    let mut lines = vec!["Current todo list snapshot:".to_string()];
+    if !todo_list.completed_items().is_empty() {
+        lines.push("Completed todos:".to_string());
+        for todo in todo_list.completed_items() {
+            lines.push(format!("- {}: {}", todo.id, todo.title));
+        }
+    }
+    if !todo_list.pending_items().is_empty() {
+        lines.push("Pending todos:".to_string());
+        for (index, todo) in todo_list.pending_items().iter().enumerate() {
+            if index == 0 {
+                lines.push(format!("- In progress: {}: {}", todo.id, todo.title));
+            } else {
+                lines.push(format!("- Pending: {}: {}", todo.id, todo.title));
+            }
+        }
+    }
+    truncate_message_content(&lines.join("\n"), 4096)
+}
+
 fn context_sections_from_input(input: &AIAgentInput) -> Vec<String> {
     input_contexts(input)
         .into_iter()
@@ -4691,6 +4780,32 @@ mod tests {
         }
     }
 
+    fn task_with_todo_list(initial_todos: Vec<api::TodoItem>) -> api::Task {
+        let messages = vec![api::Message {
+            id: "todo-message".to_string(),
+            task_id: "root".to_string(),
+            request_id: "request-1".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::UpdateTodos(
+                api::message::UpdateTodos {
+                    operation: Some(api::message::update_todos::Operation::CreateTodoList(
+                        api::CreateTodoList { initial_todos },
+                    )),
+                },
+            )),
+        }];
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
     fn first_stream_init_conversation_id(
         conversation_token: Option<ServerConversationToken>,
     ) -> String {
@@ -5195,6 +5310,45 @@ mod tests {
             panic!("expected text system prompt");
         };
         assert!(system_prompt.contains("You are in plan mode"));
+    }
+
+    #[test]
+    fn local_plan_mode_includes_read_only_todo_snapshot_context() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let tasks = vec![task_with_todo_list(vec![
+            api::TodoItem {
+                id: "todo-1".to_string(),
+                title: "Inspect repo".to_string(),
+                description: String::new(),
+            },
+            api::TodoItem {
+                id: "todo-2".to_string(),
+                title: "Write summary".to_string(),
+                description: String::new(),
+            },
+        ])];
+        let input = [user_query_input(
+            "plan next steps",
+            Vec::new(),
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks_with_policy(
+            &input,
+            &tasks,
+            None,
+            true,
+            LocalToolPolicy::Plan,
+        )
+        .unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(system_prompt.contains("Current todo list snapshot"));
+        assert!(system_prompt.contains("Inspect repo"));
+        assert!(system_prompt.contains("Write summary"));
+        assert!(system_prompt.contains("read-only context for plan mode"));
     }
 
     #[test]
