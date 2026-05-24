@@ -1,6 +1,7 @@
 mod apply_file_diff;
 mod mcp_tools;
 mod pricing;
+mod skills;
 mod tool_card;
 
 use std::{
@@ -38,6 +39,7 @@ use self::{
     },
 };
 use mcp_tools::{mcp_tool_catalog, LocalMcpToolCatalog};
+use skills::{local_invoked_skill_context, local_skill_metadata_context};
 
 use crate::{
     ai::agent::{
@@ -1355,7 +1357,15 @@ fn openai_messages_from_inputs_and_tasks_with_policy(
         }
         prompt
     } else {
-        LOCAL_DIRECT_SYSTEM_PROMPT.to_string()
+        let mut prompt = LOCAL_DIRECT_SYSTEM_PROMPT.to_string();
+        if FeatureFlag::LocalAgentSkills.is_enabled() {
+            let cwd = local_tool_cwd(input);
+            if let Some(todo_context) = local_skill_metadata_context(cwd.as_deref()) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&todo_context);
+            }
+        }
+        prompt
     };
     let mut messages = vec![openai_message("system", system_prompt)];
     let mcp_tool_catalog = local_mcp_tool_catalog_for_policy(mcp_context, tool_policy);
@@ -1402,6 +1412,9 @@ fn openai_messages_from_inputs_and_tasks_with_policy(
     let mut user_query = truncate_message_content(&user_query, MAX_LOCAL_DIRECT_MESSAGE_CHARS);
     if let Some(context) = local_context_text(input) {
         user_query = format!("{context}\n\nUser message:\n{user_query}");
+    }
+    if let Some(skill_context) = local_invoked_skill_context(input) {
+        user_query = format!("{skill_context}\n\nUser message:\n{user_query}");
     }
     let should_push_user_message = if local_images.is_empty() {
         messages
@@ -4621,7 +4634,7 @@ mod tests {
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
         AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, CallMCPToolResult,
-        MCPContext, MCPServer, RequestCommandOutputResult, UserQueryMode,
+        InvokeSkillUserQuery, MCPContext, MCPServer, RequestCommandOutputResult, UserQueryMode,
     };
     use crate::features::FeatureFlag;
     use crate::persistence::model::PRIMARY_AGENT_CATEGORY;
@@ -4632,6 +4645,8 @@ mod tests {
     use serde_json::json;
     use std::{
         collections::{HashMap, HashSet},
+        fs,
+        path::Path,
         sync::{Arc, Mutex},
     };
     use uuid::Uuid;
@@ -4639,6 +4654,24 @@ mod tests {
     use warp_editor::render::model::LineCount;
     use warp_multi_agent_api as api;
     use warp_terminal::model::BlockId;
+
+    fn write_claude_skill(
+        root: &Path,
+        name: &str,
+        frontmatter_name: &str,
+        description: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let skill_dir = root.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_path,
+            format!("---\nname: {frontmatter_name}\ndescription: {description}\n---\n{body}\n"),
+        )
+        .unwrap();
+        skill_path
+    }
 
     fn tool_call(name: &str, arguments: &str) -> OpenAIChatToolCall {
         OpenAIChatToolCall {
@@ -7914,6 +7947,134 @@ mod tests {
         assert!(!serde_json::to_string(&messages)
             .unwrap()
             .contains("data:image"));
+    }
+
+    #[test]
+    fn local_skills_flag_off_omits_metadata_from_system_prompt() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_claude_skill(
+            temp_dir.path(),
+            "debug-app",
+            "debug-app",
+            "Debugs app failures",
+            "Full skill body must stay out.",
+        );
+        let _flag = FeatureFlag::LocalAgentSkills.override_enabled(false);
+        let input = user_query_input(
+            "hello",
+            vec![AIAgentContext::Directory {
+                pwd: Some(temp_dir.path().to_string_lossy().to_string()),
+                home_dir: None,
+                are_file_symbols_indexed: false,
+            }],
+            HashMap::new(),
+        );
+
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(!system_prompt.contains("debug-app"));
+        assert!(!system_prompt.contains("Debugs app failures"));
+        assert!(!system_prompt.contains("Full skill body must stay out"));
+    }
+
+    #[test]
+    fn local_skills_metadata_includes_project_skill_without_full_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_claude_skill(
+            temp_dir.path(),
+            "debug-app",
+            "debug-app",
+            "Debugs app failures",
+            "Full skill body must stay out.",
+        );
+        let _flag = FeatureFlag::LocalAgentSkills.override_enabled(true);
+        let input = user_query_input(
+            "hello",
+            vec![AIAgentContext::Directory {
+                pwd: Some(temp_dir.path().to_string_lossy().to_string()),
+                home_dir: None,
+                are_file_symbols_indexed: false,
+            }],
+            HashMap::new(),
+        );
+
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(system_prompt.contains("/debug-app (project): Debugs app failures"));
+        assert!(!system_prompt.contains("Full skill body must stay out"));
+    }
+
+    #[test]
+    fn local_skills_invalid_frontmatter_is_skipped() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_claude_skill(
+            temp_dir.path(),
+            "debug-app",
+            "DebugApp",
+            "Debugs app failures",
+            "Invalid name body.",
+        );
+        write_claude_skill(
+            temp_dir.path(),
+            "long-description",
+            "long-description",
+            &"x".repeat(201),
+            "Invalid description body.",
+        );
+        let _flag = FeatureFlag::LocalAgentSkills.override_enabled(true);
+        let input = user_query_input(
+            "hello",
+            vec![AIAgentContext::Directory {
+                pwd: Some(temp_dir.path().to_string_lossy().to_string()),
+                home_dir: None,
+                are_file_symbols_indexed: false,
+            }],
+            HashMap::new(),
+        );
+
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(!system_prompt.contains("DebugApp"));
+        assert!(!system_prompt.contains("long-description"));
+    }
+
+    #[test]
+    fn local_skill_invocation_loads_full_content_and_preserves_user_query() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let skill_path = write_claude_skill(
+            temp_dir.path(),
+            "debug-app",
+            "debug-app",
+            "Debugs app failures",
+            "Full skill instructions for this invocation.",
+        );
+        let skill = ai::skills::parse_skill(&skill_path).unwrap();
+        let _flag = FeatureFlag::LocalAgentSkills.override_enabled(true);
+        let input = AIAgentInput::InvokeSkill {
+            context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+            skill,
+            user_query: Some(InvokeSkillUserQuery {
+                query: "inspect failing test".to_string(),
+                referenced_attachments: HashMap::new(),
+            }),
+        };
+
+        let messages = openai_messages_from_inputs_and_tasks(&[input], &[], None, true).unwrap();
+
+        let OpenAIChatContent::Text(user_message) = &messages.last().unwrap().content else {
+            panic!("expected text user message");
+        };
+        assert!(user_message.contains("Full skill instructions for this invocation."));
+        assert!(user_message.contains("User message:\n/debug-app inspect failing test"));
     }
 
     #[test]
