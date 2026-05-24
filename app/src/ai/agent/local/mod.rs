@@ -3799,6 +3799,7 @@ fn local_todo_list_from_tasks(tasks: &[api::Task]) -> Option<AIAgentTodoList> {
         saw_todo_update = true;
         match operation {
             api::message::update_todos::Operation::CreateTodoList(create) => {
+                todo_list = AIAgentTodoList::default();
                 todo_list.update_pending_items(
                     create
                         .initial_todos
@@ -4806,6 +4807,36 @@ mod tests {
         }
     }
 
+    fn task_with_todo_operations(
+        operations: Vec<api::message::update_todos::Operation>,
+    ) -> api::Task {
+        let messages = operations
+            .into_iter()
+            .enumerate()
+            .map(|(index, operation)| api::Message {
+                id: format!("todo-message-{index}"),
+                task_id: "root".to_string(),
+                request_id: format!("request-{index}"),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UpdateTodos(
+                    api::message::UpdateTodos {
+                        operation: Some(operation),
+                    },
+                )),
+            })
+            .collect();
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
     fn first_stream_init_conversation_id(
         conversation_token: Option<ServerConversationToken>,
     ) -> String {
@@ -5349,6 +5380,58 @@ mod tests {
         assert!(system_prompt.contains("Inspect repo"));
         assert!(system_prompt.contains("Write summary"));
         assert!(system_prompt.contains("read-only context for plan mode"));
+    }
+
+    #[test]
+    fn local_plan_mode_todo_snapshot_respects_full_list_replacement() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let tasks = vec![task_with_todo_operations(vec![
+            api::message::update_todos::Operation::CreateTodoList(api::CreateTodoList {
+                initial_todos: vec![
+                    api::TodoItem {
+                        id: "stale-completed".to_string(),
+                        title: "Old completed todo".to_string(),
+                        description: String::new(),
+                    },
+                    api::TodoItem {
+                        id: "old-pending".to_string(),
+                        title: "Old pending todo".to_string(),
+                        description: String::new(),
+                    },
+                ],
+            }),
+            api::message::update_todos::Operation::MarkTodosCompleted(api::MarkTodosCompleted {
+                todo_ids: vec!["stale-completed".to_string()],
+            }),
+            api::message::update_todos::Operation::CreateTodoList(api::CreateTodoList {
+                initial_todos: vec![api::TodoItem {
+                    id: "new-todo".to_string(),
+                    title: "New replacement todo".to_string(),
+                    description: String::new(),
+                }],
+            }),
+        ])];
+        let input = [user_query_input(
+            "plan next steps",
+            Vec::new(),
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks_with_policy(
+            &input,
+            &tasks,
+            None,
+            true,
+            LocalToolPolicy::Plan,
+        )
+        .unwrap();
+
+        let OpenAIChatContent::Text(system_prompt) = &messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert!(system_prompt.contains("New replacement todo"));
+        assert!(!system_prompt.contains("Old completed todo"));
+        assert!(!system_prompt.contains("Old pending todo"));
     }
 
     #[test]
