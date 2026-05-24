@@ -579,6 +579,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to consume existing Warp MCP server lifecycle context.
     LocalAgentMcp,
 
+    /// Enables local OpenAI-compatible agents to discover and load local Claude-style skills.
+    LocalAgentSkills,
+
     /// Enables local OpenAI-compatible agents to pass user-attached images to vision-capable providers.
     LocalAgentImageInput,
 
