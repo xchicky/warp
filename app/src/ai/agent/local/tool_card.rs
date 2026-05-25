@@ -5,7 +5,10 @@ use serde_json::Value;
 use warp_multi_agent_api as api;
 
 use super::{
-    apply_file_diff::ApplyFileDiffSummary, mcp_tools::LocalMcpToolCatalogEntry, OpenAIChatToolCall,
+    apply_file_diff::ApplyFileDiffSummary,
+    codebase_index::{build_search_codebase_tool_call, search_codebase_result_from_text},
+    mcp_tools::LocalMcpToolCatalogEntry,
+    OpenAIChatToolCall,
 };
 
 pub(super) fn structured_tool_card_events(
@@ -57,6 +60,9 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         "list_directory" => Some(api::message::tool_call::Tool::FileGlobV2(
             build_list_directory_tool_call(arguments),
         )),
+        "search_codebase" => Some(api::message::tool_call::Tool::SearchCodebase(
+            build_search_codebase_tool_call(arguments),
+        )),
         "apply_file_diff" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
             build_apply_file_diffs_tool_call(arguments),
         )),
@@ -101,6 +107,9 @@ fn build_tool_call_result(
         )),
         "glob" | "list_directory" => Some(api::message::tool_call_result::Result::FileGlobV2(
             file_glob_result_from_text(result),
+        )),
+        "search_codebase" => Some(api::message::tool_call_result::Result::SearchCodebase(
+            search_codebase_result_from_text(result),
         )),
         "apply_file_diff" => Some(api::message::tool_call_result::Result::ApplyFileDiffs(
             apply_file_diffs_result_from_text(result, apply_file_diff_summary),
