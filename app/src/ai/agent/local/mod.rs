@@ -7543,7 +7543,7 @@ mod tests {
             "Index: local lexical in-memory\n",
             "Scope: src\n",
             "Files indexed: 1\n",
-            "Skipped: large_files=0, binary_files=0, generated_paths=0, limit_exceeded=false\n",
+            "Skipped: large_files=0, binary_files=0, non_utf8_files=0, generated_paths=0, limit_exceeded=false\n",
             "Results: 1\n\n",
             "1. Path: src/lib.rs\n",
             "Line: 3\n",

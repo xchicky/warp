@@ -58,6 +58,7 @@ struct FileStamp {
 struct IndexSkipped {
     large_files: usize,
     binary_files: usize,
+    non_utf8_files: usize,
     generated_paths: usize,
     limit_exceeded: bool,
 }
@@ -107,7 +108,7 @@ pub(super) fn execute_search_codebase_tool(
         .lock()
         .map_err(|_| anyhow!("Local codebase index cache is unavailable"))?;
     if let Some(index) = cache.get(&cache_key) {
-        let current_manifest = scan_manifest(&scope)?;
+        let current_manifest = scan_manifest(&root, &scope)?;
         if current_manifest != index.manifest {
             cache.remove(&cache_key);
             return Ok(format!(
@@ -298,7 +299,10 @@ fn collect_index_files(
         skipped.binary_files += 1;
         return Ok(());
     }
-    let text = String::from_utf8(bytes).map_err(|_| anyhow!("non-UTF-8 file skipped"))?;
+    let Ok(text) = String::from_utf8(bytes) else {
+        skipped.non_utf8_files += 1;
+        return Ok(());
+    };
     *total_bytes += metadata.len();
     let relative_path = canonical
         .strip_prefix(root)
@@ -312,44 +316,21 @@ fn collect_index_files(
     Ok(())
 }
 
-fn scan_manifest(scope: &Path) -> anyhow::Result<BTreeMap<PathBuf, FileStamp>> {
+fn scan_manifest(root: &Path, scope: &Path) -> anyhow::Result<BTreeMap<PathBuf, FileStamp>> {
+    let mut files = Vec::new();
     let mut manifest = BTreeMap::new();
-    scan_manifest_inner(scope, 0, &mut manifest)?;
+    let mut skipped = IndexSkipped::default();
+    let mut total_bytes = 0u64;
+    collect_index_files(
+        root,
+        scope,
+        0,
+        &mut files,
+        &mut manifest,
+        &mut skipped,
+        &mut total_bytes,
+    )?;
     Ok(manifest)
-}
-
-fn scan_manifest_inner(
-    path: &Path,
-    depth: usize,
-    manifest: &mut BTreeMap<PathBuf, FileStamp>,
-) -> anyhow::Result<()> {
-    if depth > MAX_DEPTH || manifest.len() >= MAX_INDEX_FILES {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        if is_generated_path(path) {
-            return Ok(());
-        }
-        let mut entries = fs::read_dir(path)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        entries.sort();
-        for entry in entries {
-            scan_manifest_inner(&entry, depth + 1, manifest)?;
-        }
-    } else if metadata.is_file() {
-        let canonical = path.canonicalize()?;
-        manifest.insert(
-            canonical,
-            FileStamp {
-                modified: metadata.modified().ok(),
-                len: metadata.len(),
-            },
-        );
-    }
-    Ok(())
 }
 
 fn search_index(
@@ -396,11 +377,12 @@ fn search_index(
     hits.truncate(max_results);
 
     let mut output = format!(
-        "Status: ready\nIndex: local lexical in-memory\nScope: {}\nFiles indexed: {}\nSkipped: large_files={}, binary_files={}, generated_paths={}, limit_exceeded={}\nResults: {}\n",
+        "Status: ready\nIndex: local lexical in-memory\nScope: {}\nFiles indexed: {}\nSkipped: large_files={}, binary_files={}, non_utf8_files={}, generated_paths={}, limit_exceeded={}\nResults: {}\n",
         relative_scope_for_display(&index.root, &index.scope),
         index.files.len(),
         index.skipped.large_files,
         index.skipped.binary_files,
+        index.skipped.non_utf8_files,
         index.skipped.generated_paths,
         index.skipped.limit_exceeded,
         hits.len()
@@ -576,6 +558,49 @@ mod tests {
 
         assert!(result.contains("large_files=1"));
         assert!(result.contains("binary_files=1"));
+    }
+
+    #[test]
+    fn non_utf8_files_are_skipped_without_aborting_index() {
+        clear_codebase_index_cache_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "src/lib.rs", b"fn target() {}\n");
+        write_file(
+            root.path(),
+            "invalid.txt",
+            &[0xff, 0xfe, b't', b'e', b'x', b't'],
+        );
+
+        let result =
+            execute_search_codebase_tool(r#"{"query":"target"}"#, Some(root.path())).unwrap();
+
+        assert!(result.contains("Status: ready"));
+        assert!(result.contains("non_utf8_files=1"));
+        assert!(result.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn total_byte_cap_does_not_make_unchanged_index_immediately_stale() {
+        clear_codebase_index_cache_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let file_count_over_cap = (MAX_INDEX_BYTES / MAX_FILE_BYTES) + 1;
+        for index in 0..file_count_over_cap {
+            write_file(
+                root.path(),
+                &format!("src/{index:03}.txt"),
+                &vec![b'a'; MAX_FILE_BYTES as usize],
+            );
+        }
+
+        let first =
+            execute_search_codebase_tool(r#"{"query":"missing"}"#, Some(root.path())).unwrap();
+        assert!(first.contains("Status: ready"));
+        assert!(first.contains("limit_exceeded=true"));
+
+        let second =
+            execute_search_codebase_tool(r#"{"query":"missing"}"#, Some(root.path())).unwrap();
+        assert!(second.contains("Status: ready"));
+        assert!(!second.contains("Status: stale"));
     }
 
     #[test]
