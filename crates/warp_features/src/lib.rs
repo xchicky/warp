@@ -588,6 +588,9 @@ pub enum FeatureFlag {
     /// Enables local OpenAI-compatible agents to build and search a local-only codebase index.
     LocalAgentCodebaseIndex,
 
+    /// Enables local OpenAI-compatible agents to delegate bounded work to isolated local subagents.
+    LocalAgentSubagent,
+
     /// Enables local OpenAI-compatible agents to pass user-attached images to vision-capable providers.
     LocalAgentImageInput,
 
