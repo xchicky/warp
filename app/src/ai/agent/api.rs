@@ -26,7 +26,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::{
     ai::{
         blocklist::SessionContext,
-        llms::{LLMId, LLMPreferences, LLMProvider},
+        llms::{local_openai_model_from_llm_id, LLMId, LLMPreferences, LLMProvider},
     },
     server::server_api::AIApiError,
 };
@@ -153,12 +153,14 @@ fn local_openai_direct_config_for_model(
     vision_supported: bool,
 ) -> Option<super::local::LocalDirectConfig> {
     let (api_key, base_url, model) = api_keys.local_openai_config()?;
-    (model_id.as_str() == model).then(|| super::local::LocalDirectConfig {
-        api_key: api_key.to_string(),
-        base_url: base_url.to_string(),
-        model: model.to_string(),
-        vision_supported,
-        cost_telemetry: Default::default(),
+    (local_openai_model_from_llm_id(model_id) == Some(model)).then(|| {
+        super::local::LocalDirectConfig {
+            api_key: api_key.to_string(),
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            vision_supported,
+            cost_telemetry: Default::default(),
+        }
     })
 }
 
@@ -395,7 +397,7 @@ impl RequestParams {
 #[cfg(test)]
 mod tests {
     use super::local_openai_direct_config_for_model;
-    use crate::ai::llms::LLMId;
+    use crate::ai::llms::{local_openai_llm_id, LLMId};
 
     #[test]
     fn local_direct_config_uses_dedicated_local_openai_fields() {
@@ -409,9 +411,12 @@ mod tests {
             ..Default::default()
         };
 
-        let config =
-            local_openai_direct_config_for_model(&keys, &LLMId::from("qwen2.5-coder"), false)
-                .expect("expected local direct config");
+        let config = local_openai_direct_config_for_model(
+            &keys,
+            &local_openai_llm_id("qwen2.5-coder"),
+            false,
+        )
+        .expect("expected local direct config");
 
         assert_eq!(config.api_key, "local-key");
         assert_eq!(config.base_url, "http://localhost:11434/v1");
@@ -436,6 +441,42 @@ mod tests {
     }
 
     #[test]
+    fn local_direct_config_does_not_route_hosted_id_when_local_model_name_matches() {
+        let keys = ai::api_keys::ApiKeys {
+            openai: Some("hosted-openai-key".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            local_openai_model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            local_openai_direct_config_for_model(&keys, &LLMId::from("gpt-4o"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn local_direct_config_routes_namespaced_local_id_to_raw_provider_model() {
+        let keys = ai::api_keys::ApiKeys {
+            openai: Some("hosted-openai-key".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            local_openai_model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        let config =
+            local_openai_direct_config_for_model(&keys, &local_openai_llm_id("gpt-4o"), true)
+                .expect("expected namespaced local direct config");
+
+        assert_eq!(config.api_key, "local-key");
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        assert_eq!(config.model, "gpt-4o");
+        assert!(config.vision_supported);
+    }
+
+    #[test]
     fn local_direct_config_preserves_legacy_openai_triple_fallback() {
         let keys = ai::api_keys::ApiKeys {
             openai: Some("legacy-local-key".to_string()),
@@ -444,9 +485,12 @@ mod tests {
             ..Default::default()
         };
 
-        let config =
-            local_openai_direct_config_for_model(&keys, &LLMId::from("legacy-local-model"), true)
-                .expect("expected legacy local direct config");
+        let config = local_openai_direct_config_for_model(
+            &keys,
+            &local_openai_llm_id("legacy-local-model"),
+            true,
+        )
+        .expect("expected legacy local direct config");
 
         assert_eq!(config.api_key, "legacy-local-key");
         assert_eq!(config.base_url, "http://localhost:11434/v1");
