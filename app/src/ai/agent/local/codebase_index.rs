@@ -52,6 +52,7 @@ struct IndexedFile {
 struct FileStamp {
     modified: Option<SystemTime>,
     len: u64,
+    fingerprint: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -277,32 +278,30 @@ fn collect_index_files(
         bail!("search_codebase path escapes the current workspace root");
     }
 
-    manifest.insert(
-        canonical.clone(),
-        FileStamp {
-            modified: metadata.modified().ok(),
-            len: metadata.len(),
-        },
-    );
-
     if metadata.len() > MAX_FILE_BYTES {
+        manifest.insert(canonical.clone(), file_stamp(&metadata, None));
         skipped.large_files += 1;
         return Ok(());
     }
     if *total_bytes + metadata.len() > MAX_INDEX_BYTES {
+        manifest.insert(canonical.clone(), file_stamp(&metadata, None));
         skipped.limit_exceeded = true;
         return Ok(());
     }
 
     let bytes = fs::read(&canonical)?;
     if is_binary(&bytes) {
+        manifest.insert(canonical.clone(), file_stamp(&metadata, None));
         skipped.binary_files += 1;
         return Ok(());
     }
+    let fingerprint = content_fingerprint(&bytes);
     let Ok(text) = String::from_utf8(bytes) else {
+        manifest.insert(canonical.clone(), file_stamp(&metadata, None));
         skipped.non_utf8_files += 1;
         return Ok(());
     };
+    manifest.insert(canonical.clone(), file_stamp(&metadata, Some(fingerprint)));
     *total_bytes += metadata.len();
     let relative_path = canonical
         .strip_prefix(root)
@@ -426,6 +425,22 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(4096).any(|byte| *byte == 0)
 }
 
+fn file_stamp(metadata: &fs::Metadata, fingerprint: Option<u64>) -> FileStamp {
+    FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        fingerprint,
+    }
+}
+
+fn content_fingerprint(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -497,6 +512,7 @@ pub(super) fn clear_codebase_index_cache_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn write_file(root: &Path, relative: &str, content: &[u8]) -> PathBuf {
         let path = root.join(relative);
@@ -506,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn path_scope_rejects_parent_and_symlink_escape() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -522,6 +539,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn search_results_are_bounded_and_deterministic() {
         clear_codebase_index_cache_for_tests();
         let root = tempfile::tempdir().unwrap();
@@ -540,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn large_and_binary_files_are_skipped_with_bounded_metadata() {
         clear_codebase_index_cache_for_tests();
         let root = tempfile::tempdir().unwrap();
@@ -561,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn non_utf8_files_are_skipped_without_aborting_index() {
         clear_codebase_index_cache_for_tests();
         let root = tempfile::tempdir().unwrap();
@@ -580,6 +600,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn total_byte_cap_does_not_make_unchanged_index_immediately_stale() {
         clear_codebase_index_cache_for_tests();
         let root = tempfile::tempdir().unwrap();
@@ -604,6 +625,98 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn total_byte_cap_skipped_file_stays_in_manifest_metadata_only() {
+        clear_codebase_index_cache_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let included = write_file(
+            root.path(),
+            "src/000.txt",
+            &vec![b'a'; MAX_FILE_BYTES as usize],
+        );
+        let capped = write_file(
+            root.path(),
+            "src/001.txt",
+            &vec![b'b'; MAX_FILE_BYTES as usize],
+        );
+        let mut files = Vec::new();
+        let mut manifest = BTreeMap::new();
+        let mut skipped = IndexSkipped::default();
+        let mut total_bytes = MAX_INDEX_BYTES - MAX_FILE_BYTES - 1;
+
+        collect_index_files(
+            &root.path().canonicalize().unwrap(),
+            &root.path().join("src"),
+            0,
+            &mut files,
+            &mut manifest,
+            &mut skipped,
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert!(skipped.limit_exceeded);
+        assert_eq!(
+            manifest
+                .get(&included.canonicalize().unwrap())
+                .unwrap()
+                .fingerprint,
+            Some(content_fingerprint(&vec![b'a'; MAX_FILE_BYTES as usize]))
+        );
+        assert_eq!(
+            manifest
+                .get(&capped.canonicalize().unwrap())
+                .unwrap()
+                .fingerprint,
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unchanged_index_remains_ready_on_second_search() {
+        clear_codebase_index_cache_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "src/lib.rs", b"alpha\n");
+
+        let first =
+            execute_search_codebase_tool(r#"{"query":"alpha"}"#, Some(root.path())).unwrap();
+        let second =
+            execute_search_codebase_tool(r#"{"query":"alpha"}"#, Some(root.path())).unwrap();
+
+        assert!(first.contains("Status: ready"));
+        assert!(second.contains("Status: ready"));
+        assert!(!second.contains("Status: stale"));
+    }
+
+    #[test]
+    #[serial]
+    fn same_length_rewrite_is_detected_via_fingerprint() {
+        clear_codebase_index_cache_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let path = write_file(root.path(), "src/lib.rs", b"alpha\n");
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let first =
+            execute_search_codebase_tool(r#"{"query":"alpha"}"#, Some(root.path())).unwrap();
+        assert!(first.contains("Status: ready"));
+
+        fs::write(&path, b"bravo\n").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let second =
+            execute_search_codebase_tool(r#"{"query":"bravo"}"#, Some(root.path())).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), b"alpha\n".len() as u64);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            original_modified
+        );
+        assert!(second.contains("Status: stale"));
+    }
+
+    #[test]
+    #[serial]
     fn stale_index_state_is_provider_visible() {
         clear_codebase_index_cache_for_tests();
         let root = tempfile::tempdir().unwrap();
@@ -620,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn local_index_module_does_not_reference_cloud_store() {
         let source = include_str!("codebase_index.rs");
 
