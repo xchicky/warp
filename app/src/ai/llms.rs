@@ -564,6 +564,23 @@ fn custom_llm_info(display_prefix: &str, model: &str, provider: LLMProvider) -> 
     }
 }
 
+const LOCAL_OPENAI_LLM_ID_PREFIX: &str = "local-openai:";
+
+pub(crate) fn local_openai_llm_id(model: &str) -> LLMId {
+    format!("{LOCAL_OPENAI_LLM_ID_PREFIX}{model}").into()
+}
+
+pub(crate) fn local_openai_model_from_llm_id(id: &LLMId) -> Option<&str> {
+    id.as_str().strip_prefix(LOCAL_OPENAI_LLM_ID_PREFIX)
+}
+
+fn local_openai_llm_info(model: &str) -> LLMInfo {
+    LLMInfo {
+        id: local_openai_llm_id(model),
+        ..custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)
+    }
+}
+
 fn is_custom_model_info(info: &LLMInfo) -> bool {
     info.display_name.starts_with("Custom OpenAI:")
         || info.display_name.starts_with("Custom Anthropic:")
@@ -615,11 +632,8 @@ fn add_custom_models(models: &mut ModelsByFeature, api_keys: &ai::api_keys::ApiK
 
     let custom_models = [
         api_keys
-            .openai
-            .as_ref()
-            .zip(api_keys.openai_base_url.as_ref())
-            .and(api_keys.openai_model.as_deref())
-            .map(|model| custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)),
+            .local_openai_config()
+            .map(|(_, _, model)| local_openai_llm_info(model)),
         api_keys
             .anthropic
             .as_ref()

@@ -127,15 +127,82 @@ fn llm_info_round_trip_serializes_and_deserializes() {
 fn add_custom_models_makes_local_openai_the_default_agent_model() {
     let mut models = ModelsByFeature::default();
     let api_keys = ai::api_keys::ApiKeys {
-        openai: Some("local-key".to_string()),
-        openai_base_url: Some("http://localhost:11434/v1".to_string()),
-        openai_model: Some("qwen2.5-coder".to_string()),
+        local_openai_api_key: Some("local-key".to_string()),
+        local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+        local_openai_model: Some("qwen2.5-coder".to_string()),
         ..Default::default()
     };
 
     add_custom_models(&mut models, &api_keys);
 
     let default = models.agent_mode.default_llm_info();
-    assert_eq!(default.id, LLMId::from("qwen2.5-coder"));
+    assert_eq!(default.id, local_openai_llm_id("qwen2.5-coder"));
     assert_eq!(default.display_name, "Local OpenAI: qwen2.5-coder");
+}
+
+#[test]
+fn add_custom_models_allows_hosted_openai_key_to_coexist_with_local_openai() {
+    let mut models = ModelsByFeature::default();
+    let api_keys = ai::api_keys::ApiKeys {
+        openai: Some("hosted-openai-key".to_string()),
+        local_openai_api_key: Some("local-key".to_string()),
+        local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+        local_openai_model: Some("qwen2.5-coder".to_string()),
+        ..Default::default()
+    };
+
+    add_custom_models(&mut models, &api_keys);
+
+    let default = models.agent_mode.default_llm_info();
+    assert_eq!(default.id, local_openai_llm_id("qwen2.5-coder"));
+    assert_eq!(default.display_name, "Local OpenAI: qwen2.5-coder");
+}
+
+#[test]
+fn add_custom_models_preserves_legacy_local_openai_fallback() {
+    let mut models = ModelsByFeature::default();
+    let api_keys = ai::api_keys::ApiKeys {
+        openai: Some("legacy-local-key".to_string()),
+        openai_base_url: Some("http://localhost:11434/v1".to_string()),
+        openai_model: Some("legacy-local-model".to_string()),
+        ..Default::default()
+    };
+
+    add_custom_models(&mut models, &api_keys);
+
+    let default = models.agent_mode.default_llm_info();
+    assert_eq!(default.id, local_openai_llm_id("legacy-local-model"));
+    assert_eq!(default.display_name, "Local OpenAI: legacy-local-model");
+}
+
+#[test]
+fn add_custom_models_namespaces_local_openai_id_when_model_matches_hosted_id() {
+    let mut models = ModelsByFeature::default();
+    models.agent_mode.choices.push(custom_llm_info(
+        "Hosted OpenAI",
+        "gpt-4o",
+        LLMProvider::OpenAI,
+    ));
+    let api_keys = ai::api_keys::ApiKeys {
+        local_openai_api_key: Some("local-key".to_string()),
+        local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+        local_openai_model: Some("gpt-4o".to_string()),
+        ..Default::default()
+    };
+
+    add_custom_models(&mut models, &api_keys);
+
+    let default = models.agent_mode.default_llm_info();
+    assert_eq!(default.id, local_openai_llm_id("gpt-4o"));
+    assert_eq!(default.display_name, "Local OpenAI: gpt-4o");
+    assert!(models
+        .agent_mode
+        .choices
+        .iter()
+        .any(|choice| choice.id == LLMId::from("gpt-4o")));
+    assert!(models
+        .agent_mode
+        .choices
+        .iter()
+        .any(|choice| choice.id == local_openai_llm_id("gpt-4o")));
 }

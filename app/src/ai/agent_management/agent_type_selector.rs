@@ -117,8 +117,7 @@ impl AgentTypeSelector {
             cloud_agent_mouse_state: MouseStateHandle::default(),
             local_agent_mouse_state: MouseStateHandle::default(),
             dialog_mouse_state: MouseStateHandle::default(),
-            // Cloud agent is selected by default (index 0).
-            selected_option_index: 0,
+            selected_option_index: 1,
         }
     }
 
@@ -335,7 +334,7 @@ impl AgentTypeSelector {
             Icon::OzCloud,
             "Cloud agent",
             "Runs autonomously in a cloud environment you choose. Best for parallel or long-running work.",
-            true,
+            false,
             self.cloud_agent_mouse_state.clone(),
             AgentTypeSelectorAction::SelectCloudAgent,
             appearance,
@@ -346,7 +345,7 @@ impl AgentTypeSelector {
             Icon::Oz,
             "Local agent",
             "Runs on your machine and requires supervision. Best for quick, interactive tasks.",
-            false,
+            true,
             self.local_agent_mouse_state.clone(),
             AgentTypeSelectorAction::SelectLocalAgent,
             appearance,

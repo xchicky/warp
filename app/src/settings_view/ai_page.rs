@@ -6308,8 +6308,9 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
 
 struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
-    openai_base_url_editor: ViewHandle<EditorView>,
-    openai_model_editor: ViewHandle<EditorView>,
+    local_openai_api_key_editor: ViewHandle<EditorView>,
+    local_openai_base_url_editor: ViewHandle<EditorView>,
+    local_openai_model_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     anthropic_base_url_editor: ViewHandle<EditorView>,
     anthropic_model_editor: ViewHandle<EditorView>,
@@ -6327,8 +6328,9 @@ impl ApiKeysWidget {
             openai: openai_key,
             anthropic: anthropic_key,
             google: google_key,
-            openai_base_url,
-            openai_model,
+            local_openai_api_key,
+            local_openai_base_url,
+            local_openai_model,
             anthropic_base_url,
             anthropic_model,
             ..
@@ -6393,17 +6395,24 @@ impl ApiKeysWidget {
             true
         );
         create_api_key_editor!(
-            openai_base_url_editor,
-            openai_base_url,
-            set_openai_base_url,
+            local_openai_api_key_editor,
+            local_openai_api_key,
+            set_local_openai_api_key,
+            "local-api-key",
+            true
+        );
+        create_api_key_editor!(
+            local_openai_base_url_editor,
+            local_openai_base_url,
+            set_local_openai_base_url,
             "http://localhost:11434/v1",
             false
         );
         create_api_key_editor!(
-            openai_model_editor,
-            openai_model,
-            set_openai_model,
-            "gpt-4o",
+            local_openai_model_editor,
+            local_openai_model,
+            set_local_openai_model,
+            "llama3.1",
             false
         );
         create_api_key_editor!(
@@ -6437,8 +6446,9 @@ impl ApiKeysWidget {
 
         Self {
             openai_api_key_editor,
-            openai_base_url_editor,
-            openai_model_editor,
+            local_openai_api_key_editor,
+            local_openai_base_url_editor,
+            local_openai_model_editor,
             anthropic_api_key_editor,
             anthropic_base_url_editor,
             anthropic_model_editor,
@@ -6519,20 +6529,6 @@ impl ApiKeysWidget {
         ));
         column.add_child(render_api_key_input(
             appearance,
-            "OpenAI-compatible Base URL",
-            self.openai_base_url_editor.clone(),
-            is_enabled,
-            app,
-        ));
-        column.add_child(render_api_key_input(
-            appearance,
-            "OpenAI-compatible Model",
-            self.openai_model_editor.clone(),
-            is_enabled,
-            app,
-        ));
-        column.add_child(render_api_key_input(
-            appearance,
             "Anthropic API Key",
             self.anthropic_api_key_editor.clone(),
             is_enabled,
@@ -6556,6 +6552,90 @@ impl ApiKeysWidget {
             appearance,
             "Google API Key",
             self.google_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+
+        column.finish()
+    }
+
+    fn render_local_openai_section(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+        is_byo_enabled: bool,
+    ) -> Box<dyn Element> {
+        let ai_settings = AISettings::as_ref(app);
+        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(app);
+        let is_enabled = is_any_ai_enabled && is_byo_enabled;
+
+        let mut column = Flex::column()
+            .with_spacing(16.)
+            .with_child(
+                Container::new(render_ai_setting_description(
+                    "Connect a local or self-hosted OpenAI-compatible agent provider such as Ollama, LM Studio, or vLLM. This config is stored locally and is separate from the hosted OpenAI API key.",
+                    is_enabled,
+                    app,
+                ))
+                .with_margin_bottom(-styles::DESCRIPTION_MARGIN_BOTTOM)
+                .finish(),
+            );
+
+        fn render_local_input(
+            appearance: &Appearance,
+            label: &'static str,
+            editor: ViewHandle<EditorView>,
+            is_enabled: bool,
+            app: &AppContext,
+        ) -> Box<dyn Element> {
+            let padding = Some(Coords {
+                top: 10.,
+                bottom: 10.,
+                left: 16.,
+                right: 16.,
+            });
+            let editor_style = UiComponentStyles {
+                padding,
+                background: Some(appearance.theme().surface_2().into()),
+                ..Default::default()
+            };
+
+            let label = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                .with_color(styles::header_font_color(is_enabled, app).into())
+                .finish();
+
+            let input = appearance
+                .ui_builder()
+                .text_input(editor)
+                .with_style(editor_style)
+                .build()
+                .finish();
+
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(label)
+                .with_child(input)
+                .finish()
+        }
+
+        column.add_child(render_local_input(
+            appearance,
+            "Local API Key",
+            self.local_openai_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_local_input(
+            appearance,
+            "Base URL",
+            self.local_openai_base_url_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_local_input(
+            appearance,
+            "Model",
+            self.local_openai_model_editor.clone(),
             is_enabled,
             app,
         ));
@@ -6597,7 +6677,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "api keys bring your own byo openai anthropic google claude gemini gpt local openai-compatible ollama lm studio vllm"
     }
 
     fn render(
@@ -6620,6 +6700,25 @@ impl SettingsWidget for ApiKeysWidget {
                 .finish(),
             )
             .with_child(self.render_api_keys_section(appearance, app, true));
+
+        column.add_child(
+            Container::new(
+                Flex::column()
+                    .with_child(
+                        build_sub_header(
+                            appearance,
+                            "Local OpenAI-compatible Agent",
+                            Some(styles::header_font_color(is_any_ai_enabled, app)),
+                        )
+                        .with_padding_bottom(HEADER_PADDING)
+                        .finish(),
+                    )
+                    .with_child(self.render_local_openai_section(appearance, app, true))
+                    .finish(),
+            )
+            .with_margin_top(16.)
+            .finish(),
+        );
 
         column.add_child(
             Container::new(self.render_can_use_warp_credits_with_byok_toggle(view, app))
