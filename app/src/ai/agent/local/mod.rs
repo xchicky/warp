@@ -2465,6 +2465,7 @@ async fn execute_spawn_subagent_tool(
                     messages.push(openai_tool_message(tool_call.id, error));
                     continue;
                 }
+                let tool_name = tool_call.function.name.clone();
                 let result = execute_local_tool_with_policy(
                     &tool_call,
                     cwd,
@@ -2472,17 +2473,17 @@ async fn execute_spawn_subagent_tool(
                     mcp_tool_catalog,
                     tool_policy,
                 );
-                let tool_name = tool_call.function.name.clone();
-                let tool_result = if result.exits_plan_mode {
-                    "Child subagents cannot exit parent plan mode.".to_string()
-                } else if result.pending_tool_call {
-                    format!(
-                        "Subagent stopped because tool '{}' requires visible parent approval; synchronous M5.3 V0 does not auto-approve or hide approval actions.",
-                        tool_name
-                    )
-                } else {
-                    result.text
-                };
+                if result.exits_plan_mode || result.pending_tool_call {
+                    return Ok(local_subagent_result_text(
+                        &invocation,
+                        "approval_required",
+                        &format!(
+                            "Subagent stopped because tool '{tool_name}' requires parent control or visible approval. M5.3 V0 does not auto-approve child actions."
+                        ),
+                        &executed_tools,
+                    ));
+                }
+                let tool_result = result.text;
                 executed_tools.push(tool_name);
                 messages.push(openai_tool_message(tool_call.id, tool_result));
             }
@@ -2591,9 +2592,16 @@ fn child_allowed_subagent_tools(
         .into_iter()
         .filter(|tool| {
             let name = tool.function.name.as_str();
-            name != "spawn_subagent" && name != "exit_plan_mode" && tool_policy.allows_tool(name)
+            !is_subagent_forbidden_tool(name) && tool_policy.allows_tool(name)
         })
         .collect()
+}
+
+fn is_subagent_forbidden_tool(name: &str) -> bool {
+    is_mutating_local_tool(name)
+        || name == "spawn_subagent"
+        || name == "exit_plan_mode"
+        || name.starts_with("mcp__")
 }
 
 fn local_subagent_messages(
@@ -2603,7 +2611,7 @@ fn local_subagent_messages(
     let mode = if tool_policy.is_plan() {
         "Parent plan mode is active. You are a read-only planning/research child. Do not execute changes, call MCP tools, run shell commands, update todos, or call exit_plan_mode."
     } else {
-        "Use only the tools explicitly advertised to this child. Risky or mutating tools still follow the parent policy and visible approval gates."
+        "Use only the tools explicitly advertised to this child. Mutating and out-of-band approval tools are not advertised in M5.3 V0."
     };
     let mut user = format!(
         "Child task:\n{}\n\nExplicit context from parent:\n{}",
@@ -2690,7 +2698,7 @@ async fn drain_local_subagent_response(
         let events = sse_events_from_chunk(&mut pending, &mut bytes_read, chunk)?;
         for event in events {
             match event {
-                OpenAIStreamEvent::Delta(token) | OpenAIStreamEvent::ReasoningDelta(token) => {
+                OpenAIStreamEvent::Delta(token) => {
                     content.push_str(&token);
                     if content.chars().count() > MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS {
                         content = truncate_message_content(
@@ -2699,6 +2707,7 @@ async fn drain_local_subagent_response(
                         );
                     }
                 }
+                OpenAIStreamEvent::ReasoningDelta(_) => {}
                 OpenAIStreamEvent::ToolCallDelta(delta) => {
                     tool_call_accumulator.push(delta);
                 }
@@ -2717,9 +2726,10 @@ async fn drain_local_subagent_response(
         pending.push('\n');
         for event in drain_sse_events(&mut pending)? {
             match event {
-                OpenAIStreamEvent::Delta(token) | OpenAIStreamEvent::ReasoningDelta(token) => {
+                OpenAIStreamEvent::Delta(token) => {
                     content.push_str(&token);
                 }
+                OpenAIStreamEvent::ReasoningDelta(_) => {}
                 OpenAIStreamEvent::ToolCallDelta(delta) => {
                     tool_call_accumulator.push(delta);
                 }
@@ -6528,6 +6538,50 @@ mod tests {
     }
 
     #[test]
+    fn local_subagent_excludes_mutating_and_out_of_band_tools_even_when_parent_has_flags() {
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let _web_flag = FeatureFlag::LocalAgentWeb.override_enabled(true);
+        let _mcp_flag = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let parent_tools =
+            local_tools_for_context_with_policy(Some(&local_context), LocalToolPolicy::Normal);
+        let child_tools =
+            child_allowed_subagent_tools(parent_tools.clone(), LocalToolPolicy::Normal)
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>();
+
+        assert!(child_tools.iter().any(|name| name == "read_file"));
+        assert!(child_tools.iter().any(|name| name == "web_search"));
+        for forbidden in [
+            "write_file",
+            "edit_file",
+            "apply_file_diff",
+            "todo_write",
+            "run_shell_command",
+            "mcp__filesystem__read_path",
+            "spawn_subagent",
+            "exit_plan_mode",
+        ] {
+            assert!(
+                !child_tools.iter().any(|name| name == forbidden),
+                "{forbidden} should not be advertised to child"
+            );
+            let error = build_local_subagent_invocation(
+                &json!({"task":"Inspect", "tools":[forbidden]}).to_string(),
+                parent_tools.clone(),
+                LocalToolPolicy::Normal,
+                0,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unavailable or forbidden"));
+        }
+    }
+
+    #[test]
     fn local_subagent_plan_mode_denies_mutating_tools_and_exit_plan_mode() {
         let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
         let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
@@ -6598,6 +6652,38 @@ mod tests {
 
         assert!(result.chars().count() <= MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS);
         assert!(result.contains("Subagent status: completed"));
+    }
+
+    #[test]
+    fn child_reasoning_delta_is_not_returned_in_parent_summary() {
+        let mut pending = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden chain\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"visible answer\"}}]}\n",
+            "data: [DONE]\n"
+        )
+        .to_string();
+        let mut content = String::new();
+        for event in drain_sse_events(&mut pending).unwrap() {
+            match event {
+                OpenAIStreamEvent::Delta(token) => content.push_str(&token),
+                OpenAIStreamEvent::ReasoningDelta(_) => {}
+                OpenAIStreamEvent::ToolCallDelta(_)
+                | OpenAIStreamEvent::Usage(_)
+                | OpenAIStreamEvent::Done => {}
+            }
+        }
+
+        let invocation = LocalSubagentInvocation {
+            child_conversation_id: "child".to_string(),
+            task: "Summarize".to_string(),
+            context: None,
+            label: None,
+            tools: Vec::new(),
+        };
+        let result = local_subagent_result_text(&invocation, "completed", &content, &[]);
+
+        assert!(result.contains("visible answer"));
+        assert!(!result.contains("hidden chain"));
     }
 
     #[test]
