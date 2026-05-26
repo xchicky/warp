@@ -30,6 +30,9 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    pub local_openai_api_key: Option<String>,
+    pub local_openai_base_url: Option<String>,
+    pub local_openai_model: Option<String>,
     pub openai_base_url: Option<String>,
     pub openai_model: Option<String>,
     pub anthropic_base_url: Option<String>,
@@ -45,7 +48,27 @@ impl ApiKeys {
     }
 
     pub fn has_any_local_api_key(&self) -> bool {
-        self.has_any_key()
+        self.has_any_key() || self.local_openai_api_key.is_some()
+    }
+
+    pub fn local_openai_config(&self) -> Option<(&str, &str, &str)> {
+        if self.local_openai_api_key.is_some()
+            || self.local_openai_base_url.is_some()
+            || self.local_openai_model.is_some()
+        {
+            return self
+                .local_openai_api_key
+                .as_deref()
+                .zip(self.local_openai_base_url.as_deref())
+                .zip(self.local_openai_model.as_deref())
+                .map(|((api_key, base_url), model)| (api_key, base_url, model));
+        }
+
+        self.openai
+            .as_deref()
+            .zip(self.openai_base_url.as_deref())
+            .zip(self.openai_model.as_deref())
+            .map(|((api_key, base_url), model)| (api_key, base_url, model))
     }
 }
 
@@ -165,6 +188,28 @@ impl ApiKeyManager {
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.open_router = non_empty_trimmed(key);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_api_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_openai_api_key = non_empty_trimmed(key);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_base_url(
+        &mut self,
+        base_url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.local_openai_base_url = non_empty_trimmed(base_url);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_openai_model = normalized_model_id(model);
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
@@ -299,7 +344,7 @@ impl SingletonEntity for ApiKeyManager {}
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_model_id, ApiKeyManager, ApiKeyProvider, AwsCredentialsState};
+    use super::{normalized_model_id, ApiKeyManager, ApiKeyProvider, ApiKeys, AwsCredentialsState};
 
     #[test]
     fn normalized_model_id_accepts_common_model_ids() {
@@ -350,5 +395,74 @@ name"
         assert!(keys.openai.is_empty());
         assert!(keys.google.is_empty());
         assert!(keys.open_router.is_empty());
+    }
+
+    #[test]
+    fn local_openai_config_prefers_dedicated_local_fields() {
+        let keys = ApiKeys {
+            openai: Some("hosted-openai-key".to_string()),
+            openai_base_url: Some("https://api.openai.com/v1".to_string()),
+            openai_model: Some("gpt-4o".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            local_openai_model: Some("qwen2.5-coder".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            keys.local_openai_config(),
+            Some(("local-key", "http://localhost:11434/v1", "qwen2.5-coder"))
+        );
+    }
+
+    #[test]
+    fn local_openai_config_falls_back_to_legacy_openai_triple() {
+        let keys = ApiKeys {
+            openai: Some("legacy-local-key".to_string()),
+            openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            openai_model: Some("qwen2.5-coder".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            keys.local_openai_config(),
+            Some((
+                "legacy-local-key",
+                "http://localhost:11434/v1",
+                "qwen2.5-coder"
+            ))
+        );
+    }
+
+    #[test]
+    fn hosted_openai_request_key_does_not_use_local_openai_key() {
+        let manager = ApiKeyManager {
+            keys: ApiKeys {
+                openai: Some("hosted-openai-key".to_string()),
+                local_openai_api_key: Some("local-key".to_string()),
+                local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+                local_openai_model: Some("qwen2.5-coder".to_string()),
+                ..Default::default()
+            },
+            aws_credentials_state: AwsCredentialsState::Missing,
+            aws_credentials_refresh_strategy: Default::default(),
+        };
+
+        let keys = manager
+            .api_keys_for_request(true, false, &[ApiKeyProvider::OpenAI])
+            .expect("expected hosted OpenAI provider key");
+
+        assert_eq!(keys.openai, "hosted-openai-key");
+    }
+
+    #[test]
+    fn local_openai_key_counts_as_local_availability() {
+        let keys = ApiKeys {
+            local_openai_api_key: Some("local-key".to_string()),
+            ..Default::default()
+        };
+
+        assert!(keys.has_any_local_api_key());
+        assert!(!keys.has_any_key());
     }
 }

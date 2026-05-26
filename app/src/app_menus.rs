@@ -1006,7 +1006,7 @@ fn make_new_elements_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
             Some(Keystroke::parse("cmd-t").expect("Valid keystroke")),
         )),
         MenuItem::Custom(CustomMenuItem::new(
-            "New Agent Tab",
+            "New Local Agent Tab",
             open_new_agent_tab_or_window,
             move |_props: &MenuItemProperties, ctx: &mut AppContext| {
                 let mut changes = MenuItemPropertyChanges::default();

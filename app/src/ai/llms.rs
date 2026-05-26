@@ -615,11 +615,8 @@ fn add_custom_models(models: &mut ModelsByFeature, api_keys: &ai::api_keys::ApiK
 
     let custom_models = [
         api_keys
-            .openai
-            .as_ref()
-            .zip(api_keys.openai_base_url.as_ref())
-            .and(api_keys.openai_model.as_deref())
-            .map(|model| custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)),
+            .local_openai_config()
+            .map(|(_, _, model)| custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)),
         api_keys
             .anthropic
             .as_ref()

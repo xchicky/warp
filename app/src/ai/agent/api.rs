@@ -147,6 +147,21 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 #[cfg(target_family = "wasm")]
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Event>>>;
 
+fn local_openai_direct_config_for_model(
+    api_keys: &ai::api_keys::ApiKeys,
+    model_id: &LLMId,
+    vision_supported: bool,
+) -> Option<super::local::LocalDirectConfig> {
+    let (api_key, base_url, model) = api_keys.local_openai_config()?;
+    (model_id.as_str() == model).then(|| super::local::LocalDirectConfig {
+        api_key: api_key.to_string(),
+        base_url: base_url.to_string(),
+        model: model.to_string(),
+        vision_supported,
+        cost_telemetry: Default::default(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationData {
     pub id: AIConversationId,
@@ -270,33 +285,15 @@ impl RequestParams {
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
             &model_providers,
         );
-        let local_direct_config = api_key_manager.keys().openai.as_ref().and_then(|api_key| {
-            api_key_manager
-                .keys()
-                .openai_base_url
-                .as_ref()
-                .and_then(|base_url| {
-                    api_key_manager
-                        .keys()
-                        .openai_model
-                        .as_ref()
-                        .and_then(|model| {
-                            (request_input.model_id.as_str() == model).then(|| {
-                                let vision_supported = llm_preferences
-                                    .get_llm_info(&request_input.model_id)
-                                    .map(|info| info.vision_supported)
-                                    .unwrap_or(true);
-                                super::local::LocalDirectConfig {
-                                    api_key: api_key.clone(),
-                                    base_url: base_url.clone(),
-                                    model: model.clone(),
-                                    vision_supported,
-                                    cost_telemetry: Default::default(),
-                                }
-                            })
-                        })
-                })
-        });
+        let vision_supported = llm_preferences
+            .get_llm_info(&request_input.model_id)
+            .map(|info| info.vision_supported)
+            .unwrap_or(true);
+        let local_direct_config = local_openai_direct_config_for_model(
+            api_key_manager.keys(),
+            &request_input.model_id,
+            vision_supported,
+        );
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
 
@@ -392,5 +389,68 @@ impl RequestParams {
             parent_agent_id: None,
             agent_name: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_openai_direct_config_for_model;
+    use crate::ai::llms::LLMId;
+
+    #[test]
+    fn local_direct_config_uses_dedicated_local_openai_fields() {
+        let keys = ai::api_keys::ApiKeys {
+            openai: Some("hosted-openai-key".to_string()),
+            openai_base_url: Some("https://api.openai.com/v1".to_string()),
+            openai_model: Some("gpt-4o".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            local_openai_model: Some("qwen2.5-coder".to_string()),
+            ..Default::default()
+        };
+
+        let config =
+            local_openai_direct_config_for_model(&keys, &LLMId::from("qwen2.5-coder"), false)
+                .expect("expected local direct config");
+
+        assert_eq!(config.api_key, "local-key");
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        assert_eq!(config.model, "qwen2.5-coder");
+        assert!(!config.vision_supported);
+    }
+
+    #[test]
+    fn local_direct_config_does_not_route_hosted_openai_model_when_local_model_differs() {
+        let keys = ai::api_keys::ApiKeys {
+            openai: Some("hosted-openai-key".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            local_openai_model: Some("qwen2.5-coder".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            local_openai_direct_config_for_model(&keys, &LLMId::from("gpt-4o"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn local_direct_config_preserves_legacy_openai_triple_fallback() {
+        let keys = ai::api_keys::ApiKeys {
+            openai: Some("legacy-local-key".to_string()),
+            openai_base_url: Some("http://localhost:11434/v1".to_string()),
+            openai_model: Some("legacy-local-model".to_string()),
+            ..Default::default()
+        };
+
+        let config =
+            local_openai_direct_config_for_model(&keys, &LLMId::from("legacy-local-model"), true)
+                .expect("expected legacy local direct config");
+
+        assert_eq!(config.api_key, "legacy-local-key");
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        assert_eq!(config.model, "legacy-local-model");
+        assert!(config.vision_supported);
     }
 }
