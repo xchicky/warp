@@ -2784,6 +2784,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LocalAgentWeb,
         #[cfg(feature = "local_agent_codebase_index")]
         FeatureFlag::LocalAgentCodebaseIndex,
+        #[cfg(feature = "local_agent_subagent")]
+        FeatureFlag::LocalAgentSubagent,
         #[cfg(feature = "local_agent_image_input")]
         FeatureFlag::LocalAgentImageInput,
         #[cfg(feature = "local_agent_cost_telemetry")]
