@@ -416,4 +416,33 @@ mod tests {
 
         assert!(error.to_string().contains("escapes"));
     }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn resource_symlink_escape_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_path = temp
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("debug-app")
+            .join("SKILL.md");
+        write_skill(temp.path(), "debug-app", "debug-app", "Debugs app", "Body.");
+        fs::write(temp.path().join("outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(
+            temp.path().join("outside.txt"),
+            temp.path()
+                .join(".claude")
+                .join("skills")
+                .join("debug-app")
+                .join("outside-link"),
+        )
+        .unwrap();
+        let skill = parse_skill(&skill_path).unwrap();
+
+        let error = resolve_local_skill_resource_path(&skill, "outside-link").unwrap_err();
+
+        assert!(error.to_string().contains("escapes"));
+    }
 }
