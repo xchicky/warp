@@ -25,6 +25,35 @@ fn create_small_test_png() -> Vec<u8> {
     bytes
 }
 
+fn create_small_test_jpeg() -> Vec<u8> {
+    use image::{ImageBuffer, Rgb};
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(10, 10, |_x, _y| Rgb([255u8, 0u8, 0u8]));
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut bytes);
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg).unwrap();
+    bytes
+}
+
+fn insert_jpeg_app1_segment(jpeg: &[u8], payload: &[u8]) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    let segment_len = u16::try_from(payload.len() + 2).unwrap();
+    let mut with_app1 = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+    with_app1.extend_from_slice(&jpeg[..2]);
+    with_app1.extend_from_slice(&[0xff, 0xe1]);
+    with_app1.extend_from_slice(&segment_len.to_be_bytes());
+    with_app1.extend_from_slice(payload);
+    with_app1.extend_from_slice(&jpeg[2..]);
+    with_app1
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 #[test]
 fn test_process_image_for_agent_small_image() {
     let small_png = create_small_test_png();
@@ -62,6 +91,24 @@ fn test_process_image_for_agent_invalid_data() {
         }
         other => panic!("Expected Error, got {:?}", other),
     }
+}
+
+#[test]
+fn test_normalize_image_for_agent_strips_jpeg_exif_location_metadata() {
+    let payload = b"Exif\0\0GPSLatitude=37.7749;GPSLongitude=-122.4194;CameraSerial=SECRET";
+    let jpeg = create_small_test_jpeg();
+    let jpeg_with_exif = insert_jpeg_app1_segment(&jpeg, payload);
+
+    assert!(bytes_contain(&jpeg_with_exif, payload));
+
+    let result = normalize_image_for_agent(&jpeg_with_exif, "image/jpeg");
+    let ProcessImageResult::Success { data } = result else {
+        panic!("Expected Success, got {:?}", result);
+    };
+
+    assert!(!bytes_contain(&data, b"GPSLatitude=37.7749"));
+    assert!(!bytes_contain(&data, b"GPSLongitude=-122.4194"));
+    assert!(!bytes_contain(&data, b"CameraSerial=SECRET"));
 }
 
 /// Creates a large test PNG image that exceeds MAX_IMAGE_PIXELS.
