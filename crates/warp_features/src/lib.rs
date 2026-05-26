@@ -979,6 +979,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::SoloUserByok,
     FeatureFlag::LocalAgentCostTelemetry,
     FeatureFlag::LocalAgentTodoWrite,
+    FeatureFlag::LocalAgentImageInput,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
