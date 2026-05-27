@@ -6,7 +6,7 @@ use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::blocklist::{AIQueryHistory, BlocklistAIPermissions};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
-use crate::ai::llms::LLMPreferences;
+use crate::ai::llms::{local_openai_llm_id, LLMId, LLMPreferences};
 use crate::ai::mcp::gallery::MCPGalleryManager;
 use crate::ai::mcp::templatable_manager::TemplatableMCPServerManager;
 use crate::ai::outline::RepoOutlines;
@@ -102,6 +102,7 @@ use crate::terminal::resizable_data::ResizableData;
 use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
 use crate::terminal::writeable_pty::command_history::update_command_history;
 use crate::{GlobalResourceHandles, GlobalResourceHandlesProvider, ReferralThemeStatus};
+use ai::api_keys::ApiKeyManager;
 
 pub fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
@@ -6052,6 +6053,126 @@ fn test_image_attachment_preserves_lock_state() {
             !unlocked_config.is_locked,
             "Auto-detection should be preserved when selecting image"
         );
+    });
+}
+
+#[test]
+fn local_agent_image_input_enables_ai_image_context_without_global_image_flag() {
+    let _global_image_context = FeatureFlag::ImageAsContext.override_enabled(false);
+    let _local_agent_image_input = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("local-vision".to_string()), ctx);
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            LLMPreferences::handle(ctx).update(ctx, |preferences, ctx| {
+                preferences.update_preferred_agent_mode_llm(
+                    &local_openai_llm_id("local-vision"),
+                    input.terminal_view_id,
+                    ctx,
+                );
+            });
+            input.ai_input_model().update(ctx, |ai_input, ctx| {
+                ai_input.set_input_config(
+                    InputConfig {
+                        input_type: InputType::AI,
+                        is_locked: false,
+                    },
+                    true,
+                    ctx,
+                );
+            });
+            input.update_image_context_options(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(input.should_show_image_context_button(ctx));
+            assert!(input.is_image_context_enabled(ctx));
+            assert!(!input.is_image_context_unsupported_model(ctx));
+        });
+    });
+}
+
+#[test]
+fn image_context_stays_disabled_without_global_or_local_image_flag() {
+    let _global_image_context = FeatureFlag::ImageAsContext.override_enabled(false);
+    let _local_agent_image_input = FeatureFlag::LocalAgentImageInput.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.ai_input_model().update(ctx, |ai_input, ctx| {
+                ai_input.set_input_config(
+                    InputConfig {
+                        input_type: InputType::AI,
+                        is_locked: false,
+                    },
+                    true,
+                    ctx,
+                );
+            });
+            input.update_image_context_options(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(!input.should_show_image_context_button(ctx));
+            assert!(!input.is_image_context_enabled(ctx));
+        });
+    });
+}
+
+#[test]
+fn local_agent_image_input_does_not_enable_hosted_model_image_context() {
+    let _global_image_context = FeatureFlag::ImageAsContext.override_enabled(false);
+    let _local_agent_image_input = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("local-vision".to_string()), ctx);
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            LLMPreferences::handle(ctx).update(ctx, |preferences, ctx| {
+                preferences.update_preferred_agent_mode_llm(
+                    &LLMId::from("auto"),
+                    input.terminal_view_id,
+                    ctx,
+                );
+            });
+            input.ai_input_model().update(ctx, |ai_input, ctx| {
+                ai_input.set_input_config(
+                    InputConfig {
+                        input_type: InputType::AI,
+                        is_locked: false,
+                    },
+                    true,
+                    ctx,
+                );
+            });
+            input.update_image_context_options(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(!input.should_show_image_context_button(ctx));
+            assert!(!input.is_image_context_enabled(ctx));
+        });
     });
 }
 
