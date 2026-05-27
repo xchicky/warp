@@ -139,7 +139,7 @@ use crate::{
             BLOCK_CONTEXT_ATTACHMENT_REGEX, DIFF_HUNK_ATTACHMENT_REGEX,
             DRIVE_OBJECT_ATTACHMENT_REGEX,
         },
-        llms::{LLMPreferences, LLMPreferencesEvent},
+        llms::{local_openai_model_from_llm_id, LLMPreferences, LLMPreferencesEvent},
         predict::{
             next_command_model::{
                 is_command_valid, is_next_command_enabled, NextCommandModel, NextCommandModelEvent,
@@ -2066,6 +2066,17 @@ enum Executing {
 }
 
 impl Input {
+    pub(super) fn image_attachments_available_for_ai_input(&self, app: &AppContext) -> bool {
+        FeatureFlag::ImageAsContext.is_enabled()
+            || (FeatureFlag::LocalAgentImageInput.is_enabled()
+                && local_openai_model_from_llm_id(
+                    &LLMPreferences::as_ref(app)
+                        .get_active_base_model(app, Some(self.terminal_view_id))
+                        .id,
+                )
+                .is_some())
+    }
+
     pub fn send_input_buffer_to_terminal_editor(
         &mut self,
         buffer_contents: Arc<String>,
@@ -5364,7 +5375,7 @@ impl Input {
 
         // Image context is available whenever the feature flag is enabled and we're in AI input
         // mode, including cloud mode
-        let image_context_options = if FeatureFlag::ImageAsContext.is_enabled()
+        let image_context_options = if self.image_attachments_available_for_ai_input(ctx)
             && matches!(ai_input_model.input_type(), InputType::AI)
         {
             ImageContextOptions::Enabled {
@@ -15265,6 +15276,24 @@ impl Input {}
 
 #[cfg(test)]
 impl Input {
+    pub fn is_image_context_enabled(&self, app: &AppContext) -> bool {
+        self.editor.as_ref(app).image_context_options.is_enabled()
+    }
+
+    pub fn should_show_image_context_button(&self, app: &AppContext) -> bool {
+        self.editor
+            .as_ref(app)
+            .image_context_options
+            .should_show_button()
+    }
+
+    pub fn is_image_context_unsupported_model(&self, app: &AppContext) -> bool {
+        self.editor
+            .as_ref(app)
+            .image_context_options
+            .is_unsupported_model()
+    }
+
     pub fn agent_footer_chip_kinds(
         &self,
         app: &AppContext,

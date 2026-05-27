@@ -113,7 +113,7 @@ impl Input {
 
         let ai_input_model = self.ai_input_model.as_ref(app);
 
-        if FeatureFlag::ImageAsContext.is_enabled()
+        if self.image_attachments_available_for_ai_input(app)
             && matches!(ai_input_model.input_type(), InputType::AI)
         {
             if let Some(images) = self.render_attachment_chips(appearance) {
@@ -625,7 +625,7 @@ impl Input {
             .with_main_axis_size(MainAxisSize::Min);
 
         let ai_input_model = self.ai_input_model.as_ref(app);
-        let show_chips = FeatureFlag::ImageAsContext.is_enabled()
+        let show_chips = self.image_attachments_available_for_ai_input(app)
             && matches!(ai_input_model.input_type(), InputType::AI);
         if show_chips {
             if let Some(chips) = self.render_attachment_chips(appearance) {

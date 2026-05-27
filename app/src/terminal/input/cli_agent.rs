@@ -8,7 +8,6 @@ use crate::{
     appearance::Appearance,
     context_chips::spacing,
     editor::TextColors,
-    features::FeatureFlag,
     terminal::{cli_agent_sessions::CLIAgentSessionsModel, view::TerminalAction},
 };
 use warp_core::ui::{
@@ -64,7 +63,7 @@ impl Input {
 
         // Render attachment chips (e.g. pasted screenshots) above the editor,
         // matching the pattern used by the agent view input in agent.rs.
-        if FeatureFlag::ImageAsContext.is_enabled() {
+        if self.image_attachments_available_for_ai_input(app) {
             if let Some(images) = self.render_attachment_chips(appearance) {
                 column.add_child(
                     Container::new(images)
