@@ -196,13 +196,39 @@ struct OpenAIChatRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAIChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<OpenAIChatToolChoice>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestMode {
     ToolUse,
     Finalize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum OpenAIChatToolChoice {
+    String(&'static str),
+    Function {
+        r#type: &'static str,
+        function: OpenAIChatToolChoiceFunction,
+    },
+}
+
+impl OpenAIChatToolChoice {
+    fn required_function(name: &str) -> Self {
+        Self::Function {
+            r#type: "function",
+            function: OpenAIChatToolChoiceFunction {
+                name: name.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OpenAIChatToolChoiceFunction {
+    name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -495,6 +521,28 @@ enum LocalToolPolicy {
     Plan,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequiredLocalTool {
+    TodoWrite,
+    SearchCodebase,
+}
+
+impl RequiredLocalTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TodoWrite => "todo_write",
+            Self::SearchCodebase => "search_codebase",
+        }
+    }
+
+    fn user_label(self) -> &'static str {
+        match self {
+            Self::TodoWrite => "Todo UI updates",
+            Self::SearchCodebase => "local codebase search",
+        }
+    }
+}
+
 impl LocalToolPolicy {
     fn from_inputs(input: &[AIAgentInput]) -> Self {
         if FeatureFlag::LocalAgentPlanMode.is_enabled()
@@ -544,6 +592,79 @@ impl LocalToolPolicy {
             )
         })
     }
+}
+
+fn required_local_tool_for_inputs(
+    input: &[AIAgentInput],
+    tool_policy: LocalToolPolicy,
+) -> Option<RequiredLocalTool> {
+    let user_query = input
+        .iter()
+        .filter_map(AIAgentInput::user_query)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if user_query.trim().is_empty() {
+        return None;
+    }
+
+    if !tool_policy.is_plan()
+        && FeatureFlag::LocalAgentTodoWrite.is_enabled()
+        && explicit_todo_request(&user_query)
+    {
+        return Some(RequiredLocalTool::TodoWrite);
+    }
+    if FeatureFlag::LocalAgentCodebaseIndex.is_enabled()
+        && explicit_codebase_search_request(&user_query)
+    {
+        return Some(RequiredLocalTool::SearchCodebase);
+    }
+    None
+}
+
+fn explicit_todo_request(query: &str) -> bool {
+    [
+        "todo",
+        "to-do",
+        "checklist",
+        "task list",
+        "track it",
+        "track this",
+        "待办",
+        "任务列表",
+        "跟踪",
+    ]
+    .iter()
+    .any(|term| query.contains(term))
+}
+
+fn explicit_codebase_search_request(query: &str) -> bool {
+    [
+        "search",
+        "find",
+        "locate",
+        "grep",
+        "codebase",
+        "repo",
+        "workspace",
+        "stale",
+        "reindex",
+        "symbol index",
+        "搜索",
+        "查找",
+        "检索",
+        "索引",
+    ]
+    .iter()
+    .any(|term| query.contains(term))
+}
+
+fn required_tool_missing_result_text(required_tool: RequiredLocalTool) -> String {
+    format!(
+        "The selected local OpenAI-compatible provider did not return the required `{}` tool call for this request, so Warp did not continue with a plain text answer. `{}` requires a tool-calling local model/server. Select a tool-capable local model, enable tool calling in your local provider, or switch to a provider that supports OpenAI-compatible tool calls.",
+        required_tool.name(),
+        required_tool.user_label()
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -728,17 +849,20 @@ pub fn generate_openai_compatible_output(
         let mut reasoning_started_at: Option<Instant> = None;
         let mut tool_result_summaries = Vec::new();
         let suggested_shell_commands = Arc::new(Mutex::new(HashSet::new()));
+        let required_tool = required_local_tool_for_inputs(&input, tool_policy);
 
         let max_tool_rounds = if has_user_query { MAX_LOCAL_DIRECT_TOOL_ROUNDS } else { 0 };
         for round in 0..max_tool_rounds {
             log::debug!("Starting local direct tool loop round {}", round + 1);
             let mcp_tool_catalog = local_mcp_tool_catalog_for_policy(mcp_context.as_ref(), tool_policy);
+            let required_tool_this_round = (round == 0).then_some(required_tool).flatten();
             let response = match request_openai_compatible_completion(
                 &config,
                 messages.clone(),
                 RequestMode::ToolUse,
                 mcp_context.as_ref(),
                 tool_policy,
+                required_tool_this_round,
             )
             .await
             {
@@ -759,6 +883,7 @@ pub fn generate_openai_compatible_output(
             let mut bytes_read = 0u64;
             let mut stream_done = false;
             let mut tool_call_accumulator = OpenAIToolCallAccumulator::default();
+            let mut buffered_required_tool_text = String::new();
 
             while let Some(chunk) = body.next().await {
                 let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
@@ -773,7 +898,11 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield_agent_output_content!(token);
+                            if required_tool_this_round.is_some() {
+                                buffered_required_tool_text.push_str(&token);
+                            } else {
+                                yield_agent_output_content!(token);
+                            }
                         }
                         OpenAIStreamEvent::ReasoningDelta(token) => {
                             if let Some(reasoning_id) = &reasoning_message_id {
@@ -829,7 +958,11 @@ pub fn generate_openai_compatible_output(
                     match event {
                         OpenAIStreamEvent::Delta(token) => {
                             received_token = true;
-                            yield_agent_output_content!(token);
+                            if required_tool_this_round.is_some() {
+                                buffered_required_tool_text.push_str(&token);
+                            } else {
+                                yield_agent_output_content!(token);
+                            }
                         }
                         OpenAIStreamEvent::ReasoningDelta(token) => {
                             if let Some(reasoning_id) = &reasoning_message_id {
@@ -886,6 +1019,16 @@ pub fn generate_openai_compatible_output(
                     yield Ok(stream_finished_done(&config, &usage_telemetry));
                     return;
                 }
+                if let Some(required_tool) = required_tool_this_round {
+                    log::info!(
+                        "Local direct provider returned text without required {} tool call; buffered_text_bytes={}",
+                        required_tool.name(),
+                        buffered_required_tool_text.len()
+                    );
+                    yield_agent_output_content!(required_tool_missing_result_text(required_tool));
+                    yield Ok(stream_finished_done(&config, &usage_telemetry));
+                    return;
+                }
                 match empty_local_provider_response_resolution(received_token, &tool_result_summaries) {
                     EmptyLocalProviderResponseResolution::Finish => {
                         yield Ok(stream_finished_done(&config, &usage_telemetry));
@@ -905,6 +1048,21 @@ pub fn generate_openai_compatible_output(
                         ))));
                         return;
                     }
+                }
+            }
+
+            if let Some(required_tool) = required_tool_this_round {
+                if !tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.function.name == required_tool.name())
+                {
+                    log::info!(
+                        "Local direct provider returned tool calls without required {} tool call",
+                        required_tool.name()
+                    );
+                    yield_agent_output_content!(required_tool_missing_result_text(required_tool));
+                    yield Ok(stream_finished_done(&config, &usage_telemetry));
+                    return;
                 }
             }
 
@@ -1000,6 +1158,7 @@ pub fn generate_openai_compatible_output(
             RequestMode::Finalize,
             mcp_context.as_ref(),
             tool_policy,
+            None,
         )
         .await
         {
@@ -1167,6 +1326,7 @@ async fn request_openai_compatible_completion(
     mode: RequestMode,
     mcp_context: Option<&LocalMcpContext>,
     tool_policy: LocalToolPolicy,
+    required_tool: Option<RequiredLocalTool>,
 ) -> anyhow::Result<LocalProviderResponse> {
     let include_usage = FeatureFlag::LocalAgentCostTelemetry.is_enabled();
     let request = openai_chat_request_with_policy(
@@ -1176,6 +1336,7 @@ async fn request_openai_compatible_completion(
         mcp_context,
         include_usage,
         tool_policy,
+        required_tool,
     );
     match send_openai_compatible_request(config, request).await {
         Ok(response) => Ok(LocalProviderResponse {
@@ -1190,6 +1351,7 @@ async fn request_openai_compatible_completion(
                 mcp_context,
                 false,
                 tool_policy,
+                required_tool,
             );
             let response = send_openai_compatible_request(config, request)
                 .await
@@ -1222,6 +1384,7 @@ fn openai_chat_request(
         mcp_context,
         include_usage,
         LocalToolPolicy::Normal,
+        None,
     )
 }
 
@@ -1232,6 +1395,7 @@ fn openai_chat_request_with_policy(
     mcp_context: Option<&LocalMcpContext>,
     include_usage: bool,
     tool_policy: LocalToolPolicy,
+    required_tool: Option<RequiredLocalTool>,
 ) -> OpenAIChatRequest {
     OpenAIChatRequest {
         model: config.model.clone(),
@@ -1245,8 +1409,10 @@ fn openai_chat_request_with_policy(
             RequestMode::Finalize => Vec::new(),
         },
         tool_choice: match mode {
-            RequestMode::ToolUse => None,
-            RequestMode::Finalize => Some("none"),
+            RequestMode::ToolUse => {
+                required_tool.map(|tool| OpenAIChatToolChoice::required_function(tool.name()))
+            }
+            RequestMode::Finalize => Some(OpenAIChatToolChoice::String("none")),
         },
     }
 }
@@ -1257,6 +1423,7 @@ async fn send_openai_compatible_request(
 ) -> Result<reqwest::Response, LocalProviderRequestError> {
     let request_contains_images = request_contains_images(&request);
     let request_contains_stream_options = request.stream_options.is_some();
+    let request_requires_tool_choice = request_requires_tool_choice(&request);
 
     let endpoint = chat_completions_url(&config.base_url);
     let response = reqwest::Client::builder()
@@ -1287,6 +1454,11 @@ async fn send_openai_compatible_request(
         if request_contains_images {
             return Err(LocalProviderRequestError::Other(anyhow!(
                 "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
+            )));
+        }
+        if request_requires_tool_choice {
+            return Err(LocalProviderRequestError::Other(anyhow!(
+                "Local provider rejected the required tool-choice request with status {status}. Use a local OpenAI-compatible model/server that supports tool calling, or disable the local feature that requires tool calls for this request."
             )));
         }
         return Err(LocalProviderRequestError::Other(anyhow!(
@@ -1332,6 +1504,13 @@ fn request_contains_images(request: &OpenAIChatRequest) -> bool {
         .messages
         .iter()
         .any(|message| message.content.contains_image_url())
+}
+
+fn request_requires_tool_choice(request: &OpenAIChatRequest) -> bool {
+    matches!(
+        request.tool_choice.as_ref(),
+        Some(OpenAIChatToolChoice::Function { .. })
+    )
 }
 
 fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
@@ -5262,21 +5441,23 @@ mod tests {
         local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
         mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
         openai_message, openai_messages_from_inputs_and_tasks,
-        openai_messages_from_inputs_and_tasks_with_policy, root_task_id,
-        shell_command_result_for_provider, stream_finished_done, structured_mcp_tool_call_event,
-        structured_tool_call_event, todo_update_events, truncate_mcp_output_for_provider,
-        truncate_shell_output_for_provider, unsupported_stream_options_response, web_status_event,
+        openai_messages_from_inputs_and_tasks_with_policy, required_local_tool_for_inputs,
+        required_tool_missing_result_text, root_task_id, shell_command_result_for_provider,
+        stream_finished_done, structured_mcp_tool_call_event, structured_tool_call_event,
+        todo_update_events, truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
+        unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
         LocalSubagentInvocation, LocalToolPolicy, LocalUsageTelemetry, LocalWebUiStatus,
         OpenAIChatContent, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
-        OpenAIStreamEvent, OpenAIStreamUsage, OpenAIToolCallAccumulator, OpenAIUsageTokenDetails,
-        RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
-        MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
-        MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
-        MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_PLAN_CHARS,
-        MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_SUBAGENT_DEPTH,
-        MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
-        MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        OpenAIChatToolChoice, OpenAIStreamEvent, OpenAIStreamUsage, OpenAIToolCallAccumulator,
+        OpenAIUsageTokenDetails, RequestMode, RequiredLocalTool, LOCAL_DIRECT_SYSTEM_PROMPT,
+        LOCAL_DIRECT_TODO_WRITE_PROMPT, MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS,
+        MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS, MAX_LOCAL_DIRECT_HISTORY_MESSAGES,
+        MAX_LOCAL_DIRECT_MCP_RESULT_BYTES, MAX_LOCAL_DIRECT_MESSAGE_CHARS,
+        MAX_LOCAL_DIRECT_PLAN_CHARS, MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES,
+        MAX_LOCAL_DIRECT_SUBAGENT_DEPTH, MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS,
+        MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS, MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS,
+        MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
         api::ServerConversationToken,
@@ -6063,6 +6244,117 @@ mod tests {
         };
         assert!(error.message.contains("Status: stale"));
         assert!(!error.message.contains("alpha"));
+    }
+
+    #[test]
+    fn explicit_local_tool_requests_require_matching_tool_choice() {
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let todo_input = [user_query_input(
+            "Create a three-step plan and track it with todos",
+            Vec::new(),
+            HashMap::new(),
+        )];
+        let search_input = [user_query_input(
+            "Search this repo for alpha",
+            Vec::new(),
+            HashMap::new(),
+        )];
+
+        assert_eq!(
+            required_local_tool_for_inputs(&todo_input, LocalToolPolicy::Normal),
+            Some(RequiredLocalTool::TodoWrite)
+        );
+        assert_eq!(
+            required_local_tool_for_inputs(&todo_input, LocalToolPolicy::Plan),
+            None
+        );
+        assert_eq!(
+            required_local_tool_for_inputs(&search_input, LocalToolPolicy::Normal),
+            Some(RequiredLocalTool::SearchCodebase)
+        );
+    }
+
+    #[test]
+    fn local_tool_request_serializes_required_tool_choice_and_tool_schemas() {
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let config = local_direct_config();
+        let request = super::openai_chat_request_with_policy(
+            &config,
+            vec![openai_message("user", "Track this with todos")],
+            RequestMode::ToolUse,
+            None,
+            false,
+            LocalToolPolicy::Normal,
+            Some(RequiredLocalTool::TodoWrite),
+        );
+
+        let value = serde_json::to_value(request).unwrap();
+        let tool_names = value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(tool_names.contains(&"todo_write"));
+        assert!(tool_names.contains(&"search_codebase"));
+        assert_eq!(value["tool_choice"]["type"], "function");
+        assert_eq!(value["tool_choice"]["function"]["name"], "todo_write");
+    }
+
+    #[test]
+    fn local_image_request_serializes_image_parts_with_local_tool_schemas() {
+        let _image_flag = FeatureFlag::LocalAgentImageInput.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let input = vec![user_query_input(
+            "describe this image",
+            vec![crate::ai::agent::AIAgentContext::Image(
+                test_png_image_context(),
+            )],
+            HashMap::new(),
+        )];
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
+        let request = super::openai_chat_request_with_policy(
+            &local_direct_config(),
+            messages,
+            RequestMode::ToolUse,
+            None,
+            false,
+            LocalToolPolicy::Normal,
+            None,
+        );
+
+        let value = serde_json::to_value(request).unwrap();
+        let content = value["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        let tool_names = value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(tool_names.contains(&"todo_write"));
+        assert!(tool_names.contains(&"search_codebase"));
+    }
+
+    #[test]
+    fn required_tool_missing_message_is_clear_user_guidance() {
+        let message = required_tool_missing_result_text(RequiredLocalTool::TodoWrite);
+
+        assert!(message.contains("did not return the required `todo_write` tool call"));
+        assert!(message.contains("tool-calling local model"));
+        assert!(message.contains("OpenAI-compatible tool calls"));
     }
 
     #[test]
@@ -6953,7 +7245,7 @@ mod tests {
             },
             tool_choice: match RequestMode::Finalize {
                 RequestMode::ToolUse => None,
-                RequestMode::Finalize => Some("none"),
+                RequestMode::Finalize => Some(OpenAIChatToolChoice::String("none")),
             },
         };
 
@@ -6976,7 +7268,7 @@ mod tests {
             },
             tool_choice: match RequestMode::ToolUse {
                 RequestMode::ToolUse => None,
-                RequestMode::Finalize => Some("none"),
+                RequestMode::Finalize => Some(OpenAIChatToolChoice::String("none")),
             },
         };
 
