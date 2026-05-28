@@ -23,6 +23,8 @@ pub(super) fn structured_tool_card_events(
     apply_file_diff_summary: Option<&ApplyFileDiffSummary>,
 ) -> Option<Vec<api::ResponseEvent>> {
     let tool = build_tool_call(
+        task_id,
+        request_id,
         &tool_call.function.name,
         &tool_call.function.arguments,
         &tool_call.id,
@@ -41,6 +43,8 @@ pub(super) fn structured_tool_call_event(
     tool_call: &OpenAIChatToolCall,
 ) -> Option<api::ResponseEvent> {
     let tool = build_tool_call(
+        task_id,
+        request_id,
         &tool_call.function.name,
         &tool_call.function.arguments,
         &tool_call.id,
@@ -59,6 +63,8 @@ pub(super) fn structured_mcp_tool_call_event(
 }
 
 fn build_tool_call(
+    task_id: &str,
+    request_id: &str,
     name: &str,
     arguments: &str,
     tool_call_id: &str,
@@ -99,7 +105,12 @@ fn build_tool_call(
                 .is_enabled()
                 && is_local_autoexecute_safe_command(&command);
             if local_autoexecute_safe {
-                register_local_autoexecute_safe_tool_call(tool_call_id, &command);
+                register_local_autoexecute_safe_tool_call(
+                    task_id,
+                    request_id,
+                    tool_call_id,
+                    &command,
+                );
             }
             Some(api::message::tool_call::Tool::RunShellCommand(
                 build_run_shell_command_tool_call(arguments, local_autoexecute_safe),

@@ -38,7 +38,9 @@ const GIT_DENIED_OPTIONS: &[&str] = &[
     "--config-env",
 ];
 
-static LOCAL_AUTOEXECUTE_SAFE_TOOL_CALLS: LazyLock<Mutex<HashMap<String, String>>> =
+type LocalSafeToolCallKey = (String, String, String, String);
+
+static LOCAL_AUTOEXECUTE_SAFE_TOOL_CALLS: LazyLock<Mutex<HashMap<LocalSafeToolCallKey, ()>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(super) fn is_local_autoexecute_safe_command(command: &str) -> bool {
@@ -51,20 +53,40 @@ pub(super) fn is_local_autoexecute_safe_command(command: &str) -> bool {
     classify_tokens(&tokens)
 }
 
-pub(crate) fn register_local_autoexecute_safe_tool_call(tool_call_id: &str, command: &str) {
+pub(crate) fn register_local_autoexecute_safe_tool_call(
+    task_id: &str,
+    request_id: &str,
+    tool_call_id: &str,
+    command: &str,
+) {
     if let Ok(mut tool_calls) = LOCAL_AUTOEXECUTE_SAFE_TOOL_CALLS.lock() {
-        tool_calls.insert(tool_call_id.to_string(), command.to_string());
+        tool_calls.insert(
+            (
+                task_id.to_string(),
+                request_id.to_string(),
+                tool_call_id.to_string(),
+                command.to_string(),
+            ),
+            (),
+        );
     }
 }
 
-pub(crate) fn is_local_autoexecute_safe_tool_call(tool_call_id: &str, command: &str) -> bool {
+pub(crate) fn take_local_autoexecute_safe_tool_call(
+    task_id: &str,
+    request_id: &str,
+    tool_call_id: &str,
+    command: &str,
+) -> bool {
+    let key = (
+        task_id.to_string(),
+        request_id.to_string(),
+        tool_call_id.to_string(),
+        command.to_string(),
+    );
     LOCAL_AUTOEXECUTE_SAFE_TOOL_CALLS
         .lock()
-        .is_ok_and(|tool_calls| {
-            tool_calls
-                .get(tool_call_id)
-                .is_some_and(|stored| stored == command)
-        })
+        .is_ok_and(|mut tool_calls| tool_calls.remove(&key).is_some())
 }
 
 fn contains_forbidden_shell_syntax(command: &str) -> bool {
@@ -98,12 +120,22 @@ fn classify_tokens(tokens: &[String]) -> bool {
         "command" => matches!(tokens.get(1).map(String::as_str), Some("-v")) && tokens.len() >= 3,
         "git" => classify_git(tokens),
         "top" => classify_top(tokens),
+        "tree" => classify_tree(tokens),
         "find" => !tokens
             .iter()
             .any(|token| FIND_DENIED_OPTIONS.contains(&token.as_str())),
         "grep" | "rg" => classify_grep_like(tokens),
         allowed => DIRECTLY_ALLOWED_COMMANDS.contains(&allowed),
     }
+}
+
+fn classify_tree(tokens: &[String]) -> bool {
+    !tokens.iter().any(|token| {
+        token == "-o"
+            || token == "--output"
+            || token.starts_with("-o")
+            || token.starts_with("--output=")
+    })
 }
 
 fn classify_git(tokens: &[String]) -> bool {
@@ -244,6 +276,9 @@ mod tests {
             "git -c core.pager=cat status",
             "git status -c core.pager=cat",
             "git log --config-env=foo=bar",
+            "tree -o out.txt .",
+            "tree --output out.txt .",
+            "tree --output=out.txt .",
         ] {
             assert!(
                 !is_local_autoexecute_safe_command(command),

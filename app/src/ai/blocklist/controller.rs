@@ -2551,6 +2551,8 @@ impl BlocklistAIController {
                             }
                             warp_multi_agent_api::response_event::Type::ClientActions(actions) => {
                                 let client_actions = actions.actions;
+                                let allow_local_autoexecute_marker =
+                                    response_stream.as_ref(ctx).is_local_direct_request();
                                 let apply_result =
                                     history_model.update(ctx, |history_model, ctx| {
                                         history_model.apply_client_actions(
@@ -2558,6 +2560,7 @@ impl BlocklistAIController {
                                             client_actions,
                                             conversation_id,
                                             self.terminal_view_id,
+                                            allow_local_autoexecute_marker,
                                             ctx,
                                         )
                                     });

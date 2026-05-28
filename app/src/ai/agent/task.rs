@@ -249,6 +249,7 @@ impl Task {
                 current_todo_list,
                 active_code_review,
                 false,
+                false,
             ) {
                 log::error!(
                     "Failed to update last exchange from messages upon converting to a server created task: {e:?}"
@@ -336,6 +337,7 @@ impl Task {
             current_todo_list,
             current_comment_state,
             should_convert_input_messages,
+            false,
         )
         .expect("Exchange exists and output is in 'streaming' state.");
         me
@@ -645,6 +647,7 @@ impl Task {
         current_todo_list: Option<&AIAgentTodoList>,
         current_comments: Option<&CodeReview>,
         should_convert_input_messages: bool,
+        allow_local_autoexecute_marker: bool,
     ) -> Result<(), UpdateTaskError> {
         if self.source().is_none() {
             return Err(UpdateTaskError::TaskNotInitialized);
@@ -655,6 +658,7 @@ impl Task {
             current_todo_list,
             current_comments,
             should_convert_input_messages,
+            allow_local_autoexecute_marker,
         )?;
         self.try_get_source_mut()?.messages.extend(messages);
         Ok(())
@@ -682,6 +686,7 @@ impl Task {
                 current_todo_list,
                 current_comments,
                 should_convert_input_messages,
+                false,
             )?;
             return self
                 .try_get_source()?
@@ -902,6 +907,7 @@ impl Task {
         current_todo_list: Option<&AIAgentTodoList>,
         active_code_review: Option<&CodeReview>,
         should_convert_input_messages: bool,
+        allow_local_autoexecute_marker: bool,
     ) -> Result<(), UpdateTaskError> {
         let exchange = self
             .exchange_mut(exchange_id)
@@ -942,6 +948,8 @@ impl Task {
                 .filter_map(|m| {
                     match m.to_client_output_message(ConversionParams {
                         task_id: &self.id,
+                        request_id: None,
+                        allow_local_autoexecute_marker,
                         current_todo_list,
                         active_code_review,
                     }) {
@@ -999,6 +1007,8 @@ impl AIAgentExchange {
                     current_todo_list: todo_list,
                     active_code_review: comments,
                     task_id,
+                    request_id: None,
+                    allow_local_autoexecute_marker: false,
                 })? {
                 MaybeAIAgentOutputMessage::Message(m) => {
                     // Extract citations from the message and add to the output citations

@@ -46,7 +46,7 @@ use mcp_tools::{mcp_tool_catalog, LocalMcpToolCatalog};
 use skills::{local_invoked_skill_context, local_skill_metadata_context};
 use web::{execute_web_fetch_tool, execute_web_search_tool, LocalWebToolOutput, LocalWebUiStatus};
 
-pub(crate) use safe_shell_command::is_local_autoexecute_safe_tool_call;
+pub(crate) use safe_shell_command::take_local_autoexecute_safe_tool_call;
 
 use crate::{
     ai::agent::{
@@ -5263,16 +5263,16 @@ mod tests {
         execute_local_tool_batch, execute_local_tool_batch_with_policy,
         execute_local_tool_with_policy, execute_read_file_tool, execute_run_shell_command_tool,
         execute_suggest_shell_command_tool, execute_todo_write_tool, execute_write_file_tool,
-        fallback_tool_results_message, generate_openai_compatible_output,
-        is_local_autoexecute_safe_tool_call, is_mutating_local_tool, is_sequential_local_tool,
-        local_mcp_tool_catalog, local_read_only_tools, local_shell_action_result,
-        local_subagent_messages, local_subagent_result_text, local_tool_result_summary,
-        local_tools, local_tools_for_context, local_tools_for_context_with_policy,
-        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
-        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
-        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
-        root_task_id, shell_command_result_for_provider, stream_finished_done,
-        structured_mcp_tool_call_event, structured_tool_call_event, todo_update_events,
+        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
+        is_sequential_local_tool, local_mcp_tool_catalog, local_read_only_tools,
+        local_shell_action_result, local_subagent_messages, local_subagent_result_text,
+        local_tool_result_summary, local_tools, local_tools_for_context,
+        local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
+        mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
+        openai_message, openai_messages_from_inputs_and_tasks,
+        openai_messages_from_inputs_and_tasks_with_policy, root_task_id,
+        shell_command_result_for_provider, stream_finished_done, structured_mcp_tool_call_event,
+        structured_tool_call_event, take_local_autoexecute_safe_tool_call, todo_update_events,
         truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
@@ -7315,7 +7315,9 @@ mod tests {
         assert_eq!(command.command, "pwd");
         assert!(command.is_read_only);
         assert!(!command.is_risky);
-        assert!(is_local_autoexecute_safe_tool_call(
+        assert!(take_local_autoexecute_safe_tool_call(
+            "task",
+            "request",
             &call.tool_call_id,
             &command.command
         ));
@@ -7342,6 +7344,8 @@ mod tests {
         let output = message
             .to_client_output_message(ConversionParams {
                 task_id: &crate::ai::agent::task::TaskId::new("task".to_string()),
+                request_id: None,
+                allow_local_autoexecute_marker: true,
                 current_todo_list: None,
                 active_code_review: None,
             })
@@ -7368,6 +7372,67 @@ mod tests {
         assert_eq!(is_read_only, Some(true));
         assert_eq!(is_risky, Some(false));
         assert!(local_autoexecute_safe);
+    }
+
+    #[test]
+    #[serial]
+    fn generic_run_shell_command_with_colliding_id_does_not_use_local_marker() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
+        let local_tool_call = tool_call("run_shell_command", r#"{"command":"pwd"}"#);
+        let _ = structured_tool_call_event("shared_task", "shared_request", &local_tool_call)
+            .expect("local tool call should register scoped marker");
+
+        let message = api::Message {
+            id: "cloud_message".to_string(),
+            task_id: "shared_task".to_string(),
+            request_id: "shared_request".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: Vec::new(),
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: "call_1".to_string(),
+                tool: Some(api::message::tool_call::Tool::RunShellCommand(
+                    api::message::tool_call::RunShellCommand {
+                        command: "pwd".to_string(),
+                        is_read_only: true,
+                        uses_pager: false,
+                        citations: Vec::new(),
+                        is_risky: false,
+                        risk_category: api::RiskCategory::ReadOnly as i32,
+                        wait_until_complete_value: Some(
+                            api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
+                        ),
+                    },
+                )),
+            })),
+        };
+
+        let output = message
+            .to_client_output_message(ConversionParams {
+                task_id: &crate::ai::agent::task::TaskId::new("shared_task".to_string()),
+                request_id: None,
+                allow_local_autoexecute_marker: false,
+                current_todo_list: None,
+                active_code_review: None,
+            })
+            .unwrap();
+
+        let MaybeAIAgentOutputMessage::Message(output) = output else {
+            panic!("expected action message");
+        };
+        let AIAgentOutputMessageType::Action(action) = output.message else {
+            panic!("expected action");
+        };
+        let ai::agent::action::AIAgentActionType::RequestCommandOutput {
+            local_autoexecute_safe,
+            ..
+        } = action.action
+        else {
+            panic!("expected request command output");
+        };
+
+        assert!(!local_autoexecute_safe);
     }
 
     #[test]
@@ -7399,7 +7464,9 @@ mod tests {
         assert_eq!(command.command, "rm file");
         assert!(!command.is_read_only);
         assert!(command.is_risky);
-        assert!(!is_local_autoexecute_safe_tool_call(
+        assert!(!take_local_autoexecute_safe_tool_call(
+            "task",
+            "request",
             &call.tool_call_id,
             &command.command
         ));

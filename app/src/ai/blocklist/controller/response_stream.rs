@@ -120,6 +120,10 @@ impl ResponseStream {
         &self.id
     }
 
+    pub fn is_local_direct_request(&self) -> bool {
+        self.params.local_direct_config.is_some()
+    }
+
     /// Returns true if we should attempt to resume the conversation after the stream finishes.
     pub fn should_resume_conversation_after_stream_finished(&self) -> bool {
         self.should_resume_conversation_after_stream_finished

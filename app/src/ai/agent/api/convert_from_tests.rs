@@ -296,6 +296,8 @@ fn converts_start_agent_tool_call_to_action_with_prompt() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -325,6 +327,8 @@ fn converts_local_start_agent_v2_without_harness_type_to_defaults() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -352,6 +356,8 @@ fn converts_upload_artifact_tool_call_to_action() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -375,6 +381,8 @@ fn converts_file_artifact_created_message_with_filename() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -405,6 +413,8 @@ fn converts_start_agent_tool_calls_with_different_prompt_lengths() {
     let partial_output = partial_message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -412,6 +422,8 @@ fn converts_start_agent_tool_calls_with_different_prompt_lengths() {
     let updated_output = updated_message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -440,6 +452,8 @@ fn converts_start_agent_with_explicit_empty_lifecycle_subscription() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -469,6 +483,8 @@ fn converts_start_agent_with_cancelled_and_blocked_lifecycle_subscription() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -501,6 +517,8 @@ fn converts_remote_start_agent_with_environment_id() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -538,6 +556,8 @@ fn converts_remote_start_agent_v2_with_skill_references() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -578,6 +598,8 @@ fn converts_local_start_agent_v2_with_harness_type() {
     let output = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })
@@ -620,6 +642,8 @@ fn transfer_control_tool_call_converts_to_action_message() {
     let converted = message
         .to_client_output_message(ConversionParams {
             task_id: &task_id,
+            request_id: None,
+            allow_local_autoexecute_marker: false,
             current_todo_list: None,
             active_code_review: None,
         })

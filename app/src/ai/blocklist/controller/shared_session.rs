@@ -316,6 +316,7 @@ impl BlocklistAIController {
                 actions.actions,
                 conversation_id,
                 self.terminal_view_id,
+                false,
                 ctx,
             ) {
                 log::error!(

@@ -2124,6 +2124,7 @@ impl AIConversation {
         response_stream_id: &ResponseStreamId,
         terminal_view_id: EntityId,
         action: warp_multi_agent_api::client_action::Action,
+        allow_local_autoexecute_marker: bool,
         ctx: &mut ModelContext<BlocklistAIHistoryModel>,
     ) -> Result<(), UpdateConversationError> {
         use warp_multi_agent_api::client_action::*;
@@ -2526,6 +2527,7 @@ impl AIConversation {
                     // to mimic the normal conversation flow. (If this is not a shared session, the
                     // exchange inputs will already be populated).
                     self.is_viewing_shared_session,
+                    allow_local_autoexecute_marker,
                 )?;
 
                 self.task_store.insert(task);

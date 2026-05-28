@@ -528,6 +528,8 @@ impl ConvertToExchanges for &api::Task {
                         // TODO(alokedesai): Support persistence for the code review state.
                         active_code_review: None,
                         task_id: &TaskId::new(api_message.task_id.clone()),
+                        request_id: None,
+                        allow_local_autoexecute_marker: false,
                     })
                 {
                     current_outputs.push(output_msg);
