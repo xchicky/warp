@@ -10,6 +10,8 @@ Dogfood validation for these follow-ups must use `WarpLocal.app` / `Channel::Loc
 
 1. [M6.1: Auto-Execute Safe Commands](M6.1-auto-execute-safe-commands.md)
 2. [M6.2: Local Agent in Full Terminal Use](M6.2-local-agent-in-cli-mode.md)
+   - [M6.2 implementation spec](M6.2-implementation.md)
+   - [M6.2 Option A research notes](_research/M6.2-option-a-research.md)
 
 ## Priority
 
