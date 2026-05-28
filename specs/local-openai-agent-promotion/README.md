@@ -15,6 +15,10 @@ Promotion must be incremental. Each flag gets its own implementation PR so rollo
 
 Promotion PRs should use the `promote-feature` skill and must not promote more than one flag at a time.
 
+Dogfood validation for promoted local-agent flags must use `WarpLocal.app` / `Channel::Local`, which enables `DEBUG_FLAGS`, `DOGFOOD_FLAGS`, and `PREVIEW_FLAGS`. `WarpOss.app` / `Channel::Oss` enables only `DEBUG_FLAGS`, so it is not a valid app for dogfood verification of promoted local-agent features.
+
+For local macOS dogfood builds without the private channel config binary installed, use the local-channel bundle path: `PATH="/tmp/warp-channel-stub-bin:$PATH" WARP_BIN_NAME=warp WARP_CHANNEL=local FEATURES=gui,release_bundle ./script/macos/run --dont-open`.
+
 ## Cadence
 
 Use one cadence cycle as the minimum feedback window between promotions that materially increase risk. For this roadmap, one cadence cycle means at least five business days or one internal release train, whichever is longer.
