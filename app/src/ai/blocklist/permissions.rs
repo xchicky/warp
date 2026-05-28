@@ -43,6 +43,7 @@ pub enum CommandExecutionPermission {
 pub enum CommandExecutionPermissionAllowedReason {
     Dispatched,
     ExplicitlyAllowlisted,
+    LocalStaticSafeCommand,
     IsReadOnlyAndSettingEnabled,
     AgentDecided,
     AlwaysAllowed,
@@ -947,6 +948,44 @@ impl BlocklistAIPermissions {
                 }
             }
         }
+    }
+
+    pub fn can_autoexecute_local_static_safe_command(
+        &self,
+        conversation_id: &AIConversationId,
+        command: &str,
+        escape_char: EscapeChar,
+        terminal_view_id: Option<EntityId>,
+        ctx: &AppContext,
+    ) -> CommandExecutionPermission {
+        let normalized_command = match escape_char {
+            EscapeChar::Backslash => command.replace("\\\n", " "),
+            EscapeChar::Backtick => command.replace("`\n", " "),
+        };
+        let (commands, _) = decompose_command(&normalized_command, escape_char);
+
+        let denylist = self.get_execute_commands_denylist(ctx, terminal_view_id);
+        if commands
+            .iter()
+            .any(|command| denylist.iter().any(|deny| deny.matches(command)))
+        {
+            return CommandExecutionPermission::Denied(
+                CommandExecutionPermissionDeniedReason::ExplicitlyDenylisted,
+            );
+        }
+
+        if BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(conversation_id)
+            .is_some_and(|convo| convo.autoexecute_any_action())
+        {
+            return CommandExecutionPermission::Allowed(
+                CommandExecutionPermissionAllowedReason::RunToCompletion,
+            );
+        }
+
+        CommandExecutionPermission::Allowed(
+            CommandExecutionPermissionAllowedReason::LocalStaticSafeCommand,
+        )
     }
 
     /// Allows Agent Mode to auto-execute commands that match `command`.

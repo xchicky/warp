@@ -56,6 +56,10 @@ pub enum AIAgentActionType {
 
         /// The citations for the command.
         citations: Vec<AIAgentCitation>,
+
+        /// True only for client-local shell requests that passed Warp's static safe-command
+        /// classifier. Model-provided risk fields must not set this.
+        local_autoexecute_safe: bool,
     },
 
     WriteToLongRunningShellCommand {

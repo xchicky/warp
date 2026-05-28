@@ -14,6 +14,7 @@ fn create_test_action(id: AIAgentActionId) -> AIAgentAction {
             uses_pager: None,
             wait_until_completion: true,
             citations: vec![],
+            local_autoexecute_safe: false,
         },
         requires_result: false,
     }

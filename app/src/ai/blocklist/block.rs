@@ -2397,41 +2397,60 @@ impl AIBlock {
         let shell_type = self.active_session.as_ref(ctx).shell_type(ctx);
         let escape_char = shell_type.map(|s| ShellFamily::from(s).escape_char());
 
-        for (requested_command_action_id, command, is_read_only, is_risky) in
-            output.actions().filter_map(|action| {
-                if let AIAgentAction {
-                    action:
-                        AIAgentActionType::RequestCommandOutput {
-                            command,
-                            is_read_only,
-                            is_risky,
-                            ..
-                        },
-                    ..
-                } = action
-                {
-                    Some((
-                        &action.id,
+        for (
+            requested_command_action_id,
+            command,
+            is_read_only,
+            is_risky,
+            local_autoexecute_safe,
+        ) in output.actions().filter_map(|action| {
+            if let AIAgentAction {
+                action:
+                    AIAgentActionType::RequestCommandOutput {
                         command,
-                        is_read_only.unwrap_or(false),
-                        *is_risky,
-                    ))
-                } else {
-                    None
-                }
-            })
-        {
-            if is_agent_mode_autonomy_allowed(ctx) {
-                let autoexecute_decision = escape_char.map(|escape_char| {
-                    BlocklistAIPermissions::as_ref(ctx).can_autoexecute_command(
-                        &self.client_ids.conversation_id,
-                        command,
-                        escape_char,
                         is_read_only,
                         is_risky,
-                        Some(self.terminal_view_id),
-                        ctx,
-                    )
+                        local_autoexecute_safe,
+                        ..
+                    },
+                ..
+            } = action
+            {
+                Some((
+                    &action.id,
+                    command,
+                    is_read_only.unwrap_or(false),
+                    *is_risky,
+                    *local_autoexecute_safe,
+                ))
+            } else {
+                None
+            }
+        }) {
+            if is_agent_mode_autonomy_allowed(ctx) {
+                let autoexecute_decision = escape_char.map(|escape_char| {
+                    if local_autoexecute_safe
+                        && FeatureFlag::LocalAgentAutoExecuteSafeCommands.is_enabled()
+                    {
+                        BlocklistAIPermissions::as_ref(ctx)
+                            .can_autoexecute_local_static_safe_command(
+                                &self.client_ids.conversation_id,
+                                command,
+                                escape_char,
+                                Some(self.terminal_view_id),
+                                ctx,
+                            )
+                    } else {
+                        BlocklistAIPermissions::as_ref(ctx).can_autoexecute_command(
+                            &self.client_ids.conversation_id,
+                            command,
+                            escape_char,
+                            is_read_only,
+                            is_risky,
+                            Some(self.terminal_view_id),
+                            ctx,
+                        )
+                    }
                 });
 
                 match autoexecute_decision {

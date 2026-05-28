@@ -2776,6 +2776,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LocalAgentFileWrites,
         #[cfg(feature = "local_agent_shell_execution")]
         FeatureFlag::LocalAgentShellExecution,
+        #[cfg(feature = "local_agent_autoexecute_safe_commands")]
+        FeatureFlag::LocalAgentAutoExecuteSafeCommands,
         #[cfg(feature = "local_agent_mcp")]
         FeatureFlag::LocalAgentMcp,
         #[cfg(feature = "local_agent_skills")]

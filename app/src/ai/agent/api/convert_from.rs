@@ -689,7 +689,20 @@ impl ConvertAPIToolCallToAIAgentAction for api::message::ToolCall {
 
         match tool {
             api::message::tool_call::Tool::RunShellCommand(run_shell_command) => {
-                create_standard_action(run_shell_command.into())
+                let command = run_shell_command.command.clone();
+                let mut action: AIAgentActionType = run_shell_command.into();
+                if let AIAgentActionType::RequestCommandOutput {
+                    local_autoexecute_safe,
+                    ..
+                } = &mut action
+                {
+                    *local_autoexecute_safe =
+                        crate::ai::agent::local::is_local_autoexecute_safe_tool_call(
+                            &self.tool_call_id,
+                            &command,
+                        );
+                }
+                create_standard_action(action)
             }
             api::message::tool_call::Tool::WriteToLongRunningShellCommand(
                 write_to_long_running_shell_command,

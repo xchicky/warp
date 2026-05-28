@@ -2,6 +2,7 @@ mod apply_file_diff;
 mod codebase_index;
 mod mcp_tools;
 mod pricing;
+mod safe_shell_command;
 mod skills;
 mod tool_card;
 mod web;
@@ -44,6 +45,8 @@ use self::{
 use mcp_tools::{mcp_tool_catalog, LocalMcpToolCatalog};
 use skills::{local_invoked_skill_context, local_skill_metadata_context};
 use web::{execute_web_fetch_tool, execute_web_search_tool, LocalWebToolOutput, LocalWebUiStatus};
+
+pub(crate) use safe_shell_command::is_local_autoexecute_safe_tool_call;
 
 use crate::{
     ai::agent::{
@@ -1964,11 +1967,16 @@ fn edit_file_tool_definition() -> OpenAIChatTool {
 }
 
 fn run_shell_command_tool_definition() -> OpenAIChatTool {
+    let description = if FeatureFlag::LocalAgentAutoExecuteSafeCommands.is_enabled() {
+        "Request execution of an opaque shell command in the active terminal context. Warp may auto-execute only statically allowlisted read-only inspection commands; all other commands require visible user approval."
+    } else {
+        "Request execution of an opaque shell command after visible user approval in the active terminal context."
+    };
     OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
             name: "run_shell_command".to_string(),
-            description: "Request execution of an opaque shell command after visible user approval in the active terminal context.".to_string(),
+            description: description.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -5255,17 +5263,18 @@ mod tests {
         execute_local_tool_batch, execute_local_tool_batch_with_policy,
         execute_local_tool_with_policy, execute_read_file_tool, execute_run_shell_command_tool,
         execute_suggest_shell_command_tool, execute_todo_write_tool, execute_write_file_tool,
-        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
-        is_sequential_local_tool, local_mcp_tool_catalog, local_read_only_tools,
-        local_shell_action_result, local_subagent_messages, local_subagent_result_text,
-        local_tool_result_summary, local_tools, local_tools_for_context,
-        local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
-        mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
-        openai_message, openai_messages_from_inputs_and_tasks,
-        openai_messages_from_inputs_and_tasks_with_policy, root_task_id,
-        shell_command_result_for_provider, stream_finished_done, structured_mcp_tool_call_event,
-        structured_tool_call_event, todo_update_events, truncate_mcp_output_for_provider,
-        truncate_shell_output_for_provider, unsupported_stream_options_response, web_status_event,
+        fallback_tool_results_message, generate_openai_compatible_output,
+        is_local_autoexecute_safe_tool_call, is_mutating_local_tool, is_sequential_local_tool,
+        local_mcp_tool_catalog, local_read_only_tools, local_shell_action_result,
+        local_subagent_messages, local_subagent_result_text, local_tool_result_summary,
+        local_tools, local_tools_for_context, local_tools_for_context_with_policy,
+        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
+        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
+        root_task_id, shell_command_result_for_provider, stream_finished_done,
+        structured_mcp_tool_call_event, structured_tool_call_event, todo_update_events,
+        truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
+        unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
         LocalSubagentInvocation, LocalToolPolicy, LocalUsageTelemetry, LocalWebUiStatus,
         OpenAIChatContent, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
@@ -5279,13 +5288,17 @@ mod tests {
         MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
     };
     use crate::ai::agent::{
-        api::ServerConversationToken,
+        api::{
+            ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
+            ServerConversationToken,
+        },
         local::{
             apply_file_diff::ApplyFileDiffSummary,
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
-        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput, CallMCPToolResult,
-        InvokeSkillUserQuery, MCPContext, MCPServer, RequestCommandOutputResult, UserQueryMode,
+        AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput,
+        AIAgentOutputMessageType, CallMCPToolResult, InvokeSkillUserQuery, MCPContext, MCPServer,
+        RequestCommandOutputResult, UserQueryMode,
     };
     use crate::features::FeatureFlag;
     use crate::persistence::model::PRIMARY_AGENT_CATEGORY;
@@ -7244,6 +7257,8 @@ mod tests {
 
     #[test]
     fn run_shell_command_tool_card_uses_existing_proto_shape() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(false);
         let tool_call = tool_call(
             "run_shell_command",
             r#"{"command":"cargo test","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
@@ -7267,8 +7282,127 @@ mod tests {
 
         assert_eq!(call.tool_call_id, "call_1");
         assert_eq!(command.command, "cargo test");
+        assert!(!command.is_read_only);
+        assert!(command.is_risky);
+    }
+
+    #[test]
+    #[serial]
+    fn run_shell_command_tool_card_marks_static_safe_command_when_flag_enabled() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"pwd","is_read_only":false,"is_risky":true,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(command.command, "pwd");
         assert!(command.is_read_only);
         assert!(!command.is_risky);
+        assert!(is_local_autoexecute_safe_tool_call(
+            &call.tool_call_id,
+            &command.command
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn run_shell_command_tool_card_converts_to_local_static_safe_action() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
+        let tool_call = tool_call("run_shell_command", r#"{"command":"pwd"}"#);
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let message = add.messages[0].clone();
+
+        let output = message
+            .to_client_output_message(ConversionParams {
+                task_id: &crate::ai::agent::task::TaskId::new("task".to_string()),
+                current_todo_list: None,
+                active_code_review: None,
+            })
+            .unwrap();
+
+        let MaybeAIAgentOutputMessage::Message(output) = output else {
+            panic!("expected action message");
+        };
+        let AIAgentOutputMessageType::Action(action) = output.message else {
+            panic!("expected action");
+        };
+        let ai::agent::action::AIAgentActionType::RequestCommandOutput {
+            command,
+            is_read_only,
+            is_risky,
+            local_autoexecute_safe,
+            ..
+        } = action.action
+        else {
+            panic!("expected request command output");
+        };
+
+        assert_eq!(command, "pwd");
+        assert_eq!(is_read_only, Some(true));
+        assert_eq!(is_risky, Some(false));
+        assert!(local_autoexecute_safe);
+    }
+
+    #[test]
+    #[serial]
+    fn run_shell_command_tool_card_ignores_model_claim_for_unsafe_command() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"rm file","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(command.command, "rm file");
+        assert!(!command.is_read_only);
+        assert!(command.is_risky);
+        assert!(!is_local_autoexecute_safe_tool_call(
+            &call.tool_call_id,
+            &command.command
+        ));
     }
 
     #[test]

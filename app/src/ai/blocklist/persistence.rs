@@ -342,6 +342,7 @@ impl TryFrom<PersistedAIAgentActionType> for AIAgentActionType {
                     // TODO(zachbai): Support restoring this value from persisted type.
                     wait_until_completion: false,
                     citations: vec![],
+                    local_autoexecute_safe: false,
                 })
             }
             PersistedAIAgentActionType::WriteToLongRunningShellCommand {
