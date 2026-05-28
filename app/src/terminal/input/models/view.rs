@@ -421,7 +421,7 @@ impl InlineModelSelectorView {
                 .id
                 .clone(),
             InlineModelSelectorTab::FullTerminalUse => llm_preferences
-                .get_active_cli_agent_model(ctx, Some(self.terminal_view_id))
+                .get_active_cli_agent_model_with_local(ctx, Some(self.terminal_view_id))
                 .id
                 .clone(),
         }

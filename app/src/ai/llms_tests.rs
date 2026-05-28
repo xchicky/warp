@@ -1,5 +1,28 @@
 use super::*;
 
+fn add_local_full_terminal_use_llm_test_models(app: &mut warpui::App) {
+    app.add_singleton_model(|_| crate::auth::AuthStateProvider::new_for_test());
+    app.add_singleton_model(|_| crate::server::server_api::ServerApiProvider::new_for_test());
+    app.add_singleton_model(crate::auth::auth_manager::AuthManager::new_for_test);
+    app.add_singleton_model(crate::server::sync_queue::SyncQueue::mock);
+    app.add_singleton_model(|_| crate::network::NetworkStatus::new());
+    app.add_singleton_model(crate::workspaces::team_tester::TeamTesterStatus::mock);
+    app.add_singleton_model(crate::server::cloud_objects::update_manager::UpdateManager::mock);
+    app.add_singleton_model(crate::cloud_object::model::persistence::CloudModel::mock);
+    app.add_singleton_model(|_| {
+        crate::ai::mcp::templatable_manager::TemplatableMCPServerManager::default()
+    });
+    app.add_singleton_model(crate::settings::PrivacySettings::mock);
+    app.add_singleton_model(crate::workspaces::user_workspaces::UserWorkspaces::default_mock);
+    app.add_singleton_model(|ctx| {
+        crate::ai::execution_profiles::profiles::AIExecutionProfilesModel::new(
+            &crate::LaunchMode::new_for_unit_test(),
+            ctx,
+        )
+    });
+    app.add_singleton_model(LLMPreferences::new);
+}
+
 // -- DisableReason::should_clear_preference tests --
 
 #[test]
@@ -205,4 +228,107 @@ fn add_custom_models_namespaces_local_openai_id_when_model_matches_hosted_id() {
         .choices
         .iter()
         .any(|choice| choice.id == local_openai_llm_id("gpt-4o")));
+}
+
+#[test]
+fn local_full_terminal_use_choice_is_flag_gated() {
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        add_local_full_terminal_use_llm_test_models(&mut app);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+
+        let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(false);
+        let choice = LLMPreferences::handle(&app).read(&app, |preferences, ctx| {
+            preferences.local_full_terminal_use_choice(ctx)
+        });
+        assert!(choice.is_none());
+    });
+}
+
+#[test]
+fn local_full_terminal_use_choice_defaults_and_preserves_external_choices() {
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        add_local_full_terminal_use_llm_test_models(&mut app);
+        let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+
+        let (active, choices) = LLMPreferences::handle(&app).read(&app, |preferences, ctx| {
+            (
+                preferences.get_active_cli_agent_model_with_local(ctx, None),
+                preferences
+                    .get_cli_agent_llm_choices_with_local(ctx)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(active.id, local_openai_llm_id("qwen2.5-coder"));
+        assert_eq!(active.display_name, "Local Agent (qwen2.5-coder)");
+
+        assert_eq!(choices[0].id, local_openai_llm_id("qwen2.5-coder"));
+        assert!(choices
+            .iter()
+            .skip(1)
+            .any(|choice| choice.id == LLMId::from("cli-agent-auto")));
+    });
+}
+
+#[test]
+fn local_full_terminal_use_keeps_explicit_external_cli_agent_model() {
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        add_local_full_terminal_use_llm_test_models(&mut app);
+        let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        crate::ai::execution_profiles::profiles::AIExecutionProfilesModel::handle(&app).update(
+            &mut app,
+            |profiles, ctx| {
+                let profile_id = profiles.default_profile_id();
+                profiles.set_cli_agent_model(profile_id, Some(LLMId::from("cli-agent-auto")), ctx);
+            },
+        );
+
+        let active = LLMPreferences::handle(&app).read(&app, |preferences, ctx| {
+            preferences.get_active_cli_agent_model_with_local(ctx, None)
+        });
+
+        assert_eq!(active.id, LLMId::from("cli-agent-auto"));
+    });
+}
+
+#[test]
+fn local_full_terminal_use_choice_is_available_as_llm_info() {
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        add_local_full_terminal_use_llm_test_models(&mut app);
+        let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+
+        let info = LLMPreferences::handle(&app)
+            .read(&app, |preferences, ctx| {
+                preferences.get_llm_info_for_request(&local_openai_llm_id("qwen2.5-coder"), ctx)
+            })
+            .expect("local FTU model should be visible to request metadata");
+
+        assert_eq!(info.display_name, "Local Agent (qwen2.5-coder)");
+    });
 }

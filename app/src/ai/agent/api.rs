@@ -265,15 +265,14 @@ impl RequestParams {
             &request_input.cli_agent_model_id,
             &request_input.computer_use_model_id,
         ] {
-            let Some(provider) =
-                llm_preferences
-                    .get_llm_info(model_id)
-                    .and_then(|info| match &info.provider {
-                        LLMProvider::Anthropic => Some(ApiKeyProvider::Anthropic),
-                        LLMProvider::OpenAI => Some(ApiKeyProvider::OpenAI),
-                        LLMProvider::Google => Some(ApiKeyProvider::Google),
-                        LLMProvider::Xai | LLMProvider::Unknown => None,
-                    })
+            let Some(provider) = llm_preferences
+                .get_llm_info_for_request(model_id, app)
+                .and_then(|info| match &info.provider {
+                    LLMProvider::Anthropic => Some(ApiKeyProvider::Anthropic),
+                    LLMProvider::OpenAI => Some(ApiKeyProvider::OpenAI),
+                    LLMProvider::Google => Some(ApiKeyProvider::Google),
+                    LLMProvider::Xai | LLMProvider::Unknown => None,
+                })
             else {
                 continue;
             };
@@ -288,7 +287,7 @@ impl RequestParams {
             &model_providers,
         );
         let vision_supported = llm_preferences
-            .get_llm_info(&request_input.model_id)
+            .get_llm_info_for_request(&request_input.model_id, app)
             .map(|info| info.vision_supported)
             .unwrap_or(true);
         let local_direct_config = local_openai_direct_config_for_model(

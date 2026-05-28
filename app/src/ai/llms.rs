@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
+use warp_core::features::FeatureFlag;
 use warp_core::ui::icons::Icon;
 use warp_core::user_preferences::GetUserPreferences;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
@@ -574,8 +575,16 @@ pub(crate) fn local_openai_model_from_llm_id(id: &LLMId) -> Option<&str> {
     id.as_str().strip_prefix(LOCAL_OPENAI_LLM_ID_PREFIX)
 }
 
-fn local_openai_llm_info(model: &str) -> LLMInfo {
+pub(crate) fn local_openai_llm_info(model: &str) -> LLMInfo {
     LLMInfo {
+        id: local_openai_llm_id(model),
+        ..custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)
+    }
+}
+
+pub(crate) fn local_openai_ftu_llm_info(model: &str) -> LLMInfo {
+    LLMInfo {
+        display_name: format!("Local Agent ({model})"),
         id: local_openai_llm_id(model),
         ..custom_llm_info("Local OpenAI", model, LLMProvider::OpenAI)
     }
@@ -816,6 +825,23 @@ impl LLMPreferences {
         self.get_cli_agent_available().choices.iter()
     }
 
+    pub fn local_full_terminal_use_choice(&self, app: &AppContext) -> Option<LLMInfo> {
+        FeatureFlag::LocalAgentFullTerminalUse
+            .is_enabled()
+            .then(|| ApiKeyManager::as_ref(app).keys().local_openai_config())
+            .flatten()
+            .map(|(_, _, model)| local_openai_ftu_llm_info(model))
+    }
+
+    pub fn get_cli_agent_llm_choices_with_local<'a>(
+        &'a self,
+        app: &'a AppContext,
+    ) -> impl Iterator<Item = LLMInfo> + 'a {
+        self.local_full_terminal_use_choice(app)
+            .into_iter()
+            .chain(self.get_cli_agent_llm_choices().cloned())
+    }
+
     /// Returns the `LLMInfo` for the CLI agent model.
     pub fn get_active_cli_agent_model<'a>(
         &'a self,
@@ -831,6 +857,29 @@ impl LLMPreferences {
             .clone()
             .and_then(|id| available.info_for_id(&id))
             .unwrap_or_else(|| available.default_llm_info())
+    }
+
+    pub fn get_active_cli_agent_model_with_local(
+        &self,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> LLMInfo {
+        let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
+        let available = self.get_cli_agent_available();
+        if let Some(local_choice) = self.local_full_terminal_use_choice(app) {
+            if profile.data().cli_agent_model.is_none()
+                || profile.data().cli_agent_model.as_ref() == Some(&local_choice.id)
+            {
+                return local_choice;
+            }
+        }
+
+        profile
+            .data()
+            .cli_agent_model
+            .clone()
+            .and_then(|id| available.info_for_id(&id).cloned())
+            .unwrap_or_else(|| available.default_llm_info().clone())
     }
 
     /// Returns the default CLI agent model as a fallback.
@@ -885,7 +934,15 @@ impl LLMPreferences {
 
     /// Returns metadata about an LLM, if the client knows about it.
     pub fn get_llm_info(&self, id: &LLMId) -> Option<&LLMInfo> {
-        self.models_by_feature.info_for_id(id)
+        self.models_by_feature
+            .info_for_id(id)
+            .or_else(|| self.get_cli_agent_available().info_for_id(id))
+    }
+
+    pub fn get_llm_info_for_request(&self, id: &LLMId, app: &AppContext) -> Option<LLMInfo> {
+        self.local_full_terminal_use_choice(app)
+            .filter(|choice| &choice.id == id)
+            .or_else(|| self.get_llm_info(id).cloned())
     }
 
     /// Returns the default base model as a fallback.
@@ -1174,9 +1231,14 @@ impl LLMPreferences {
                     }
                     if let Some(preferred_llm_id) = &profile.data().cli_agent_model {
                         if self
-                            .get_cli_agent_available()
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .is_none()
+                            .local_full_terminal_use_choice(ctx)
+                            .as_ref()
+                            .map(|choice| &choice.id)
+                            != Some(preferred_llm_id)
+                            && self
+                                .get_cli_agent_available()
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .is_none()
                         {
                             profiles.set_cli_agent_model(profile_id, None, ctx);
                         }

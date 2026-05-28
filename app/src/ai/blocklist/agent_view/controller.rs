@@ -134,6 +134,8 @@ pub enum AgentViewEntryOrigin {
     /// Entered agent view by opening an existing non-Oz cloud agent run (live shared-session
     /// viewer or transcript viewer).
     ThirdPartyCloudAgent,
+    /// Entered agent view from Full Terminal Use with the configured local OpenAI-compatible agent.
+    LocalFullTerminalUse,
     /// Entered agent view via the CLI (e.g. `warp agent run`).
     Cli,
     /// Entered agent view by adding an image (drag-and-drop or paste).
@@ -283,6 +285,13 @@ impl AgentViewState {
                 ..
             } => Some(*conversation_id),
             _ => None,
+        }
+    }
+
+    pub fn origin(&self) -> Option<AgentViewEntryOrigin> {
+        match self {
+            AgentViewState::Active { origin, .. } => Some(*origin),
+            AgentViewState::Inactive => None,
         }
     }
 
@@ -700,7 +709,11 @@ impl AgentViewController {
                 .active_block()
                 .is_active_and_long_running()
                 && !terminal_model.is_conversation_transcript_viewer()
-                && !matches!(origin, AgentViewEntryOrigin::ThirdPartyCloudAgent)
+                && !matches!(
+                    origin,
+                    AgentViewEntryOrigin::ThirdPartyCloudAgent
+                        | AgentViewEntryOrigin::LocalFullTerminalUse
+                )
         };
 
         if is_long_running {

@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::agent::AIAgentContext;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
+use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::{AIQueryHistory, BlocklistAIPermissions};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
@@ -20,6 +22,7 @@ use crate::changelog_model::ChangelogModel;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::pricing::PricingInfoModel;
 use crate::search::files::model::FileSearchModel;
+use crate::search::mixer::SyncDataSource;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::input::slash_command_model::SlashCommandEntryState;
 use crate::terminal::input::slash_commands::SlashCommandsEvent;
@@ -6172,6 +6175,262 @@ fn local_agent_image_input_does_not_enable_hosted_model_image_context() {
         input.read(&app, |input, ctx| {
             assert!(!input.should_show_image_context_button(ctx));
             assert!(!input.is_image_context_enabled(ctx));
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_selector_shows_local_choice_when_enabled() {
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let terminal_view_id = terminal.id();
+        let data_source =
+            crate::terminal::input::models::ModelSelectorDataSource::new(terminal_view_id);
+        let query = crate::search::data_source::Query {
+            filters: [crate::search::QueryFilter::FullTerminalUseModels]
+                .into_iter()
+                .collect(),
+            text: String::new(),
+        };
+
+        let results = terminal.read(&app, |_, ctx| data_source.run_query(&query, ctx).unwrap());
+
+        assert_eq!(
+            results[0].accept_result().id,
+            local_openai_llm_id("qwen2.5-coder")
+        );
+        assert_eq!(
+            results[0].accessibility_label(),
+            "Model: Local Agent (qwen2.5-coder) (selected)"
+        );
+        assert!(results
+            .iter()
+            .skip(1)
+            .any(|result| result.accept_result().id == LLMId::from("cli-agent-auto")));
+    });
+}
+
+#[test]
+fn local_full_terminal_use_selector_is_unchanged_when_flag_disabled() {
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let data_source =
+            crate::terminal::input::models::ModelSelectorDataSource::new(terminal.id());
+        let query = crate::search::data_source::Query {
+            filters: [crate::search::QueryFilter::FullTerminalUseModels]
+                .into_iter()
+                .collect(),
+            text: String::new(),
+        };
+
+        let results = terminal.read(&app, |_, ctx| data_source.run_query(&query, ctx).unwrap());
+
+        assert_eq!(results[0].accept_result().id, LLMId::from("cli-agent-auto"));
+        assert!(results
+            .iter()
+            .all(|result| result.accept_result().id != local_openai_llm_id("qwen2.5-coder")));
+    });
+}
+
+#[test]
+fn local_full_terminal_use_start_enters_agent_view_without_cli_agent_session() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal
+                .model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "ALT_SCREEN_GRID_SENTINEL");
+            terminal.model.lock().enter_alt_screen(true);
+            terminal.input().update(ctx, |input, ctx| {
+                input.handle_action(&InputAction::StartNewAgentConversation, ctx)
+            });
+        });
+
+        terminal.read(&app, |terminal, ctx| {
+            let state = terminal
+                .agent_view_controller()
+                .as_ref(ctx)
+                .agent_view_state();
+            assert!(state.is_fullscreen());
+            assert_eq!(
+                state.origin(),
+                Some(AgentViewEntryOrigin::LocalFullTerminalUse)
+            );
+            assert!(CLIAgentSessionsModel::as_ref(ctx)
+                .session(terminal.id())
+                .is_none());
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_does_not_relabel_plain_agent_entry() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal.input().update(ctx, |input, ctx| {
+                input.handle_action(&InputAction::StartNewAgentConversation, ctx)
+            });
+        });
+
+        terminal.read(&app, |terminal, ctx| {
+            let state = terminal
+                .agent_view_controller()
+                .as_ref(ctx)
+                .agent_view_state();
+            assert!(state.is_fullscreen());
+            assert_eq!(
+                state.origin(),
+                Some(AgentViewEntryOrigin::Input {
+                    was_prompt_autodetected: false
+                })
+            );
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_route_bridge_sets_local_model_and_context_boundary() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+            manager.set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+            manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal
+                .agent_view_controller()
+                .update(ctx, |controller, ctx| {
+                    controller
+                        .try_enter_agent_view(None, AgentViewEntryOrigin::LocalFullTerminalUse, ctx)
+                        .unwrap();
+                });
+            terminal
+                .model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "ALT_SCREEN_GRID_SENTINEL");
+            terminal.model.lock().enter_alt_screen(true);
+            terminal
+                .ai_context_model()
+                .update(ctx, |context_model, ctx| {
+                    context_model.set_pending_context_selected_text(
+                        Some("selected tui text".to_string()),
+                        false,
+                        ctx,
+                    );
+                });
+        });
+        let conversation_id = terminal.read(&app, |terminal, ctx| {
+            terminal
+                .agent_view_controller()
+                .as_ref(ctx)
+                .agent_view_state()
+                .active_conversation_id()
+                .unwrap()
+        });
+
+        terminal.read(&app, |terminal, ctx| {
+            let controller = terminal.ai_controller().as_ref(ctx);
+            assert_eq!(
+                controller.active_local_full_terminal_use_model_id_for_test(ctx),
+                Some(local_openai_llm_id("qwen2.5-coder"))
+            );
+
+            let local_context = controller.local_full_terminal_use_context_for_test(ctx);
+            assert_eq!(
+                local_context,
+                vec![AIAgentContext::ForegroundProcess {
+                    command: "vim src/main.rs".to_string(),
+                    is_alt_screen: true,
+                }]
+            );
+
+            let all_context = controller.local_full_terminal_use_input_context_for_test(
+                conversation_id,
+                local_context,
+                ctx,
+            );
+            assert!(all_context.iter().any(|context| {
+                matches!(context, AIAgentContext::Directory { .. })
+            }));
+            assert!(all_context.iter().any(|context| {
+                matches!(context, AIAgentContext::SelectedText(text) if text == "selected tui text")
+            }));
+            assert!(all_context.iter().any(|context| {
+                matches!(
+                    context,
+                    AIAgentContext::ForegroundProcess {
+                        command,
+                        is_alt_screen: true,
+                    } if command == "vim src/main.rs"
+                )
+            }));
+            assert!(!all_context.iter().any(|context| {
+                matches!(context, AIAgentContext::Block(block) if block.output.contains("ALT_SCREEN_GRID_SENTINEL"))
+            }));
+
+            let params = controller.local_full_terminal_use_request_params_for_test(
+                "what is running?".to_string(),
+                crate::ai::agent::task::TaskId::new("task".to_string()),
+                conversation_id,
+                controller.local_full_terminal_use_context_for_test(ctx),
+                ctx,
+            );
+
+            let local_config = params
+                .local_direct_config
+                .expect("local FTU should route to local direct");
+            assert_eq!(params.model, local_openai_llm_id("qwen2.5-coder"));
+            assert_eq!(local_config.model, "qwen2.5-coder");
+            assert!(params.input.iter().all(|input| {
+                !matches!(
+                    input,
+                    crate::ai::agent::AIAgentInput::UserQuery {
+                        running_command: Some(_),
+                        ..
+                    }
+                )
+            }));
         });
     });
 }

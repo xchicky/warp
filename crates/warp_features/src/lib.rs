@@ -606,6 +606,9 @@ pub enum FeatureFlag {
     /// Enables plan mode for local OpenAI-compatible agents.
     LocalAgentPlanMode,
 
+    /// Enables local OpenAI-compatible agents in Full Terminal Use via fullscreen Agent View.
+    LocalAgentFullTerminalUse,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 

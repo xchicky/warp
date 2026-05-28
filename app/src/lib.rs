@@ -2796,6 +2796,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LocalAgentTodoWrite,
         #[cfg(feature = "local_agent_plan_mode")]
         FeatureFlag::LocalAgentPlanMode,
+        #[cfg(feature = "local_agent_full_terminal_use")]
+        FeatureFlag::LocalAgentFullTerminalUse,
         #[cfg(feature = "interactive_conversation_management_view")]
         FeatureFlag::InteractiveConversationManagementView,
         #[cfg(feature = "agent_tips")]

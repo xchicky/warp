@@ -14791,12 +14791,20 @@ impl TypedActionView for Input {
                 self.select_slash_command(command, SlashCommandTrigger::keybinding(), ctx);
             }
             InputAction::StartNewAgentConversation => {
-                // Block starting a new conversation if the agent is in control of a long-running command
-                if !self
+                let can_start_new_conversation = self
                     .ai_context_model
                     .as_ref(ctx)
-                    .can_start_new_conversation()
-                {
+                    .can_start_new_conversation();
+                let is_local_full_terminal_use = !can_start_new_conversation
+                    && FeatureFlag::LocalAgentFullTerminalUse.is_enabled()
+                    && local_openai_model_from_llm_id(
+                        &LLMPreferences::as_ref(ctx)
+                            .get_active_cli_agent_model_with_local(ctx, Some(self.terminal_view_id))
+                            .id,
+                    )
+                    .is_some();
+                // Block starting a new conversation if the agent is in control of a long-running command
+                if !can_start_new_conversation && !is_local_full_terminal_use {
                     let window_id = ctx.window_id();
                     ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
                         toast_stack.add_ephemeral_toast(
@@ -14811,14 +14819,15 @@ impl TypedActionView for Input {
                 }
 
                 if FeatureFlag::AgentView.is_enabled() {
+                    let origin = if is_local_full_terminal_use {
+                        AgentViewEntryOrigin::LocalFullTerminalUse
+                    } else {
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        }
+                    };
                     if let Err(e) = self.agent_view_controller.update(ctx, |controller, ctx| {
-                        controller.try_enter_agent_view(
-                            None,
-                            AgentViewEntryOrigin::Input {
-                                was_prompt_autodetected: false,
-                            },
-                            ctx,
-                        )
+                        controller.try_enter_agent_view(None, origin, ctx)
                     }) {
                         log::warn!("Failed to start new agent conversation from zero-state: {e:?}");
                     }
