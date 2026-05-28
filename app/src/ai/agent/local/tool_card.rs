@@ -2,12 +2,16 @@ use std::collections::BTreeMap;
 
 use chrono::Local;
 use serde_json::Value;
+use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
 use super::{
     apply_file_diff::ApplyFileDiffSummary,
     codebase_index::{build_search_codebase_tool_call, search_codebase_result_from_text},
     mcp_tools::LocalMcpToolCatalogEntry,
+    safe_shell_command::{
+        is_local_autoexecute_safe_command, register_local_autoexecute_safe_tool_call,
+    },
     OpenAIChatToolCall,
 };
 
@@ -18,7 +22,13 @@ pub(super) fn structured_tool_card_events(
     result: &str,
     apply_file_diff_summary: Option<&ApplyFileDiffSummary>,
 ) -> Option<Vec<api::ResponseEvent>> {
-    let tool = build_tool_call(&tool_call.function.name, &tool_call.function.arguments)?;
+    let tool = build_tool_call(
+        task_id,
+        request_id,
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        &tool_call.id,
+    )?;
     let result = build_tool_call_result(&tool_call.function.name, result, apply_file_diff_summary)?;
 
     Some(vec![
@@ -32,7 +42,13 @@ pub(super) fn structured_tool_call_event(
     request_id: &str,
     tool_call: &OpenAIChatToolCall,
 ) -> Option<api::ResponseEvent> {
-    let tool = build_tool_call(&tool_call.function.name, &tool_call.function.arguments)?;
+    let tool = build_tool_call(
+        task_id,
+        request_id,
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        &tool_call.id,
+    )?;
     Some(add_tool_call_message(task_id, request_id, tool_call, tool))
 }
 
@@ -46,7 +62,13 @@ pub(super) fn structured_mcp_tool_call_event(
     Some(add_tool_call_message(task_id, request_id, tool_call, tool))
 }
 
-fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_call::Tool> {
+fn build_tool_call(
+    task_id: &str,
+    request_id: &str,
+    name: &str,
+    arguments: &str,
+    tool_call_id: &str,
+) -> Option<api::message::tool_call::Tool> {
     match name {
         "read_file" => Some(api::message::tool_call::Tool::ReadFiles(
             build_read_files_tool_call(arguments),
@@ -72,9 +94,28 @@ fn build_tool_call(name: &str, arguments: &str) -> Option<api::message::tool_cal
         "edit_file" => Some(api::message::tool_call::Tool::ApplyFileDiffs(
             build_edit_file_tool_call(arguments),
         )),
-        "run_shell_command" => Some(api::message::tool_call::Tool::RunShellCommand(
-            build_run_shell_command_tool_call(arguments),
-        )),
+        "run_shell_command" => {
+            let command = parse_args(arguments)
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let local_autoexecute_safe = FeatureFlag::LocalAgentAutoExecuteSafeCommands
+                .is_enabled()
+                && is_local_autoexecute_safe_command(&command);
+            if local_autoexecute_safe {
+                register_local_autoexecute_safe_tool_call(
+                    task_id,
+                    request_id,
+                    tool_call_id,
+                    &command,
+                );
+            }
+            Some(api::message::tool_call::Tool::RunShellCommand(
+                build_run_shell_command_tool_call(arguments, local_autoexecute_safe),
+            ))
+        }
         _ => None,
     }
 }
@@ -292,10 +333,13 @@ fn build_edit_file_tool_call(arguments: &str) -> api::message::tool_call::ApplyF
     }
 }
 
-fn build_run_shell_command_tool_call(arguments: &str) -> api::message::tool_call::RunShellCommand {
+fn build_run_shell_command_tool_call(
+    arguments: &str,
+    local_autoexecute_safe: bool,
+) -> api::message::tool_call::RunShellCommand {
     let args = parse_args(arguments);
-    let is_read_only = optional_bool_arg(&args, "is_read_only").unwrap_or(false);
-    let is_risky = optional_bool_arg(&args, "is_risky").unwrap_or(!is_read_only);
+    let is_read_only = local_autoexecute_safe;
+    let is_risky = !local_autoexecute_safe;
     api::message::tool_call::RunShellCommand {
         command: optional_string_arg(&args, "command").unwrap_or_default(),
         is_read_only,

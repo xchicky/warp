@@ -682,6 +682,57 @@ fn test_can_autoexecute_command_denylist_precedence() {
 }
 
 #[test]
+fn test_can_autoexecute_local_static_safe_command_denylist_precedence() {
+    App::test((), |mut app| async move {
+        let PermissionsTestState {
+            convo_id,
+            permissions,
+            profile_model,
+            terminal_view_id,
+            ..
+        } = initialize_permissions_test(&mut app);
+
+        profile_model.update(&mut app, |model, ctx| {
+            model.add_to_command_denylist(
+                *model.active_profile(Some(terminal_view_id), ctx).id(),
+                &AgentModeCommandExecutionPredicate::new_regex("pwd").unwrap(),
+                ctx,
+            );
+        });
+
+        permissions.read(&app, |model, ctx| {
+            let result = model.can_autoexecute_local_static_safe_command(
+                &convo_id,
+                "pwd",
+                EscapeChar::Backslash,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Denied(
+                    CommandExecutionPermissionDeniedReason::ExplicitlyDenylisted
+                )
+            ));
+
+            let result = model.can_autoexecute_local_static_safe_command(
+                &convo_id,
+                "ls",
+                EscapeChar::Backslash,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Allowed(
+                    CommandExecutionPermissionAllowedReason::LocalStaticSafeCommand
+                )
+            ));
+        });
+    });
+}
+
+#[test]
 fn test_can_autoexecute_command_allowlist_precedence() {
     App::test((), |mut app| async move {
         let PermissionsTestState {

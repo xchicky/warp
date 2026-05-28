@@ -11,6 +11,7 @@ use itertools::Itertools;
 use parking_lot::FairMutex;
 use warp_core::command::ExitCode;
 use warp_core::execution_mode::AppExecutionMode;
+use warp_core::features::FeatureFlag;
 use warp_util::path::ShellFamily;
 use warpui::r#async::{Spawnable, Timer};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
@@ -114,6 +115,7 @@ impl ShellCommandExecutor {
                 command,
                 is_read_only,
                 is_risky,
+                local_autoexecute_safe,
                 ..
             } => {
                 let Some(escape_char) = self
@@ -124,15 +126,27 @@ impl ShellCommandExecutor {
                 else {
                     return false;
                 };
-                let autoexecution_permission = blocklist_permissions.can_autoexecute_command(
-                    &input.conversation_id,
-                    command,
-                    escape_char,
-                    is_read_only.unwrap_or(false),
-                    *is_risky,
-                    Some(self.terminal_view_id),
-                    ctx,
-                );
+                let autoexecution_permission = if *local_autoexecute_safe
+                    && FeatureFlag::LocalAgentAutoExecuteSafeCommands.is_enabled()
+                {
+                    blocklist_permissions.can_autoexecute_local_static_safe_command(
+                        &input.conversation_id,
+                        command,
+                        escape_char,
+                        Some(self.terminal_view_id),
+                        ctx,
+                    )
+                } else {
+                    blocklist_permissions.can_autoexecute_command(
+                        &input.conversation_id,
+                        command,
+                        escape_char,
+                        is_read_only.unwrap_or(false),
+                        *is_risky,
+                        Some(self.terminal_view_id),
+                        ctx,
+                    )
+                };
                 if let CommandExecutionPermission::Allowed(reason) = autoexecution_permission {
                     send_telemetry_from_ctx!(
                         TelemetryEvent::AutoexecutedAgentModeRequestedCommand { reason },

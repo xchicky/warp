@@ -40,6 +40,7 @@ impl From<api::message::tool_call::RunShellCommand> for AIAgentActionType {
                 .iter()
                 .filter_map(|citation| citation.clone().try_into().ok())
                 .collect(),
+            local_autoexecute_safe: false,
         }
     }
 }

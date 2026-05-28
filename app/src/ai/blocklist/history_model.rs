@@ -1351,6 +1351,7 @@ impl BlocklistAIHistoryModel {
         client_actions: Vec<warp_multi_agent_api::ClientAction>,
         conversation_id: AIConversationId,
         terminal_view_id: EntityId,
+        allow_local_autoexecute_marker: bool,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), UpdateHistoryError> {
         let mut current_conversation_id = conversation_id;
@@ -1379,6 +1380,7 @@ impl BlocklistAIHistoryModel {
                         response_stream_id,
                         terminal_view_id,
                         action,
+                        allow_local_autoexecute_marker,
                         ctx,
                     )?;
                 }

@@ -226,6 +226,8 @@ enum MaybeAIAgentAction {
 
 pub struct ConversionParams<'a> {
     pub task_id: &'a TaskId,
+    pub request_id: Option<&'a str>,
+    pub allow_local_autoexecute_marker: bool,
     pub current_todo_list: Option<&'a AIAgentTodoList>,
     pub active_code_review: Option<&'a CodeReview>,
 }
@@ -254,6 +256,10 @@ impl ConvertAPIMessageToClientOutputMessage for api::Message {
             .iter()
             .map(|citation| (*citation).clone().try_into())
             .collect::<Result<Vec<AIAgentCitation>, UnknownCitationTypeError>>()?;
+        let params = ConversionParams {
+            request_id: Some(&self.request_id),
+            ..params
+        };
 
         match message {
             api::message::Message::AgentOutput(output) => Ok(MaybeAIAgentOutputMessage::Message(
@@ -689,7 +695,24 @@ impl ConvertAPIToolCallToAIAgentAction for api::message::ToolCall {
 
         match tool {
             api::message::tool_call::Tool::RunShellCommand(run_shell_command) => {
-                create_standard_action(run_shell_command.into())
+                let command = run_shell_command.command.clone();
+                let mut action: AIAgentActionType = run_shell_command.into();
+                if let AIAgentActionType::RequestCommandOutput {
+                    local_autoexecute_safe,
+                    ..
+                } = &mut action
+                {
+                    *local_autoexecute_safe = params.allow_local_autoexecute_marker
+                        && params.request_id.is_some_and(|request_id| {
+                            crate::ai::agent::local::take_local_autoexecute_safe_tool_call(
+                                params.task_id,
+                                request_id,
+                                &self.tool_call_id,
+                                &command,
+                            )
+                        });
+                }
+                create_standard_action(action)
             }
             api::message::tool_call::Tool::WriteToLongRunningShellCommand(
                 write_to_long_running_shell_command,
