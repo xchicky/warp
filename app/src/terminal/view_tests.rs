@@ -4318,6 +4318,66 @@ fn open_cli_agent_rich_input_for_agent_with_window_id(
     (window_id, terminal)
 }
 
+#[test]
+fn local_full_terminal_use_cli_input_submits_to_agent_view_without_pty_write() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _cli_agent_rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let (_, terminal) =
+            open_cli_agent_rich_input_for_agent_with_window_id(&mut app, CLIAgent::Claude);
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    writes.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+                manager
+                    .set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+                manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+            });
+            let profile_id = *AIExecutionProfilesModel::as_ref(ctx)
+                .active_profile(Some(view.view_id), ctx)
+                .id();
+            AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+                profiles.set_cli_agent_model(
+                    profile_id,
+                    Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder")),
+                    ctx,
+                );
+            });
+
+            view.handle_input_event(
+                &InputEvent::SubmitCLIAgentInput {
+                    text: "What is running?".to_string(),
+                },
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(pty_writes.borrow().is_empty());
+            assert!(!view.has_active_cli_agent_input_session(ctx));
+            let state = view.agent_view_controller().as_ref(ctx).agent_view_state();
+            assert!(state.is_fullscreen());
+            assert_eq!(
+                state.origin(),
+                Some(AgentViewEntryOrigin::LocalFullTerminalUse)
+            );
+        });
+    });
+}
+
 /// Verifies that Ctrl-G closes CLI agent rich input when dispatched from the
 /// focused editor context. This is a regression test for #9286 where the
 /// keybinding only matched the terminal context, not the embedded editor.

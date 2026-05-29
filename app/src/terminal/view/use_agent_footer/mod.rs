@@ -265,6 +265,13 @@ impl TerminalView {
                 self.stop_sharing_session(SharedSessionActionSource::FooterChip, ctx);
             }
             UseAgentToolbarEvent::OpenRichInput => {
+                if self.is_local_full_terminal_use_model_selected(ctx) {
+                    if self.has_active_cli_agent_input_session(ctx) {
+                        self.close_cli_agent_rich_input_and_disable_auto_toggle(ctx);
+                    }
+                    self.enter_local_full_terminal_use_agent_view(None, ctx);
+                    return;
+                }
                 if self.has_active_cli_agent_input_session(ctx) {
                     self.close_cli_agent_rich_input_and_disable_auto_toggle(ctx);
                 } else {

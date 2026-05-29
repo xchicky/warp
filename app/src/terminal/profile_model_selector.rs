@@ -622,7 +622,8 @@ impl ProfileModelSelector {
                     .active_block()
                     .is_agent_in_control_or_tagged_in()
             {
-                llm_preferences.get_active_cli_agent_model(ctx, Some(self.terminal_view_id))
+                &llm_preferences
+                    .get_active_cli_agent_model_with_local(ctx, Some(self.terminal_view_id))
             } else {
                 llm_preferences.get_active_base_model(ctx, Some(self.terminal_view_id))
             };
@@ -1385,10 +1386,11 @@ impl ProfileModelSelector {
                 .is_agent_in_control_or_tagged_in();
         drop(terminal_model);
 
+        let local_cli_agent_model;
         let model_display_name = if is_lrc {
-            llm_preferences
-                .get_active_cli_agent_model(app, Some(self.terminal_view_id))
-                .menu_display_name()
+            local_cli_agent_model = llm_preferences
+                .get_active_cli_agent_model_with_local(app, Some(self.terminal_view_id));
+            local_cli_agent_model.menu_display_name()
         } else {
             llm_preferences
                 .get_active_base_model(app, Some(self.terminal_view_id))
