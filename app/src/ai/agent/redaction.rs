@@ -341,6 +341,9 @@ fn redact_context(context: &mut [AIAgentContext]) {
             AIAgentContext::SelectedText(text) => {
                 redact_secrets(text);
             }
+            AIAgentContext::ForegroundProcess { command, .. } => {
+                redact_secrets(command);
+            }
             // Other context types don't contain user-provided text that needs redaction
             AIAgentContext::Directory { .. }
             | AIAgentContext::ExecutionEnvironment(_)

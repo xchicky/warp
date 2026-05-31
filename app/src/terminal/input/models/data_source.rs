@@ -151,7 +151,7 @@ impl SyncDataSource for ModelSelectorDataSource {
 
         let active_llm_id = if is_full_terminal {
             llm_preferences
-                .get_active_cli_agent_model(app, Some(self.terminal_view_id))
+                .get_active_cli_agent_model_with_local(app, Some(self.terminal_view_id))
                 .id
                 .clone()
         } else {
@@ -161,11 +161,14 @@ impl SyncDataSource for ModelSelectorDataSource {
                 .clone()
         };
 
-        let choices: Vec<&LLMInfo> = if is_full_terminal {
-            llm_preferences.get_cli_agent_llm_choices().collect_vec()
+        let choices: Vec<LLMInfo> = if is_full_terminal {
+            llm_preferences
+                .get_cli_agent_llm_choices_with_local(app)
+                .collect_vec()
         } else {
             llm_preferences
                 .get_base_llm_choices_for_agent_mode()
+                .cloned()
                 .collect_vec()
         };
 
@@ -174,7 +177,7 @@ impl SyncDataSource for ModelSelectorDataSource {
         if query_text.is_empty() {
             return Ok(choices
                 .into_iter()
-                .map(|llm| QueryResult::from(ModelSearchItem::new(llm, &active_llm_id, app)))
+                .map(|llm| QueryResult::from(ModelSearchItem::new(&llm, &active_llm_id, app)))
                 .collect());
         }
 
@@ -192,7 +195,7 @@ impl SyncDataSource for ModelSelectorDataSource {
                 }
 
                 Some(QueryResult::from(
-                    ModelSearchItem::new(llm, &active_llm_id, app)
+                    ModelSearchItem::new(&llm, &active_llm_id, app)
                         .with_name_match_result(Some(match_result.clone()))
                         .with_score(OrderedFloat(match_result.score as f64)),
                 ))

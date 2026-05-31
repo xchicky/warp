@@ -4516,6 +4516,13 @@ fn context_section(context: &AIAgentContext) -> Option<String> {
         AIAgentContext::CurrentTime { current_time } => {
             Some(format!("Current time: {}", current_time.to_rfc3339()))
         }
+        AIAgentContext::ForegroundProcess {
+            command,
+            is_alt_screen,
+        } if !command.trim().is_empty() => Some(format!(
+            "Foreground process:\n- command: {command}\n- alt screen active: {is_alt_screen}"
+        )),
+        AIAgentContext::ForegroundProcess { .. } => None,
         AIAgentContext::ProjectRules {
             root_path,
             active_rules,
@@ -9219,6 +9226,41 @@ mod tests {
         assert!(message.contains("shell: zsh 5.9"));
         assert!(message.contains("Current time: 2026-05-15T12:00:00"));
         assert!(message.contains("branch: main"));
+    }
+
+    #[test]
+    fn local_full_terminal_use_context_includes_foreground_process_without_grid_or_history() {
+        let input = vec![user_query_input(
+            "what is running?",
+            vec![
+                AIAgentContext::Directory {
+                    pwd: Some("/repo".to_string()),
+                    home_dir: Some("/home/me".to_string()),
+                    are_file_symbols_indexed: false,
+                },
+                AIAgentContext::SelectedText("selected tui text".to_string()),
+                AIAgentContext::ForegroundProcess {
+                    command: "vim src/main.rs".to_string(),
+                    is_alt_screen: true,
+                },
+            ],
+            HashMap::new(),
+        )];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[], None, true).unwrap();
+        let message = &messages.last().unwrap().content;
+
+        assert!(message.contains("cwd: /repo"));
+        assert!(message.contains("Selected text"));
+        assert!(message.contains("selected tui text"));
+        assert!(message.contains("Foreground process"));
+        assert!(message.contains("command: vim src/main.rs"));
+        assert!(message.contains("alt screen active: true"));
+        assert!(!message.contains("Terminal block"));
+        assert!(!message.contains("grid"));
+        assert!(!message.contains("shell history"));
+        assert!(!message.contains("stdout"));
+        assert!(!message.contains("stdin"));
     }
 
     #[test]

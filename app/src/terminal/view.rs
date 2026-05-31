@@ -166,7 +166,7 @@ use crate::workspaces::user_workspaces::UserWorkspacesEvent;
 
 pub use self::link_detection::GridHighlightedLink;
 pub use self::link_detection::{RichContentLink, RichContentLinkTooltipInfo};
-use crate::ai::llms::{LLMId, LLMModelHost, LLMPreferences};
+use crate::ai::llms::{local_openai_model_from_llm_id, LLMId, LLMModelHost, LLMPreferences};
 use crate::settings::CodeSettings;
 pub use action::{AgentOnboardingVersion, OnboardingIntention, OnboardingVersion, TerminalAction};
 use ai::api_keys::{ApiKeyManager, AwsCredentialsState};
@@ -20712,6 +20712,10 @@ impl TerminalView {
                 });
             }
             InputEvent::SubmitCLIAgentInput { text } => {
+                if self.is_local_full_terminal_use_model_selected(ctx) {
+                    self.submit_local_full_terminal_use_prompt(text.clone(), ctx);
+                    return;
+                }
                 self.submit_cli_agent_rich_input(text.clone(), ctx);
             }
             InputEvent::OpenAIDocumentPane {
@@ -21794,6 +21798,98 @@ impl TerminalView {
             self.focus_terminal(ctx);
             Some(CliAgentRouting::Pty)
         }
+    }
+
+    pub(in crate::terminal) fn is_local_full_terminal_use_model_selected(
+        &self,
+        app: &AppContext,
+    ) -> bool {
+        if !FeatureFlag::LocalAgentFullTerminalUse.is_enabled() {
+            return false;
+        }
+
+        let model = LLMPreferences::as_ref(app)
+            .get_active_cli_agent_model_with_local(app, Some(self.view_id));
+        local_openai_model_from_llm_id(&model.id).is_some()
+    }
+
+    pub(in crate::terminal) fn enter_local_full_terminal_use_agent_view(
+        &mut self,
+        initial_prompt: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(prompt) = initial_prompt {
+            self.submit_local_full_terminal_use_prompt(prompt, ctx);
+            return;
+        }
+
+        self.detach_cli_agent_session_for_local_full_terminal_use(
+            CLIAgentRichInputCloseReason::Other,
+            ctx,
+        );
+        if let Err(error) = self.agent_view_controller.update(ctx, |controller, ctx| {
+            controller.try_enter_agent_view(None, AgentViewEntryOrigin::LocalFullTerminalUse, ctx)
+        }) {
+            log::warn!("Failed to enter local Full Terminal Use Agent View: {error:?}");
+            self.show_error_toast(error.to_string(), ctx);
+        }
+    }
+
+    fn detach_cli_agent_session_for_local_full_terminal_use(
+        &mut self,
+        close_reason: CLIAgentRichInputCloseReason,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let view_id = self.view_id;
+        self.close_cli_agent_rich_input(close_reason, ctx);
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.remove_session(view_id, ctx);
+        });
+
+        let active_block_agent_state = {
+            let model = self.model.lock();
+            let active_block = model.block_list().active_block();
+            (
+                active_block.is_agent_in_control(),
+                active_block.is_agent_tagged_in(),
+            )
+        };
+        if active_block_agent_state.0 {
+            self.cli_subagent_controller.update(ctx, |controller, ctx| {
+                controller.switch_control_to_user(UserTakeOverReason::Manual, ctx);
+            });
+        } else if active_block_agent_state.1 {
+            self.tag_agent_out(ctx);
+        }
+    }
+
+    fn submit_local_full_terminal_use_prompt(&mut self, text: String, ctx: &mut ViewContext<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+
+        self.input.update(ctx, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+        });
+        self.detach_cli_agent_session_for_local_full_terminal_use(
+            CLIAgentRichInputCloseReason::Submit,
+            ctx,
+        );
+
+        let conversation_id = match self.agent_view_controller.update(ctx, |controller, ctx| {
+            controller.try_enter_agent_view(None, AgentViewEntryOrigin::LocalFullTerminalUse, ctx)
+        }) {
+            Ok(conversation_id) => conversation_id,
+            Err(error) => {
+                log::warn!("Failed to submit local Full Terminal Use prompt: {error:?}");
+                self.show_error_toast(error.to_string(), ctx);
+                return;
+            }
+        };
+
+        self.ai_controller.update(ctx, |controller, ctx| {
+            controller.send_user_query_in_conversation(text, conversation_id, None, ctx);
+        });
     }
 
     /// Sends code review comments to a running CLI agent, routing to the

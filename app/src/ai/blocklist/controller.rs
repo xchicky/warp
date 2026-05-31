@@ -18,9 +18,10 @@ use super::{
     action_model::{BlocklistAIActionEvent, BlocklistAIActionModel},
     agent_view::{AgentViewController, AgentViewControllerEvent},
     context_model::BlocklistAIContextModel,
+    conversation_latest_exchange_local_openai_model_id,
     history_model::BlocklistAIHistoryModel,
     input_model::InputConfig,
-    BlocklistAIInputModel, InputType,
+    selected_local_full_terminal_use_model_id, BlocklistAIInputModel, InputType,
 };
 use crate::ai::agent::api::{self, ServerConversationToken};
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
@@ -250,6 +251,11 @@ impl RequestInput {
         self
     }
 
+    fn with_model_id(mut self, model_id: LLMId) -> Self {
+        self.model_id = model_id;
+        self
+    }
+
     fn new_with_common_fields(
         conversation_id: AIConversationId,
         active_session: &ModelHandle<ActiveSession>,
@@ -354,6 +360,12 @@ enum InputQueryType {
     AIInputType { ai_input: AIAgentInput },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputRoute {
+    Default,
+    LocalFullTerminalUse,
+}
+
 enum WhichTask {
     NewConversation,
     Task {
@@ -387,6 +399,8 @@ impl LocalClaudeWakeTrigger {
 struct InputQuery {
     which_task: WhichTask,
     input_query: InputQueryType,
+    route: InputRoute,
+    additional_context: Vec<AIAgentContext>,
     /// Additional referenced attachments to include in the query
     /// (e.g. file path references from shared session file uploads).
     additional_attachments: HashMap<String, AIAgentAttachment>,
@@ -603,6 +617,141 @@ impl BlocklistAIController {
         }
     }
 
+    fn target_conversation_local_full_terminal_use_model_id(
+        &self,
+        conversation_id: &AIConversationId,
+        app: &AppContext,
+    ) -> Option<LLMId> {
+        conversation_latest_exchange_local_openai_model_id(
+            BlocklistAIHistoryModel::as_ref(app),
+            conversation_id,
+        )
+    }
+
+    fn selected_local_full_terminal_use_model_id(&self, app: &AppContext) -> Option<LLMId> {
+        selected_local_full_terminal_use_model_id(app, self.terminal_view_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_conversation_local_full_terminal_use_model_id_for_test(
+        &self,
+        conversation_id: &AIConversationId,
+        app: &AppContext,
+    ) -> Option<LLMId> {
+        self.target_conversation_local_full_terminal_use_model_id(conversation_id, app)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_local_full_terminal_use_model_id_for_test(
+        &self,
+        app: &AppContext,
+    ) -> Option<LLMId> {
+        self.selected_local_full_terminal_use_model_id(app)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_full_terminal_use_context_for_test(
+        &self,
+        app: &AppContext,
+    ) -> Vec<AIAgentContext> {
+        if self
+            .selected_local_full_terminal_use_model_id(app)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let terminal_model = self.terminal_model.lock();
+        foreground_process_context(&terminal_model)
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_input_with_local_full_terminal_use_model_for_test(
+        &self,
+        mut request_input: RequestInput,
+        app: &AppContext,
+    ) -> RequestInput {
+        if let Some(model_id) = self.target_conversation_local_full_terminal_use_model_id(
+            &request_input.conversation_id,
+            app,
+        ) {
+            request_input = request_input.with_model_id(model_id);
+        }
+        request_input
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_full_terminal_use_request_params_for_test(
+        &self,
+        query: String,
+        task_id: TaskId,
+        conversation_id: AIConversationId,
+        additional_context: Vec<AIAgentContext>,
+        app: &AppContext,
+    ) -> api::RequestParams {
+        let context = input_context_for_request(
+            true,
+            self.context_model.as_ref(app),
+            self.active_session.as_ref(app),
+            Some(conversation_id),
+            additional_context,
+            app,
+        );
+        let request_input = RequestInput::for_task(
+            vec![AIAgentInput::UserQuery {
+                query,
+                context,
+                static_query_type: None,
+                referenced_attachments: HashMap::new(),
+                user_query_mode: UserQueryMode::Normal,
+                running_command: None,
+                intended_agent: None,
+            }],
+            task_id,
+            &self.active_session,
+            self.get_current_response_initiator(),
+            conversation_id,
+            self.terminal_view_id,
+            app,
+        );
+        let request_input =
+            self.request_input_with_local_full_terminal_use_model_for_test(request_input, app);
+
+        api::RequestParams::new(
+            Some(self.terminal_view_id),
+            SessionContext::from_session(self.active_session.as_ref(app), app),
+            &request_input,
+            api::ConversationData {
+                id: conversation_id,
+                tasks: Vec::new(),
+                server_conversation_token: None,
+                forked_from_conversation_token: None,
+                ambient_agent_task_id: None,
+                existing_suggestions: None,
+            },
+            None,
+            app,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_full_terminal_use_input_context_for_test(
+        &self,
+        conversation_id: AIConversationId,
+        additional_context: Vec<AIAgentContext>,
+        app: &AppContext,
+    ) -> Arc<[AIAgentContext]> {
+        input_context_for_request(
+            true,
+            self.context_model.as_ref(app),
+            self.active_session.as_ref(app),
+            Some(conversation_id),
+            additional_context,
+            app,
+        )
+    }
+
     /// Internal method to send a query to the AI model. External callers should use either
     /// `send_user_query_in_conversation`, `send_user_in_conversation`, or
     /// `send_custom_ai_input_query` instead.
@@ -682,7 +831,7 @@ impl BlocklistAIController {
             self.context_model.as_ref(ctx),
             self.active_session.as_ref(ctx),
             Some(conversation_id),
-            vec![],
+            input_query.additional_context.clone(),
             ctx,
         );
         let mut inputs = if should_prepend_finished_action_results {
@@ -734,6 +883,7 @@ impl BlocklistAIController {
                 static_query_type,
                 user_query_mode,
                 running_command,
+                input_query.additional_context,
                 additional_attachments,
                 self.context_model.as_ref(ctx),
                 self.active_session.as_ref(ctx),
@@ -755,16 +905,28 @@ impl BlocklistAIController {
             });
         }
 
+        let mut request_input = RequestInput::for_task(
+            inputs,
+            task_id,
+            &self.active_session,
+            self.get_current_response_initiator(),
+            conversation_id,
+            self.terminal_view_id,
+            ctx,
+        );
+        if input_query.route == InputRoute::LocalFullTerminalUse {
+            if let Some(model_id) = self
+                .target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx)
+                .or_else(|| self.selected_local_full_terminal_use_model_id(ctx))
+            {
+                request_input = request_input.with_model_id(model_id);
+            } else {
+                log::warn!("Local Full Terminal Use route requested without active local model");
+            }
+        }
+
         let send_result = self.send_request_input(
-            RequestInput::for_task(
-                inputs,
-                task_id,
-                &self.active_session,
-                self.get_current_response_initiator(),
-                conversation_id,
-                self.terminal_view_id,
-                ctx,
-            ),
+            request_input,
             Some(RequestMetadata {
                 is_autodetected_user_query: !self.input_model.as_ref(ctx).is_input_type_locked(),
                 entrypoint: entrypoint_type,
@@ -917,7 +1079,35 @@ impl BlocklistAIController {
             let terminal_model = self.terminal_model.lock();
             get_running_command(&terminal_model)
         };
+        let local_full_terminal_use_model = self.selected_local_full_terminal_use_model_id(ctx);
         if let Some(running_command) = running_command {
+            if local_full_terminal_use_model.is_some() {
+                let additional_context = {
+                    let terminal_model = self.terminal_model.lock();
+                    foreground_process_context(&terminal_model)
+                        .into_iter()
+                        .collect()
+                };
+                self.send_query(
+                    InputQuery {
+                        which_task: WhichTask::NewConversation,
+                        input_query: InputQueryType::UserSubmittedQueryFromInput {
+                            query,
+                            static_query_type,
+                            running_command: None,
+                        },
+                        route: InputRoute::LocalFullTerminalUse,
+                        additional_context,
+                        additional_attachments: HashMap::new(),
+                    },
+                    entrypoint_type,
+                    participant_id,
+                    is_queued_prompt,
+                    ctx,
+                );
+                return;
+            }
+
             let conversation_id = self.start_new_conversation_for_request(ctx).id();
             let history_model = BlocklistAIHistoryModel::handle(ctx);
             let task_id = match history_model.update(ctx, |history_model, ctx| {
@@ -945,6 +1135,8 @@ impl BlocklistAIController {
                         static_query_type,
                         running_command: Some(running_command),
                     },
+                    route: InputRoute::Default,
+                    additional_context: Vec::new(),
                     additional_attachments: HashMap::new(),
                 },
                 entrypoint_type,
@@ -953,6 +1145,7 @@ impl BlocklistAIController {
                 ctx,
             );
         } else {
+            let is_local_full_terminal_use = local_full_terminal_use_model.is_some();
             self.send_query(
                 InputQuery {
                     which_task: WhichTask::NewConversation,
@@ -961,6 +1154,12 @@ impl BlocklistAIController {
                         static_query_type,
                         running_command: None,
                     },
+                    route: if is_local_full_terminal_use {
+                        InputRoute::LocalFullTerminalUse
+                    } else {
+                        InputRoute::Default
+                    },
+                    additional_context: Vec::new(),
                     additional_attachments: HashMap::new(),
                 },
                 entrypoint_type,
@@ -1106,7 +1305,13 @@ impl BlocklistAIController {
             .pending_context_block_ids()
             .clone();
 
-        let (promoted_blocks, task_id, running_command) = {
+        let (
+            promoted_blocks,
+            task_id,
+            running_command,
+            is_local_full_terminal_use,
+            additional_context,
+        ) = {
             let mut terminal_model = self.terminal_model.lock();
             terminal_model
                 .block_list_mut()
@@ -1119,11 +1324,22 @@ impl BlocklistAIController {
                 .promote_blocks_to_attached_from_conversation(conversation_id);
 
             let active_block = terminal_model.block_list().active_block();
-            let running_command_opt = if !skip_running_command_detection {
-                get_running_command(&terminal_model)
-            } else {
-                None
-            };
+            let local_full_terminal_use_model =
+                self.target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx);
+            let running_command_opt =
+                if !skip_running_command_detection && local_full_terminal_use_model.is_none() {
+                    get_running_command(&terminal_model)
+                } else {
+                    None
+                };
+            let additional_context =
+                if local_full_terminal_use_model.is_some() && !skip_running_command_detection {
+                    foreground_process_context(&terminal_model)
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
             let (task_id, running_command) = if let Some(running_command) = running_command_opt {
                 let history_model = BlocklistAIHistoryModel::handle(ctx);
@@ -1143,7 +1359,7 @@ impl BlocklistAIController {
                 }
             } else if let Some(task_id) = active_block
                 .is_agent_monitoring()
-                .then(|| active_block.agent_interaction_metadata())
+                .then_some(active_block.agent_interaction_metadata())
                 .flatten()
                 .filter(|metadata| metadata.conversation_id() == &conversation_id)
                 .and_then(|metadata| metadata.subagent_task_id().cloned())
@@ -1161,7 +1377,13 @@ impl BlocklistAIController {
                 (conversation.get_root_task_id().clone(), None)
             };
 
-            (promoted_blocks, task_id, running_command)
+            (
+                promoted_blocks,
+                task_id,
+                running_command,
+                local_full_terminal_use_model.is_some(),
+                additional_context,
+            )
         };
 
         // Persist the updated visibility for each promoted block
@@ -1194,6 +1416,12 @@ impl BlocklistAIController {
                     static_query_type: None,
                     running_command,
                 },
+                route: if is_local_full_terminal_use {
+                    InputRoute::LocalFullTerminalUse
+                } else {
+                    InputRoute::Default
+                },
+                additional_context,
                 additional_attachments,
             },
             entrypoint_type,
@@ -1218,6 +1446,8 @@ impl BlocklistAIController {
                     static_query_type: query_type.static_query_type(),
                     running_command: None,
                 },
+                route: InputRoute::Default,
+                additional_context: Vec::new(),
                 additional_attachments: HashMap::new(),
             },
             EntrypointType::ZeroStateAgentModePromptSuggestion,
@@ -1254,6 +1484,8 @@ impl BlocklistAIController {
             InputQuery {
                 which_task,
                 input_query: InputQueryType::AIInputType { ai_input },
+                route: InputRoute::Default,
+                additional_context: Vec::new(),
                 additional_attachments: HashMap::new(),
             },
             EntrypointType::UserInitiated,
@@ -1388,6 +1620,8 @@ impl BlocklistAIController {
                         context,
                     },
                 },
+                route: InputRoute::Default,
+                additional_context: Vec::new(),
                 additional_attachments: HashMap::new(),
             },
             EntrypointType::TriggerPassiveSuggestion {
@@ -1479,6 +1713,11 @@ impl BlocklistAIController {
             self.terminal_view_id,
             ctx,
         );
+        if let Some(model_id) =
+            self.target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx)
+        {
+            request_input = request_input.with_model_id(model_id);
+        }
 
         // Include any pending orchestration events in this follow-up rather
         // than waiting for a separate idle injection turn. Skip when a server
@@ -3017,6 +3256,7 @@ fn input_for_query(
     static_query_type: Option<StaticQueryType>,
     user_query_mode: UserQueryMode,
     running_command: Option<RunningCommand>,
+    additional_context: Vec<AIAgentContext>,
     additional_attachments: HashMap<String, AIAgentAttachment>,
     context_model: &BlocklistAIContextModel,
     active_session: &ActiveSession,
@@ -3027,7 +3267,7 @@ fn input_for_query(
         context_model,
         active_session,
         Some(conversation_id),
-        vec![],
+        additional_context,
         app,
     );
     let intended_agent = BlocklistAIHistoryModel::as_ref(app)
@@ -3119,4 +3359,76 @@ fn get_running_command(terminal_model: &TerminalModel) -> Option<RunningCommand>
         requested_command_id: active_block.requested_command_action_id().cloned(),
         is_alt_screen_active,
     })
+}
+
+fn foreground_process_context(terminal_model: &TerminalModel) -> Option<AIAgentContext> {
+    let active_block = terminal_model.block_list().active_block();
+    if !active_block.is_active_and_long_running() {
+        return None;
+    }
+
+    Some(AIAgentContext::ForegroundProcess {
+        command: active_block.command_with_secrets_obfuscated(false),
+        is_alt_screen: terminal_model.is_alt_screen_active(),
+    })
+}
+
+#[cfg(test)]
+mod local_full_terminal_use_tests {
+    use super::*;
+
+    #[test]
+    fn local_full_terminal_use_model_is_selection_and_flag_gated() {
+        warpui::App::test((), |mut app| async move {
+            crate::test_util::settings::initialize_settings_for_tests(&mut app);
+            app.add_singleton_model(|_| crate::auth::AuthStateProvider::new_for_test());
+            app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+            app.add_singleton_model(crate::auth::auth_manager::AuthManager::new_for_test);
+            app.add_singleton_model(crate::server::sync_queue::SyncQueue::mock);
+            app.add_singleton_model(|_| NetworkStatus::new());
+            app.add_singleton_model(crate::workspaces::team_tester::TeamTesterStatus::mock);
+            app.add_singleton_model(
+                crate::server::cloud_objects::update_manager::UpdateManager::mock,
+            );
+            app.add_singleton_model(CloudModel::mock);
+            app.add_singleton_model(|_| {
+                crate::ai::mcp::templatable_manager::TemplatableMCPServerManager::default()
+            });
+            app.add_singleton_model(crate::settings::PrivacySettings::mock);
+            app.add_singleton_model(UserWorkspaces::default_mock);
+            app.add_singleton_model(|ctx| {
+                crate::ai::execution_profiles::profiles::AIExecutionProfilesModel::new(
+                    &crate::LaunchMode::new_for_unit_test(),
+                    ctx,
+                )
+            });
+            app.add_singleton_model(LLMPreferences::new);
+            let terminal_view_id = EntityId::new();
+
+            ai::api_keys::ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+                manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+                manager
+                    .set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+                manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+            });
+
+            {
+                let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(false);
+                assert_eq!(
+                    LLMPreferences::handle(&app).read(&app, |_, ctx| {
+                        selected_local_full_terminal_use_model_id(ctx, terminal_view_id)
+                    }),
+                    None
+                );
+            }
+
+            let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+            assert_eq!(
+                LLMPreferences::handle(&app).read(&app, |_, ctx| {
+                    selected_local_full_terminal_use_model_id(ctx, terminal_view_id)
+                }),
+                Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder"))
+            );
+        });
+    }
 }

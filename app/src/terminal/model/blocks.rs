@@ -4,7 +4,9 @@ use crate::ai::agent::{conversation::AIConversationId, AIAgentActionId};
 use crate::ai::blocklist::SerializedBlockListItem;
 use crate::terminal::block_filter::BlockFilterQuery;
 
-use crate::ai::blocklist::agent_view::{AgentViewDisplayMode, AgentViewState};
+use crate::ai::blocklist::agent_view::{
+    AgentViewDisplayMode, AgentViewEntryOrigin, AgentViewState,
+};
 use crate::terminal::event::AfterBlockCompletedEvent;
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::ansi;
@@ -1567,7 +1569,15 @@ impl BlockList {
     /// agent view.
     pub fn set_agent_view_state(&mut self, state: AgentViewState) {
         self.agent_view_state = state;
-        if !self.active_block().finished() {
+        let should_skip_active_block_conversation_mutation = matches!(
+            &self.agent_view_state,
+            AgentViewState::Active {
+                origin: AgentViewEntryOrigin::LocalFullTerminalUse,
+                display_mode: AgentViewDisplayMode::FullScreen,
+                ..
+            }
+        );
+        if !should_skip_active_block_conversation_mutation && !self.active_block().finished() {
             if let Some(id) = self.agent_view_state.active_conversation_id() {
                 // For inline agent views, add the conversation ID to Terminal variant
                 // instead of replacing with Agent variant

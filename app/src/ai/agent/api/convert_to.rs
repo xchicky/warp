@@ -765,6 +765,7 @@ fn convert_context(context: &[AIAgentContext]) -> api::InputContext {
                     nanos: utc_time.nanosecond() as i32,
                 });
             }
+            AIAgentContext::ForegroundProcess { .. } => {}
             AIAgentContext::Image(image_context) => {
                 api_context.images.push(api::input_context::Image {
                     data: image_context.data.into(),

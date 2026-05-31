@@ -6,9 +6,11 @@ pub mod toolbar_item;
 use crate::{
     ai::{
         blocklist::{
+            current_rendered_conversation_local_openai_model_id,
             history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel},
             is_local_to_cloud_handoff_available,
             prompt::prompt_alert::{PromptAlertEvent, PromptAlertView},
+            selected_local_full_terminal_use_model_id,
             usage::icon_for_context_window_usage,
             BlocklistAIInputModel,
         },
@@ -1591,13 +1593,7 @@ impl AgentInputFooter {
             return;
         }
 
-        let showing_ftu_model_picker = FeatureFlag::InlineMenuHeaders.is_enabled()
-            && self
-                .terminal_model
-                .lock()
-                .block_list()
-                .active_block()
-                .is_agent_in_control_or_tagged_in();
+        let showing_ftu_model_picker = self.is_full_terminal_use_model_picker_active(ctx);
         if showing_ftu_model_picker && !ftu_dismissed {
             if !self.render_ftu_callout {
                 self.render_ftu_callout = true;
@@ -1637,13 +1633,7 @@ impl AgentInputFooter {
                     ctx.notify();
                 }
 
-                let initial_tab = if self
-                    .terminal_model
-                    .lock()
-                    .block_list()
-                    .active_block()
-                    .is_agent_in_control_or_tagged_in()
-                {
+                let initial_tab = if self.is_full_terminal_use_model_picker_active(ctx) {
                     InlineModelSelectorTab::FullTerminalUse
                 } else {
                     InlineModelSelectorTab::BaseAgent
@@ -1652,6 +1642,25 @@ impl AgentInputFooter {
                 ctx.emit(AgentInputFooterEvent::ToggleInlineModelSelector { initial_tab });
             }
         }
+    }
+
+    fn is_full_terminal_use_model_picker_active(&self, app: &AppContext) -> bool {
+        if !FeatureFlag::InlineMenuHeaders.is_enabled() {
+            return false;
+        }
+
+        let terminal_model = self.terminal_model.lock();
+        let active_block = terminal_model.block_list().active_block();
+        let selected_local_model =
+            selected_local_full_terminal_use_model_id(app, self.terminal_view_id);
+        active_block.is_agent_in_control_or_tagged_in()
+            || current_rendered_conversation_local_openai_model_id(
+                &terminal_model,
+                None,
+                BlocklistAIHistoryModel::as_ref(app),
+                selected_local_model.as_ref(),
+            )
+            .is_some()
     }
 
     pub fn set_voice_is_active(&mut self, is_active: bool, ctx: &mut ViewContext<Self>) {
@@ -2163,6 +2172,7 @@ impl View for AgentInputFooter {
                 }
             }
         }
+        drop(terminal_model);
 
         let content = Wrap::row()
             .with_main_axis_size(MainAxisSize::Max)
@@ -2187,11 +2197,7 @@ impl View for AgentInputFooter {
         // If the model chip has switched to show the ftu model options
         // (and this is the first time this has happened)
         // we show a little callout explaining the change.
-        let showing_ftu_model_picker = FeatureFlag::InlineMenuHeaders.is_enabled()
-            && terminal_model
-                .block_list()
-                .active_block()
-                .is_agent_in_control_or_tagged_in();
+        let showing_ftu_model_picker = self.is_full_terminal_use_model_picker_active(app);
         if showing_ftu_model_picker && self.render_ftu_callout {
             let mut stack = Stack::new();
             stack.add_child(container.finish());

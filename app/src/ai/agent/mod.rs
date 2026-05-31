@@ -1993,6 +1993,12 @@ pub enum AIAgentContext {
         current_time: DateTime<Local>,
     },
 
+    /// Foreground terminal process metadata for local Full Terminal Use.
+    ForegroundProcess {
+        command: String,
+        is_alt_screen: bool,
+    },
+
     /// An image attached to the query.
     Image(ImageContext),
 

@@ -21,6 +21,10 @@ use crate::{
         agent_view_bg_fill, child_agent_status_card::ChildAgentStatusCard, AgentMessageBar,
         AgentViewController, EphemeralMessageModel,
     },
+    ai::blocklist::{
+        current_rendered_conversation_local_openai_model_id,
+        selected_local_full_terminal_use_model_id,
+    },
     terminal::input::{
         buffer_model::InputBufferModel,
         message_bar::common::render_standard_message_bar,
@@ -1144,6 +1148,20 @@ impl View for BlocklistAIStatusBar {
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
         let appearance = Appearance::as_ref(app);
         let agent_view_controller = self.agent_view_controller.as_ref(app);
+        let is_local_openai_conversation = {
+            let terminal_model = self.terminal_model.lock();
+            let selected_local_model = selected_local_full_terminal_use_model_id(
+                app,
+                agent_view_controller.terminal_view_id(),
+            );
+            current_rendered_conversation_local_openai_model_id(
+                &terminal_model,
+                Some(agent_view_controller),
+                BlocklistAIHistoryModel::as_ref(app),
+                selected_local_model.as_ref(),
+            )
+            .is_some()
+        };
         if let Some(cloud_mode_setup_terminal_message) =
             self.render_cloud_mode_setup_terminal_message(app)
         {
@@ -1187,6 +1205,7 @@ impl View for BlocklistAIStatusBar {
                 .block_list()
                 .active_block()
                 .is_agent_tagged_in()
+                && !is_local_openai_conversation
                 && self
                     .ephemeral_message_model
                     .as_ref(app)
@@ -1217,7 +1236,9 @@ impl View for BlocklistAIStatusBar {
                     app,
                 )
             } else if let (Some(warping_indicator), true) = (
-                self.render_warping_indicator_for_latest_exchange(app),
+                (!is_local_openai_conversation)
+                    .then(|| self.render_warping_indicator_for_latest_exchange(app))
+                    .flatten(),
                 self.ephemeral_message_model
                     .as_ref(app)
                     .current_message()

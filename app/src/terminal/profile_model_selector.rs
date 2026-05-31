@@ -26,8 +26,10 @@ const SIDECAR_POSITION_ID: &str = "model_sidecar_panel";
 use crate::{
     ai::{
         blocklist::{
-            prompt::PromptIconButtonTheme, BlocklistAIController, BlocklistAIControllerEvent,
-            BlocklistAIInputEvent, BlocklistAIInputModel,
+            current_rendered_conversation_local_openai_model_id,
+            history_model::BlocklistAIHistoryModel, prompt::PromptIconButtonTheme,
+            selected_local_full_terminal_use_model_id, BlocklistAIController,
+            BlocklistAIControllerEvent, BlocklistAIInputEvent, BlocklistAIInputModel,
         },
         execution_profiles::{
             model_menu_items::{available_model_menu_items, has_reasoning_variants, is_auto},
@@ -595,6 +597,25 @@ impl ProfileModelSelector {
         format!("{PROFILE_SELECTOR_POSITION_ID}_{llm_id}")
     }
 
+    fn uses_full_terminal_use_model_selector(&self, app: &AppContext) -> bool {
+        if !FeatureFlag::InlineMenuHeaders.is_enabled() {
+            return false;
+        }
+
+        let terminal_model = self.terminal_model.lock();
+        let active_block = terminal_model.block_list().active_block();
+        let selected_local_model =
+            selected_local_full_terminal_use_model_id(app, self.terminal_view_id);
+        active_block.is_agent_in_control_or_tagged_in()
+            || current_rendered_conversation_local_openai_model_id(
+                &terminal_model,
+                None,
+                BlocklistAIHistoryModel::as_ref(app),
+                selected_local_model.as_ref(),
+            )
+            .is_some()
+    }
+
     fn refresh_state(&mut self, ctx: &mut ViewContext<Self>) {
         self.refresh_profile_menu(ctx);
         self.refresh_model_menu(ctx);
@@ -614,15 +635,12 @@ impl ProfileModelSelector {
 
         let model_name = {
             let llm_preferences = LLMPreferences::as_ref(ctx);
-            let active_llm = if FeatureFlag::InlineMenuHeaders.is_enabled()
-                && self
-                    .terminal_model
-                    .lock()
-                    .block_list()
-                    .active_block()
-                    .is_agent_in_control_or_tagged_in()
-            {
-                llm_preferences.get_active_cli_agent_model(ctx, Some(self.terminal_view_id))
+            let local_cli_agent_model;
+            let active_llm = if self.uses_full_terminal_use_model_selector(ctx) {
+                local_cli_agent_model = llm_preferences
+                    .get_active_cli_agent_model_with_local(ctx, Some(self.terminal_view_id))
+                    .clone();
+                &local_cli_agent_model
             } else {
                 llm_preferences.get_active_base_model(ctx, Some(self.terminal_view_id))
             };
@@ -766,29 +784,36 @@ impl ProfileModelSelector {
     fn refresh_model_menu(&mut self, ctx: &mut ViewContext<Self>) {
         let llm_preferences = LLMPreferences::as_ref(ctx);
 
-        let active_llm = llm_preferences.get_active_base_model(ctx, Some(self.terminal_view_id));
+        let uses_full_terminal_use_model_selector = self.uses_full_terminal_use_model_selector(ctx);
+        let active_cli_agent_llm;
+        let active_llm = if uses_full_terminal_use_model_selector {
+            active_cli_agent_llm = llm_preferences
+                .get_active_cli_agent_model_with_local(ctx, Some(self.terminal_view_id));
+            &active_cli_agent_llm
+        } else {
+            llm_preferences.get_active_base_model(ctx, Some(self.terminal_view_id))
+        };
 
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(Some(self.terminal_view_id), ctx);
 
-        let profile_base_model_id = active_profile
-            .data()
-            .base_model
-            .clone()
-            .and_then(|id| {
-                llm_preferences
-                    .get_llm_info(&id)
-                    .map(|info| info.id.clone())
-            })
-            .unwrap_or_else(|| llm_preferences.get_default_base_model().id.clone());
-
-        let model_id_to_add_profile_default_label_to = Some(&profile_base_model_id);
+        let model_id_to_add_profile_default_label_to = if uses_full_terminal_use_model_selector {
+            active_profile.data().cli_agent_model.as_ref()
+        } else {
+            active_profile.data().base_model.as_ref()
+        };
 
         // Store all model choices for reasoning variant lookups
-        self.all_model_choices = llm_preferences
-            .get_base_llm_choices_for_agent_mode()
-            .cloned()
-            .collect();
+        self.all_model_choices = if uses_full_terminal_use_model_selector {
+            llm_preferences
+                .get_cli_agent_llm_choices_with_local(ctx)
+                .collect()
+        } else {
+            llm_preferences
+                .get_base_llm_choices_for_agent_mode()
+                .cloned()
+                .collect()
+        };
 
         // Group models by base_model_name to collapse reasoning variants.
         // Use "auto" as the key for all auto models so they collapse together.
@@ -1378,17 +1403,14 @@ impl ProfileModelSelector {
         let has_edit_access = is_composing_ambient_agent
             || !terminal_model.shared_session_status().is_viewer()
             || terminal_model.shared_session_status().is_executor();
-        let is_lrc = FeatureFlag::InlineMenuHeaders.is_enabled()
-            && terminal_model
-                .block_list()
-                .active_block()
-                .is_agent_in_control_or_tagged_in();
         drop(terminal_model);
+        let is_lrc = self.uses_full_terminal_use_model_selector(app);
 
+        let local_cli_agent_model;
         let model_display_name = if is_lrc {
-            llm_preferences
-                .get_active_cli_agent_model(app, Some(self.terminal_view_id))
-                .menu_display_name()
+            local_cli_agent_model = llm_preferences
+                .get_active_cli_agent_model_with_local(app, Some(self.terminal_view_id));
+            local_cli_agent_model.menu_display_name()
         } else {
             llm_preferences
                 .get_active_base_model(app, Some(self.terminal_view_id))
@@ -1816,10 +1838,23 @@ impl TypedActionView for ProfileModelSelector {
                 self.set_profile_menu_visibility(false, ctx);
             }
             ProfileModelSelectorAction::SelectModel(llm_id) => {
-                LLMPreferences::handle(ctx).update(ctx, |preferences, ctx| {
-                    log::info!("Selecting base agent model {llm_id} (from model selector)");
-                    preferences.update_preferred_agent_mode_llm(llm_id, self.terminal_view_id, ctx);
-                });
+                if self.uses_full_terminal_use_model_selector(ctx) {
+                    let profile_id = *AIExecutionProfilesModel::as_ref(ctx)
+                        .active_profile(Some(self.terminal_view_id), ctx)
+                        .id();
+                    AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+                        profiles.set_cli_agent_model(profile_id, Some(llm_id.clone()), ctx);
+                    });
+                } else {
+                    LLMPreferences::handle(ctx).update(ctx, |preferences, ctx| {
+                        log::info!("Selecting base agent model {llm_id} (from model selector)");
+                        preferences.update_preferred_agent_mode_llm(
+                            llm_id,
+                            self.terminal_view_id,
+                            ctx,
+                        );
+                    });
+                }
                 self.set_model_menu_visibility(false, ctx);
             }
             ProfileModelSelectorAction::SelectAutoModel
