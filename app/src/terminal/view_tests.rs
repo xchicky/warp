@@ -1,4 +1,4 @@
-use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentExchange, AIAgentExchangeId, AIAgentInput, AIAgentOutputStatus, UserQueryMode,
@@ -17,13 +17,13 @@ use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PAST
 use warpui::{
     notification::UserNotification, platform::WindowStyle, Presenter, WindowInvalidation,
 };
-use warpui::{App, ReadModel};
+use warpui::{App, ModelContext, ReadModel};
 
 use crate::ai::blocklist::agent_view::toolbar_item::AgentToolbarItemKind;
 use crate::ai::blocklist::block::cli_controller::UserTakeOverReason;
 use crate::ai::blocklist::{
-    agent_view::AgentViewEntryOrigin, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
-    InputConfig, InputType, ResponseStreamId,
+    active_block_latest_exchange_local_openai_model_id, agent_view::AgentViewEntryOrigin,
+    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, InputConfig, InputType, ResponseStreamId,
 };
 use crate::ai::llms::LLMId;
 use crate::context_chips::prompt::Prompt;
@@ -84,6 +84,13 @@ fn has_pending_user_query_block(view: &TerminalView) -> bool {
 }
 
 fn exchange_with_inputs(inputs: Vec<AIAgentInput>) -> AIAgentExchange {
+    exchange_with_inputs_and_model_id(inputs, LLMId::from("test-model"))
+}
+
+fn exchange_with_inputs_and_model_id(
+    inputs: Vec<AIAgentInput>,
+    model_id: LLMId,
+) -> AIAgentExchange {
     AIAgentExchange {
         id: AIAgentExchangeId::new(),
         input: inputs,
@@ -93,7 +100,7 @@ fn exchange_with_inputs(inputs: Vec<AIAgentInput>) -> AIAgentExchange {
         finish_time: None,
         time_to_first_token_ms: None,
         working_directory: None,
-        model_id: LLMId::from("test-model"),
+        model_id,
         request_cost: None,
         coding_model_id: LLMId::from("test-coding-model"),
         cli_agent_model_id: LLMId::from("test-cli-agent-model"),
@@ -4356,6 +4363,14 @@ fn local_full_terminal_use_cli_input_submits_to_agent_view_without_pty_write() {
                     ctx,
                 );
             });
+            view.model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "");
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_is_agent_tagged_in(true);
 
             view.handle_input_event(
                 &InputEvent::SubmitCLIAgentInput {
@@ -4368,12 +4383,326 @@ fn local_full_terminal_use_cli_input_submits_to_agent_view_without_pty_write() {
         terminal.read(&app, |view, ctx| {
             assert!(pty_writes.borrow().is_empty());
             assert!(!view.has_active_cli_agent_input_session(ctx));
+            assert!(CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .is_none());
             let state = view.agent_view_controller().as_ref(ctx).agent_view_state();
             assert!(state.is_fullscreen());
             assert_eq!(
                 state.origin(),
                 Some(AgentViewEntryOrigin::LocalFullTerminalUse)
             );
+            let model = view.model.lock();
+            assert!(!model
+                .block_list()
+                .active_block()
+                .should_hide_block(model.block_list().agent_view_state()));
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_status_uses_latest_exchange_model_from_conversation_list_origin() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let history_model = BlocklistAIHistoryModel::handle(ctx);
+            let (conversation_id, task_id) = history_model.update(ctx, |history_model, ctx| {
+                let conversation_id =
+                    history_model.start_new_conversation(view.view_id, false, false, ctx);
+                let task_id = history_model
+                    .conversation(&conversation_id)
+                    .expect("conversation should exist")
+                    .get_root_task_id()
+                    .clone();
+                let response_stream_id = ResponseStreamId::new_for_test();
+                let exchange = exchange_with_inputs_and_model_id(
+                    vec![AIAgentInput::UserQuery {
+                        query: "What is running?".to_string(),
+                        context: Default::default(),
+                        static_query_type: None,
+                        referenced_attachments: Default::default(),
+                        user_query_mode: UserQueryMode::default(),
+                        running_command: None,
+                        intended_agent: None,
+                    }],
+                    crate::ai::llms::local_openai_llm_id("qwen2.5-coder"),
+                );
+                history_model
+                    .conversation_mut(&conversation_id)
+                    .expect("conversation should exist")
+                    .append_reassigned_exchange(&response_stream_id, exchange, view.view_id, ctx)
+                    .expect("exchange should append");
+                (conversation_id, task_id)
+            });
+
+            view.agent_view_controller().update(ctx, |controller, ctx| {
+                controller
+                    .try_enter_agent_view(
+                        Some(conversation_id),
+                        AgentViewEntryOrigin::ConversationListView,
+                        ctx,
+                    )
+                    .expect("agent view should open")
+            });
+            view.model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "");
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_is_agent_tagged_in(true);
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_agent_interaction_mode(
+                    crate::terminal::model::block::AgentInteractionMetadata::new(
+                        None,
+                        conversation_id,
+                        Some(task_id.clone()),
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+
+            let model = view.model.lock();
+            assert_eq!(
+                view.agent_view_controller()
+                    .as_ref(ctx)
+                    .agent_view_state()
+                    .origin(),
+                Some(AgentViewEntryOrigin::ConversationListView)
+            );
+            assert_eq!(
+                active_block_latest_exchange_local_openai_model_id(
+                    &model,
+                    BlocklistAIHistoryModel::as_ref(ctx),
+                ),
+                Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder"))
+            );
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_status_uses_latest_exchange_and_fails_closed() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "");
+
+            {
+                let model = view.model.lock();
+                assert_eq!(
+                    active_block_latest_exchange_local_openai_model_id(
+                        &model,
+                        BlocklistAIHistoryModel::as_ref(ctx),
+                    ),
+                    None
+                );
+            }
+
+            let missing_conversation_id = AIConversationId::new();
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_is_agent_tagged_in(true);
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_agent_interaction_mode(
+                    crate::terminal::model::block::AgentInteractionMetadata::new(
+                        None,
+                        missing_conversation_id,
+                        Some(TaskId::new("missing".to_string())),
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+            {
+                let model = view.model.lock();
+                assert_eq!(
+                    active_block_latest_exchange_local_openai_model_id(
+                        &model,
+                        BlocklistAIHistoryModel::as_ref(ctx),
+                    ),
+                    None
+                );
+            }
+
+            let history_model = BlocklistAIHistoryModel::handle(ctx);
+            let (conversation_id, task_id) = history_model.update(ctx, |history_model, ctx| {
+                let conversation_id =
+                    history_model.start_new_conversation(view.view_id, false, false, ctx);
+                let task_id = history_model
+                    .conversation(&conversation_id)
+                    .expect("conversation should exist")
+                    .get_root_task_id()
+                    .clone();
+                (conversation_id, task_id)
+            });
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_agent_interaction_mode(
+                    crate::terminal::model::block::AgentInteractionMetadata::new(
+                        None,
+                        conversation_id,
+                        Some(task_id.clone()),
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+            {
+                let model = view.model.lock();
+                assert_eq!(
+                    active_block_latest_exchange_local_openai_model_id(
+                        &model,
+                        BlocklistAIHistoryModel::as_ref(ctx),
+                    ),
+                    None
+                );
+            }
+
+            let append_exchange =
+                |history_model: &mut BlocklistAIHistoryModel,
+                 model_id: LLMId,
+                 ctx: &mut ModelContext<BlocklistAIHistoryModel>| {
+                    let response_stream_id = ResponseStreamId::new_for_test();
+                    let exchange = exchange_with_inputs_and_model_id(
+                        vec![AIAgentInput::UserQuery {
+                            query: "What is running?".to_string(),
+                            context: Default::default(),
+                            static_query_type: None,
+                            referenced_attachments: Default::default(),
+                            user_query_mode: UserQueryMode::default(),
+                            running_command: None,
+                            intended_agent: None,
+                        }],
+                        model_id,
+                    );
+                    history_model
+                        .conversation_mut(&conversation_id)
+                        .expect("conversation should exist")
+                        .append_reassigned_exchange(
+                            &response_stream_id,
+                            exchange,
+                            view.view_id,
+                            ctx,
+                        )
+                        .expect("exchange should append");
+                };
+
+            history_model.update(ctx, |history_model, ctx| {
+                append_exchange(history_model, LLMId::from("gpt-4o"), ctx);
+            });
+            {
+                let model = view.model.lock();
+                assert_eq!(
+                    active_block_latest_exchange_local_openai_model_id(
+                        &model,
+                        BlocklistAIHistoryModel::as_ref(ctx),
+                    ),
+                    None
+                );
+            }
+
+            history_model.update(ctx, |history_model, ctx| {
+                append_exchange(
+                    history_model,
+                    crate::ai::llms::local_openai_llm_id("qwen2.5-coder"),
+                    ctx,
+                );
+            });
+            {
+                let model = view.model.lock();
+                assert_eq!(
+                    active_block_latest_exchange_local_openai_model_id(
+                        &model,
+                        BlocklistAIHistoryModel::as_ref(ctx),
+                    ),
+                    Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder"))
+                );
+            }
+        });
+    });
+}
+
+#[test]
+fn local_full_terminal_use_enter_without_prompt_detaches_cli_agent_state() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _cli_agent_rich_input = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+    let _local_ftu = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let (_, terminal) =
+            open_cli_agent_rich_input_for_agent_with_window_id(&mut app, CLIAgent::Claude);
+
+        terminal.update(&mut app, |view, ctx| {
+            ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.set_local_openai_api_key(Some("local-key".to_string()), ctx);
+                manager
+                    .set_local_openai_base_url(Some("http://localhost:11434/v1".to_string()), ctx);
+                manager.set_local_openai_model(Some("qwen2.5-coder".to_string()), ctx);
+            });
+            let profile_id = *AIExecutionProfilesModel::as_ref(ctx)
+                .active_profile(Some(view.view_id), ctx)
+                .id();
+            AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+                profiles.set_cli_agent_model(
+                    profile_id,
+                    Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder")),
+                    ctx,
+                );
+            });
+            view.model
+                .lock()
+                .simulate_long_running_block("vim src/main.rs", "");
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_is_agent_tagged_in(true);
+
+            view.enter_local_full_terminal_use_agent_view(None, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(!view.has_active_cli_agent_input_session(ctx));
+            assert!(CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .is_none());
+            let state = view.agent_view_controller().as_ref(ctx).agent_view_state();
+            assert_eq!(
+                state.origin(),
+                Some(AgentViewEntryOrigin::LocalFullTerminalUse)
+            );
+            assert!(!view
+                .model
+                .lock()
+                .block_list()
+                .active_block()
+                .is_agent_in_control_or_tagged_in());
         });
     });
 }

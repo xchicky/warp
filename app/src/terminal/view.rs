@@ -21823,11 +21823,43 @@ impl TerminalView {
             return;
         }
 
+        self.detach_cli_agent_session_for_local_full_terminal_use(
+            CLIAgentRichInputCloseReason::Other,
+            ctx,
+        );
         if let Err(error) = self.agent_view_controller.update(ctx, |controller, ctx| {
             controller.try_enter_agent_view(None, AgentViewEntryOrigin::LocalFullTerminalUse, ctx)
         }) {
             log::warn!("Failed to enter local Full Terminal Use Agent View: {error:?}");
             self.show_error_toast(error.to_string(), ctx);
+        }
+    }
+
+    fn detach_cli_agent_session_for_local_full_terminal_use(
+        &mut self,
+        close_reason: CLIAgentRichInputCloseReason,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let view_id = self.view_id;
+        self.close_cli_agent_rich_input(close_reason, ctx);
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.remove_session(view_id, ctx);
+        });
+
+        let active_block_agent_state = {
+            let model = self.model.lock();
+            let active_block = model.block_list().active_block();
+            (
+                active_block.is_agent_in_control(),
+                active_block.is_agent_tagged_in(),
+            )
+        };
+        if active_block_agent_state.0 {
+            self.cli_subagent_controller.update(ctx, |controller, ctx| {
+                controller.switch_control_to_user(UserTakeOverReason::Manual, ctx);
+            });
+        } else if active_block_agent_state.1 {
+            self.tag_agent_out(ctx);
         }
     }
 
@@ -21839,11 +21871,10 @@ impl TerminalView {
         self.input.update(ctx, |input, ctx| {
             input.clear_buffer_and_reset_undo_stack(ctx);
         });
-        let view_id = self.view_id;
-        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, _| {
-            sessions.clear_draft(view_id);
-        });
-        self.close_cli_agent_rich_input(CLIAgentRichInputCloseReason::Submit, ctx);
+        self.detach_cli_agent_session_for_local_full_terminal_use(
+            CLIAgentRichInputCloseReason::Submit,
+            ctx,
+        );
 
         let conversation_id = match self.agent_view_controller.update(ctx, |controller, ctx| {
             controller.try_enter_agent_view(None, AgentViewEntryOrigin::LocalFullTerminalUse, ctx)

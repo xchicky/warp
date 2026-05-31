@@ -16,6 +16,7 @@ use super::agent_view::AgentViewEntryOrigin;
 use super::ResponseStreamId;
 use super::{
     action_model::{BlocklistAIActionEvent, BlocklistAIActionModel},
+    active_block_latest_exchange_local_openai_model_id,
     agent_view::{AgentViewController, AgentViewControllerEvent},
     context_model::BlocklistAIContextModel,
     history_model::BlocklistAIHistoryModel,
@@ -307,7 +308,6 @@ pub struct BlocklistAIController {
     input_model: ModelHandle<BlocklistAIInputModel>,
     context_model: ModelHandle<BlocklistAIContextModel>,
     action_model: ModelHandle<BlocklistAIActionModel>,
-    agent_view_controller: ModelHandle<AgentViewController>,
     terminal_model: Arc<FairMutex<TerminalModel>>,
 
     in_flight_response_streams: PendingResponseStreams,
@@ -603,7 +603,6 @@ impl BlocklistAIController {
             context_model,
             action_model,
             active_session,
-            agent_view_controller,
             terminal_model,
             in_flight_response_streams: PendingResponseStreams::new(),
             terminal_view_id,
@@ -619,14 +618,15 @@ impl BlocklistAIController {
     }
 
     fn active_local_full_terminal_use_model_id(&self, app: &AppContext) -> Option<LLMId> {
-        local_full_terminal_use_model_id_for_origin(
-            app,
-            self.terminal_view_id,
-            self.agent_view_controller
-                .as_ref(app)
-                .agent_view_state()
-                .origin(),
+        let terminal_model = self.terminal_model.lock();
+        active_block_latest_exchange_local_openai_model_id(
+            &terminal_model,
+            BlocklistAIHistoryModel::as_ref(app),
         )
+    }
+
+    fn selected_local_full_terminal_use_model_id(&self, app: &AppContext) -> Option<LLMId> {
+        selected_local_full_terminal_use_model_id(app, self.terminal_view_id)
     }
 
     #[cfg(test)]
@@ -638,11 +638,23 @@ impl BlocklistAIController {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_local_full_terminal_use_model_id_for_test(
+        &self,
+        app: &AppContext,
+    ) -> Option<LLMId> {
+        self.selected_local_full_terminal_use_model_id(app)
+    }
+
+    #[cfg(test)]
     pub(crate) fn local_full_terminal_use_context_for_test(
         &self,
         app: &AppContext,
     ) -> Vec<AIAgentContext> {
-        if self.active_local_full_terminal_use_model_id(app).is_none() {
+        if self
+            .selected_local_full_terminal_use_model_id(app)
+            .or_else(|| self.active_local_full_terminal_use_model_id(app))
+            .is_none()
+        {
             return Vec::new();
         }
         let terminal_model = self.terminal_model.lock();
@@ -657,7 +669,10 @@ impl BlocklistAIController {
         mut request_input: RequestInput,
         app: &AppContext,
     ) -> RequestInput {
-        if let Some(model_id) = self.active_local_full_terminal_use_model_id(app) {
+        if let Some(model_id) = self
+            .active_local_full_terminal_use_model_id(app)
+            .or_else(|| self.selected_local_full_terminal_use_model_id(app))
+        {
             request_input = request_input.with_model_id(model_id);
         }
         request_input
@@ -897,7 +912,10 @@ impl BlocklistAIController {
             ctx,
         );
         if input_query.route == InputRoute::LocalFullTerminalUse {
-            if let Some(model_id) = self.active_local_full_terminal_use_model_id(ctx) {
+            if let Some(model_id) = self
+                .active_local_full_terminal_use_model_id(ctx)
+                .or_else(|| self.selected_local_full_terminal_use_model_id(ctx))
+            {
                 request_input = request_input.with_model_id(model_id);
             } else {
                 log::warn!("Local Full Terminal Use route requested without active local model");
@@ -1058,7 +1076,7 @@ impl BlocklistAIController {
             let terminal_model = self.terminal_model.lock();
             get_running_command(&terminal_model)
         };
-        let local_full_terminal_use_model = self.active_local_full_terminal_use_model_id(ctx);
+        let local_full_terminal_use_model = self.selected_local_full_terminal_use_model_id(ctx);
         if let Some(running_command) = running_command {
             if local_full_terminal_use_model.is_some() {
                 let additional_context = {
@@ -1124,6 +1142,7 @@ impl BlocklistAIController {
                 ctx,
             );
         } else {
+            let is_local_full_terminal_use = local_full_terminal_use_model.is_some();
             self.send_query(
                 InputQuery {
                     which_task: WhichTask::NewConversation,
@@ -1132,7 +1151,11 @@ impl BlocklistAIController {
                         static_query_type,
                         running_command: None,
                     },
-                    route: InputRoute::Default,
+                    route: if is_local_full_terminal_use {
+                        InputRoute::LocalFullTerminalUse
+                    } else {
+                        InputRoute::Default
+                    },
                     additional_context: Vec::new(),
                     additional_attachments: HashMap::new(),
                 },
@@ -1298,7 +1321,10 @@ impl BlocklistAIController {
                 .promote_blocks_to_attached_from_conversation(conversation_id);
 
             let active_block = terminal_model.block_list().active_block();
-            let local_full_terminal_use_model = self.active_local_full_terminal_use_model_id(ctx);
+            let local_full_terminal_use_model = active_block_latest_exchange_local_openai_model_id(
+                &terminal_model,
+                BlocklistAIHistoryModel::as_ref(ctx),
+            );
             let running_command_opt =
                 if !skip_running_command_detection && local_full_terminal_use_model.is_none() {
                     get_running_command(&terminal_model)
@@ -3263,14 +3289,11 @@ fn input_for_query(
     }
 }
 
-fn local_full_terminal_use_model_id_for_origin(
+fn selected_local_full_terminal_use_model_id(
     app: &AppContext,
     terminal_view_id: EntityId,
-    origin: Option<AgentViewEntryOrigin>,
 ) -> Option<LLMId> {
-    if !FeatureFlag::LocalAgentFullTerminalUse.is_enabled()
-        || origin != Some(AgentViewEntryOrigin::LocalFullTerminalUse)
-    {
+    if !FeatureFlag::LocalAgentFullTerminalUse.is_enabled() {
         return None;
     }
 
@@ -3364,7 +3387,7 @@ mod local_full_terminal_use_tests {
     use super::*;
 
     #[test]
-    fn local_full_terminal_use_model_is_origin_and_flag_gated() {
+    fn local_full_terminal_use_model_is_selection_and_flag_gated() {
         warpui::App::test((), |mut app| async move {
             crate::test_util::settings::initialize_settings_for_tests(&mut app);
             app.add_singleton_model(|_| crate::auth::AuthStateProvider::new_for_test());
@@ -3402,11 +3425,7 @@ mod local_full_terminal_use_tests {
                 let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(false);
                 assert_eq!(
                     LLMPreferences::handle(&app).read(&app, |_, ctx| {
-                        local_full_terminal_use_model_id_for_origin(
-                            ctx,
-                            terminal_view_id,
-                            Some(AgentViewEntryOrigin::LocalFullTerminalUse),
-                        )
+                        selected_local_full_terminal_use_model_id(ctx, terminal_view_id)
                     }),
                     None
                 );
@@ -3415,23 +3434,7 @@ mod local_full_terminal_use_tests {
             let _flag = FeatureFlag::LocalAgentFullTerminalUse.override_enabled(true);
             assert_eq!(
                 LLMPreferences::handle(&app).read(&app, |_, ctx| {
-                    local_full_terminal_use_model_id_for_origin(
-                        ctx,
-                        terminal_view_id,
-                        Some(AgentViewEntryOrigin::Input {
-                            was_prompt_autodetected: false,
-                        }),
-                    )
-                }),
-                None
-            );
-            assert_eq!(
-                LLMPreferences::handle(&app).read(&app, |_, ctx| {
-                    local_full_terminal_use_model_id_for_origin(
-                        ctx,
-                        terminal_view_id,
-                        Some(AgentViewEntryOrigin::LocalFullTerminalUse),
-                    )
+                    selected_local_full_terminal_use_model_id(ctx, terminal_view_id)
                 }),
                 Some(crate::ai::llms::local_openai_llm_id("qwen2.5-coder"))
             );

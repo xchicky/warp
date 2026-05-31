@@ -17,6 +17,7 @@ use crate::{
     },
 };
 use crate::{
+    ai::blocklist::active_block_latest_exchange_local_openai_model_id,
     ai::blocklist::agent_view::{
         agent_view_bg_fill, child_agent_status_card::ChildAgentStatusCard, AgentMessageBar,
         AgentViewController, EphemeralMessageModel,
@@ -1144,6 +1145,14 @@ impl View for BlocklistAIStatusBar {
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
         let appearance = Appearance::as_ref(app);
         let agent_view_controller = self.agent_view_controller.as_ref(app);
+        let is_local_openai_conversation = {
+            let terminal_model = self.terminal_model.lock();
+            active_block_latest_exchange_local_openai_model_id(
+                &terminal_model,
+                BlocklistAIHistoryModel::as_ref(app),
+            )
+            .is_some()
+        };
         if let Some(cloud_mode_setup_terminal_message) =
             self.render_cloud_mode_setup_terminal_message(app)
         {
@@ -1187,6 +1196,7 @@ impl View for BlocklistAIStatusBar {
                 .block_list()
                 .active_block()
                 .is_agent_tagged_in()
+                && !is_local_openai_conversation
                 && self
                     .ephemeral_message_model
                     .as_ref(app)
@@ -1217,7 +1227,9 @@ impl View for BlocklistAIStatusBar {
                     app,
                 )
             } else if let (Some(warping_indicator), true) = (
-                self.render_warping_indicator_for_latest_exchange(app),
+                (!is_local_openai_conversation)
+                    .then(|| self.render_warping_indicator_for_latest_exchange(app))
+                    .flatten(),
                 self.ephemeral_message_model
                     .as_ref(app)
                     .current_message()

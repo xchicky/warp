@@ -14,6 +14,24 @@ pub(crate) fn is_local_to_cloud_handoff_available() -> bool {
         && FeatureFlag::HandoffLocalCloud.is_enabled()
         && cfg!(all(feature = "local_fs", not(target_family = "wasm")))
 }
+
+pub(crate) fn active_block_latest_exchange_local_openai_model_id(
+    terminal_model: &crate::terminal::TerminalModel,
+    history_model: &history_model::BlocklistAIHistoryModel,
+) -> Option<crate::ai::llms::LLMId> {
+    let conversation_id = terminal_model
+        .block_list()
+        .active_block()
+        .ai_conversation_id()?;
+    let model_id = history_model
+        .conversation(&conversation_id)?
+        .latest_exchange()?
+        .model_id
+        .clone();
+    crate::ai::llms::local_openai_model_from_llm_id(&model_id)
+        .is_some()
+        .then_some(model_id)
+}
 pub(crate) mod orchestration_event_streamer;
 pub(crate) mod orchestration_events;
 mod passive_suggestions;

@@ -6373,6 +6373,10 @@ fn local_full_terminal_use_route_bridge_sets_local_model_and_context_boundary() 
             let controller = terminal.ai_controller().as_ref(ctx);
             assert_eq!(
                 controller.active_local_full_terminal_use_model_id_for_test(ctx),
+                None
+            );
+            assert_eq!(
+                controller.selected_local_full_terminal_use_model_id_for_test(ctx),
                 Some(local_openai_llm_id("qwen2.5-coder"))
             );
 
