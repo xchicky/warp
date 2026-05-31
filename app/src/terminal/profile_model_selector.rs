@@ -26,10 +26,10 @@ const SIDECAR_POSITION_ID: &str = "model_sidecar_panel";
 use crate::{
     ai::{
         blocklist::{
-            active_block_latest_exchange_local_openai_model_id,
+            current_rendered_conversation_local_openai_model_id,
             history_model::BlocklistAIHistoryModel, prompt::PromptIconButtonTheme,
-            BlocklistAIController, BlocklistAIControllerEvent, BlocklistAIInputEvent,
-            BlocklistAIInputModel,
+            selected_local_full_terminal_use_model_id, BlocklistAIController,
+            BlocklistAIControllerEvent, BlocklistAIInputEvent, BlocklistAIInputModel,
         },
         execution_profiles::{
             model_menu_items::{available_model_menu_items, has_reasoning_variants, is_auto},
@@ -604,10 +604,14 @@ impl ProfileModelSelector {
 
         let terminal_model = self.terminal_model.lock();
         let active_block = terminal_model.block_list().active_block();
+        let selected_local_model =
+            selected_local_full_terminal_use_model_id(app, self.terminal_view_id);
         active_block.is_agent_in_control_or_tagged_in()
-            || active_block_latest_exchange_local_openai_model_id(
+            || current_rendered_conversation_local_openai_model_id(
                 &terminal_model,
+                None,
                 BlocklistAIHistoryModel::as_ref(app),
+                selected_local_model.as_ref(),
             )
             .is_some()
     }

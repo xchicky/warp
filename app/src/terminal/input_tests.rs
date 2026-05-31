@@ -6372,7 +6372,10 @@ fn local_full_terminal_use_route_bridge_sets_local_model_and_context_boundary() 
         terminal.read(&app, |terminal, ctx| {
             let controller = terminal.ai_controller().as_ref(ctx);
             assert_eq!(
-                controller.active_local_full_terminal_use_model_id_for_test(ctx),
+                controller.target_conversation_local_full_terminal_use_model_id_for_test(
+                    &conversation_id,
+                    ctx,
+                ),
                 None
             );
             assert_eq!(

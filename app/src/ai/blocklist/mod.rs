@@ -1,4 +1,6 @@
 //! This module contains model, controller, and view logic for Blocklist AI.
+use warpui::SingletonEntity;
+
 mod action_model;
 pub mod agent_view;
 pub mod block;
@@ -15,22 +17,66 @@ pub(crate) fn is_local_to_cloud_handoff_available() -> bool {
         && cfg!(all(feature = "local_fs", not(target_family = "wasm")))
 }
 
-pub(crate) fn active_block_latest_exchange_local_openai_model_id(
-    terminal_model: &crate::terminal::TerminalModel,
+pub(crate) fn conversation_latest_exchange_local_openai_model_id(
     history_model: &history_model::BlocklistAIHistoryModel,
+    conversation_id: &crate::ai::agent::conversation::AIConversationId,
 ) -> Option<crate::ai::llms::LLMId> {
-    let conversation_id = terminal_model
-        .block_list()
-        .active_block()
-        .ai_conversation_id()?;
     let model_id = history_model
-        .conversation(&conversation_id)?
+        .conversation(conversation_id)?
         .latest_exchange()?
         .model_id
         .clone();
     crate::ai::llms::local_openai_model_from_llm_id(&model_id)
         .is_some()
         .then_some(model_id)
+}
+
+pub(crate) fn selected_local_full_terminal_use_model_id(
+    app: &warpui::AppContext,
+    terminal_view_id: warpui::EntityId,
+) -> Option<crate::ai::llms::LLMId> {
+    if !crate::features::FeatureFlag::LocalAgentFullTerminalUse.is_enabled() {
+        return None;
+    }
+
+    let model = crate::ai::llms::LLMPreferences::as_ref(app)
+        .get_active_cli_agent_model_with_local(app, Some(terminal_view_id));
+    crate::ai::llms::local_openai_model_from_llm_id(&model.id)
+        .is_some()
+        .then_some(model.id)
+}
+
+pub(crate) fn current_rendered_conversation_local_openai_model_id(
+    terminal_model: &crate::terminal::TerminalModel,
+    maybe_agent_view_controller: Option<&agent_view::AgentViewController>,
+    history_model: &history_model::BlocklistAIHistoryModel,
+    selected_local_model: Option<&crate::ai::llms::LLMId>,
+) -> Option<crate::ai::llms::LLMId> {
+    let agent_view_state = maybe_agent_view_controller
+        .map(|controller| controller.agent_view_state())
+        .unwrap_or_else(|| terminal_model.block_list().agent_view_state());
+
+    if agent_view_state.is_active() {
+        let conversation_id = agent_view_state
+            .fullscreen_conversation_id()
+            .or_else(|| agent_view_state.active_conversation_id())?;
+        let conversation = history_model.conversation(&conversation_id)?;
+        if conversation.latest_exchange().is_none() {
+            return selected_local_model.and_then(|model_id| {
+                crate::ai::llms::local_openai_model_from_llm_id(model_id)
+                    .is_some()
+                    .then_some(model_id.clone())
+            });
+        }
+
+        return conversation_latest_exchange_local_openai_model_id(history_model, &conversation_id);
+    }
+
+    let conversation_id = terminal_model
+        .block_list()
+        .active_block()
+        .ai_conversation_id()?;
+    conversation_latest_exchange_local_openai_model_id(history_model, &conversation_id)
 }
 pub(crate) mod orchestration_event_streamer;
 pub(crate) mod orchestration_events;

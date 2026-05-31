@@ -17,10 +17,13 @@ use crate::{
     },
 };
 use crate::{
-    ai::blocklist::active_block_latest_exchange_local_openai_model_id,
     ai::blocklist::agent_view::{
         agent_view_bg_fill, child_agent_status_card::ChildAgentStatusCard, AgentMessageBar,
         AgentViewController, EphemeralMessageModel,
+    },
+    ai::blocklist::{
+        current_rendered_conversation_local_openai_model_id,
+        selected_local_full_terminal_use_model_id,
     },
     terminal::input::{
         buffer_model::InputBufferModel,
@@ -1147,9 +1150,15 @@ impl View for BlocklistAIStatusBar {
         let agent_view_controller = self.agent_view_controller.as_ref(app);
         let is_local_openai_conversation = {
             let terminal_model = self.terminal_model.lock();
-            active_block_latest_exchange_local_openai_model_id(
+            let selected_local_model = selected_local_full_terminal_use_model_id(
+                app,
+                agent_view_controller.terminal_view_id(),
+            );
+            current_rendered_conversation_local_openai_model_id(
                 &terminal_model,
+                Some(agent_view_controller),
                 BlocklistAIHistoryModel::as_ref(app),
+                selected_local_model.as_ref(),
             )
             .is_some()
         };

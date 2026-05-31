@@ -16,12 +16,12 @@ use super::agent_view::AgentViewEntryOrigin;
 use super::ResponseStreamId;
 use super::{
     action_model::{BlocklistAIActionEvent, BlocklistAIActionModel},
-    active_block_latest_exchange_local_openai_model_id,
     agent_view::{AgentViewController, AgentViewControllerEvent},
     context_model::BlocklistAIContextModel,
+    conversation_latest_exchange_local_openai_model_id,
     history_model::BlocklistAIHistoryModel,
     input_model::InputConfig,
-    BlocklistAIInputModel, InputType,
+    selected_local_full_terminal_use_model_id, BlocklistAIInputModel, InputType,
 };
 use crate::ai::agent::api::{self, ServerConversationToken};
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
@@ -37,7 +37,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::document::ai_document_model::{
     AIDocumentId, AIDocumentModel, AIDocumentUserEditStatus,
 };
-use crate::ai::llms::{local_openai_model_from_llm_id, LLMId};
+use crate::ai::llms::LLMId;
 use crate::ai::{
     agent::{
         conversation::AIConversationId, extract_user_query_mode, AIAgentActionResultType,
@@ -617,11 +617,14 @@ impl BlocklistAIController {
         }
     }
 
-    fn active_local_full_terminal_use_model_id(&self, app: &AppContext) -> Option<LLMId> {
-        let terminal_model = self.terminal_model.lock();
-        active_block_latest_exchange_local_openai_model_id(
-            &terminal_model,
+    fn target_conversation_local_full_terminal_use_model_id(
+        &self,
+        conversation_id: &AIConversationId,
+        app: &AppContext,
+    ) -> Option<LLMId> {
+        conversation_latest_exchange_local_openai_model_id(
             BlocklistAIHistoryModel::as_ref(app),
+            conversation_id,
         )
     }
 
@@ -630,11 +633,12 @@ impl BlocklistAIController {
     }
 
     #[cfg(test)]
-    pub(crate) fn active_local_full_terminal_use_model_id_for_test(
+    pub(crate) fn target_conversation_local_full_terminal_use_model_id_for_test(
         &self,
+        conversation_id: &AIConversationId,
         app: &AppContext,
     ) -> Option<LLMId> {
-        self.active_local_full_terminal_use_model_id(app)
+        self.target_conversation_local_full_terminal_use_model_id(conversation_id, app)
     }
 
     #[cfg(test)]
@@ -652,7 +656,6 @@ impl BlocklistAIController {
     ) -> Vec<AIAgentContext> {
         if self
             .selected_local_full_terminal_use_model_id(app)
-            .or_else(|| self.active_local_full_terminal_use_model_id(app))
             .is_none()
         {
             return Vec::new();
@@ -669,10 +672,10 @@ impl BlocklistAIController {
         mut request_input: RequestInput,
         app: &AppContext,
     ) -> RequestInput {
-        if let Some(model_id) = self
-            .active_local_full_terminal_use_model_id(app)
-            .or_else(|| self.selected_local_full_terminal_use_model_id(app))
-        {
+        if let Some(model_id) = self.target_conversation_local_full_terminal_use_model_id(
+            &request_input.conversation_id,
+            app,
+        ) {
             request_input = request_input.with_model_id(model_id);
         }
         request_input
@@ -913,7 +916,7 @@ impl BlocklistAIController {
         );
         if input_query.route == InputRoute::LocalFullTerminalUse {
             if let Some(model_id) = self
-                .active_local_full_terminal_use_model_id(ctx)
+                .target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx)
                 .or_else(|| self.selected_local_full_terminal_use_model_id(ctx))
             {
                 request_input = request_input.with_model_id(model_id);
@@ -1321,10 +1324,8 @@ impl BlocklistAIController {
                 .promote_blocks_to_attached_from_conversation(conversation_id);
 
             let active_block = terminal_model.block_list().active_block();
-            let local_full_terminal_use_model = active_block_latest_exchange_local_openai_model_id(
-                &terminal_model,
-                BlocklistAIHistoryModel::as_ref(ctx),
-            );
+            let local_full_terminal_use_model =
+                self.target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx);
             let running_command_opt =
                 if !skip_running_command_detection && local_full_terminal_use_model.is_none() {
                     get_running_command(&terminal_model)
@@ -1358,7 +1359,7 @@ impl BlocklistAIController {
                 }
             } else if let Some(task_id) = active_block
                 .is_agent_monitoring()
-                .then(|| active_block.agent_interaction_metadata())
+                .then_some(active_block.agent_interaction_metadata())
                 .flatten()
                 .filter(|metadata| metadata.conversation_id() == &conversation_id)
                 .and_then(|metadata| metadata.subagent_task_id().cloned())
@@ -1712,6 +1713,11 @@ impl BlocklistAIController {
             self.terminal_view_id,
             ctx,
         );
+        if let Some(model_id) =
+            self.target_conversation_local_full_terminal_use_model_id(&conversation_id, ctx)
+        {
+            request_input = request_input.with_model_id(model_id);
+        }
 
         // Include any pending orchestration events in this follow-up rather
         // than waiting for a separate idle injection turn. Skip when a server
@@ -3287,21 +3293,6 @@ fn input_for_query(
         running_command,
         intended_agent,
     }
-}
-
-fn selected_local_full_terminal_use_model_id(
-    app: &AppContext,
-    terminal_view_id: EntityId,
-) -> Option<LLMId> {
-    if !FeatureFlag::LocalAgentFullTerminalUse.is_enabled() {
-        return None;
-    }
-
-    let model = LLMPreferences::as_ref(app)
-        .get_active_cli_agent_model_with_local(app, Some(terminal_view_id));
-    local_openai_model_from_llm_id(&model.id)
-        .is_some()
-        .then_some(model.id)
 }
 
 /// Validates that tool call results have corresponding tool calls in the task context, otherwise

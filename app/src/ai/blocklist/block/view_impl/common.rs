@@ -52,9 +52,9 @@ use crate::{
     ai::{
         agent::{conversation::AIConversation, icons, ShellCommandDelay},
         blocklist::{
-            active_block_latest_exchange_local_openai_model_id,
-            block::status_bar::BlocklistAIStatusBarAction, history_model::BlocklistAIHistoryModel,
-            BlocklistAIActionModel, ShellCommandExecutor,
+            block::status_bar::BlocklistAIStatusBarAction,
+            conversation_latest_exchange_local_openai_model_id,
+            history_model::BlocklistAIHistoryModel, BlocklistAIActionModel, ShellCommandExecutor,
         },
         loading::shimmering_warp_loading_text,
     },
@@ -370,11 +370,15 @@ pub fn render_warping_indicator<V: View>(
             }
             action => {
                 let active_block = props.terminal_model.block_list().active_block();
-                let is_local_openai_conversation =
-                    active_block_latest_exchange_local_openai_model_id(
-                        props.terminal_model,
-                        BlocklistAIHistoryModel::as_ref(app),
-                    )
+                let is_local_openai_conversation = props
+                    .model
+                    .conversation_id(app)
+                    .and_then(|conversation_id| {
+                        conversation_latest_exchange_local_openai_model_id(
+                            BlocklistAIHistoryModel::as_ref(app),
+                            &conversation_id,
+                        )
+                    })
                     .is_some();
                 if !props.model.status(app).is_streaming()
                     && !is_local_openai_conversation
