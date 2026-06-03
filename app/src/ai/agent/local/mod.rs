@@ -3843,6 +3843,18 @@ fn append_history_messages(
         .collect::<Vec<_>>();
     history.reverse();
     let mut mcp_tool_calls_by_id: HashMap<String, McpToolCallMetadata> = HashMap::new();
+    for message in &history {
+        let Some(api::message::Message::ToolCall(tool_call)) = &message.message else {
+            continue;
+        };
+        if let Some(metadata) = mcp_tool_call_metadata_from_api(tool_call, mcp_tool_catalog) {
+            mcp_tool_calls_by_id.insert(tool_call.tool_call_id.clone(), metadata);
+        }
+    }
+    let paired_tool_call_ids =
+        history_tool_call_ids_with_results(&history, mcp_tool_catalog, &mcp_tool_calls_by_id);
+    let paired_tool_messages_by_id =
+        history_tool_messages_by_id(&history, &paired_tool_call_ids, &mcp_tool_calls_by_id);
     for message in history {
         match &message.message {
             Some(api::message::Message::UserQuery(query)) if !query.query.is_empty() => {
@@ -3858,25 +3870,86 @@ fn append_history_messages(
                 ));
             }
             Some(api::message::Message::ToolCall(tool_call)) => {
-                if let Some(metadata) = mcp_tool_call_metadata_from_api(tool_call, mcp_tool_catalog)
-                {
-                    mcp_tool_calls_by_id.insert(tool_call.tool_call_id.clone(), metadata);
+                if !paired_tool_call_ids.contains(&tool_call.tool_call_id) {
+                    continue;
                 }
                 if let Some(tool_call) = openai_tool_call_from_api(tool_call, mcp_tool_catalog) {
+                    let tool_call_id = tool_call.id.clone();
                     messages.push(openai_assistant_tool_call_message(vec![tool_call]));
+                    if let Some(tool_message) = paired_tool_messages_by_id.get(&tool_call_id) {
+                        messages.push(tool_message.clone());
+                    }
                 }
             }
-            Some(api::message::Message::ToolCallResult(tool_call_result)) => {
-                if let Some(message) = openai_tool_message_from_api(
+            Some(api::message::Message::ToolCallResult(_)) => {}
+            _ => {}
+        }
+    }
+}
+
+fn history_tool_call_ids_with_results(
+    history: &[&api::Message],
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+    mcp_tool_calls_by_id: &HashMap<String, McpToolCallMetadata>,
+) -> HashSet<String> {
+    let mut tool_call_indices = HashMap::new();
+    let mut tool_result_indices = HashMap::new();
+
+    for (index, message) in history.iter().enumerate() {
+        match &message.message {
+            Some(api::message::Message::ToolCall(tool_call))
+                if openai_tool_call_from_api(tool_call, mcp_tool_catalog).is_some() =>
+            {
+                tool_call_indices
+                    .entry(tool_call.tool_call_id.clone())
+                    .or_insert(index);
+            }
+            Some(api::message::Message::ToolCallResult(tool_call_result))
+                if openai_tool_message_from_api(
                     tool_call_result,
                     mcp_tool_calls_by_id.get(&tool_call_result.tool_call_id),
-                ) {
-                    messages.push(message);
-                }
+                )
+                .is_some() =>
+            {
+                tool_result_indices
+                    .entry(tool_call_result.tool_call_id.clone())
+                    .or_insert(index);
             }
             _ => {}
         }
     }
+
+    tool_call_indices
+        .into_iter()
+        .filter_map(|(tool_call_id, call_index)| {
+            let result_index = tool_result_indices.get(&tool_call_id)?;
+            (call_index < *result_index).then_some(tool_call_id)
+        })
+        .collect()
+}
+
+fn history_tool_messages_by_id(
+    history: &[&api::Message],
+    paired_tool_call_ids: &HashSet<String>,
+    mcp_tool_calls_by_id: &HashMap<String, McpToolCallMetadata>,
+) -> HashMap<String, OpenAIChatMessage> {
+    history
+        .iter()
+        .filter_map(|message| {
+            let Some(api::message::Message::ToolCallResult(tool_call_result)) = &message.message
+            else {
+                return None;
+            };
+            if !paired_tool_call_ids.contains(&tool_call_result.tool_call_id) {
+                return None;
+            }
+            let message = openai_tool_message_from_api(
+                tool_call_result,
+                mcp_tool_calls_by_id.get(&tool_call_result.tool_call_id),
+            )?;
+            Some((tool_call_result.tool_call_id.clone(), message))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5277,9 +5350,10 @@ mod tests {
         unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
         LocalSubagentInvocation, LocalToolPolicy, LocalUsageTelemetry, LocalWebUiStatus,
-        OpenAIChatContent, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
-        OpenAIStreamEvent, OpenAIStreamUsage, OpenAIToolCallAccumulator, OpenAIUsageTokenDetails,
-        RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
+        OpenAIChatContent, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatToolCall,
+        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
+        OpenAIToolCallAccumulator, OpenAIUsageTokenDetails, RequestMode,
+        LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
         MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_PLAN_CHARS,
@@ -5533,6 +5607,144 @@ mod tests {
             summary: String::new(),
             server_data: String::new(),
         }
+    }
+
+    fn assert_no_orphan_tool_calls(messages: &[OpenAIChatMessage]) {
+        for (index, message) in messages.iter().enumerate() {
+            let Some(tool_calls) = message.tool_calls.as_ref() else {
+                continue;
+            };
+            let following_tool_ids = messages
+                .iter()
+                .skip(index + 1)
+                .take_while(|message| message.role == "tool")
+                .filter_map(|message| message.tool_call_id.as_deref())
+                .collect::<HashSet<_>>();
+            for tool_call in tool_calls {
+                assert!(
+                    following_tool_ids.contains(tool_call.id.as_str()),
+                    "tool_call_id {} has no following tool result",
+                    tool_call.id
+                );
+            }
+        }
+    }
+
+    fn shell_tool_history_task(include_result: bool) -> api::Task {
+        let mut messages = vec![
+            api::Message {
+                id: "user-1".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: "run pwd".to_string(),
+                    context: None,
+                    referenced_attachments: Default::default(),
+                    mode: None,
+                    intended_agent: 0,
+                })),
+            },
+            api::Message {
+                id: "tool-call-1".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                    tool_call_id: "call_trace_pwd".to_string(),
+                    tool: Some(api::message::tool_call::Tool::RunShellCommand(
+                        api::message::tool_call::RunShellCommand {
+                            command: "pwd".to_string(),
+                            is_read_only: true,
+                            uses_pager: false,
+                            citations: vec![],
+                            is_risky: false,
+                            risk_category: api::RiskCategory::ReadOnly as i32,
+                            wait_until_complete_value: Some(
+                                api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
+                            ),
+                        },
+                    )),
+                })),
+            },
+        ];
+
+        if include_result {
+            messages.push(api::Message {
+                id: "tool-result-1".to_string(),
+                task_id: "root".to_string(),
+                request_id: "request-2".to_string(),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::ToolCallResult(
+                    api::message::ToolCallResult {
+                        tool_call_id: "call_trace_pwd".to_string(),
+                        context: None,
+                        result: Some(api::message::tool_call_result::Result::RunShellCommand(
+                            #[allow(deprecated)]
+                            api::RunShellCommandResult {
+                                command: "pwd".to_string(),
+                                output: Default::default(),
+                                exit_code: Default::default(),
+                                result: Some(
+                                    api::run_shell_command_result::Result::CommandFinished(
+                                        api::ShellCommandFinished {
+                                            command_id: "block-1".to_string(),
+                                            output: "/Users/yizhang\n".to_string(),
+                                            exit_code: 0,
+                                        },
+                                    ),
+                                ),
+                            },
+                        )),
+                    },
+                )),
+            });
+        }
+
+        messages.push(api::Message {
+            id: "assistant-1".to_string(),
+            task_id: "root".to_string(),
+            request_id: "request-3".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput {
+                    text: "The current directory is /Users/yizhang.".to_string(),
+                },
+            )),
+        });
+
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
+    fn append_final_agent_output(task: &mut api::Task, text: &str) {
+        task.messages.push(api::Message {
+            id: "assistant-final".to_string(),
+            task_id: "root".to_string(),
+            request_id: "request-final".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput {
+                    text: text.to_string(),
+                },
+            )),
+        });
     }
 
     fn first_stream_init_conversation_id(
@@ -7631,6 +7843,7 @@ mod tests {
         let messages =
             openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context), true)
                 .unwrap();
+        assert_no_orphan_tool_calls(&messages);
         let result_message = messages
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
@@ -7640,6 +7853,31 @@ mod tests {
         assert!(result_message.content.contains("Tool: read_path"));
         assert!(result_message.content.contains("mcp ok"));
         assert!(!result_message.content.contains("Server: unknown"));
+    }
+
+    #[test]
+    fn mcp_history_strips_unpaired_tool_call_on_next_turn() {
+        let _mcp_enabled = FeatureFlag::LocalAgentMcp.override_enabled(true);
+        let local_context = local_mcp_context_with_tool("server-id", "filesystem", "read_path");
+        let mut task = task_with_mcp_tool_call("call_mcp", "server-id", "read_path", None);
+        append_final_agent_output(&mut task, "MCP completed.");
+        let input = vec![user_query_input("follow up", Vec::new(), HashMap::new())];
+
+        let messages =
+            openai_messages_from_inputs_and_tasks(&input, &[task], Some(&local_context), true)
+                .unwrap();
+
+        assert_no_orphan_tool_calls(&messages);
+        assert!(
+            messages.iter().all(|message| message.tool_calls.is_none()),
+            "historical MCP assistant tool_calls without tool results must be stripped"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.tool_call_id.as_deref() != Some("call_mcp")),
+            "historical MCP tool role messages must not appear without paired assistant tool_calls"
+        );
     }
 
     #[test]
@@ -7662,6 +7900,7 @@ mod tests {
         let messages =
             openai_messages_from_inputs_and_tasks(&input, &tasks, Some(&local_context), true)
                 .unwrap();
+        assert_no_orphan_tool_calls(&messages);
         let result_message = messages
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call_mcp"))
@@ -9056,6 +9295,135 @@ mod tests {
                 ("user", "what did I say?"),
             ]
         );
+    }
+
+    #[test]
+    fn openai_messages_keep_paired_shell_tool_history_on_next_turn() {
+        let tasks = vec![shell_tool_history_task(true)];
+        let input = vec![user_query_input("thanks", vec![], HashMap::new())];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
+
+        assert_no_orphan_tool_calls(&messages);
+        let tool_call_index = messages
+            .iter()
+            .position(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|tool_calls| tool_calls[0].id == "call_trace_pwd")
+            })
+            .expect("expected historical shell tool call");
+        assert_eq!(messages[tool_call_index].role, "assistant");
+        assert_eq!(messages[tool_call_index + 1].role, "tool");
+        assert_eq!(
+            messages[tool_call_index + 1].tool_call_id.as_deref(),
+            Some("call_trace_pwd")
+        );
+        assert!(messages[tool_call_index + 1]
+            .content
+            .as_str()
+            .contains("/Users/yizhang"));
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert_eq!(messages.last().unwrap().content.as_str(), "thanks");
+    }
+
+    #[test]
+    fn openai_messages_keep_multiple_paired_shell_tool_results_on_next_turn() {
+        let mut task = shell_tool_history_task(true);
+        let final_output = task.messages.pop().unwrap();
+        let first_tool_result = task.messages.pop().unwrap();
+        let tool_call_template = task.messages[1].clone();
+        let tool_result_template = first_tool_result.clone();
+        let mut extra_tool_results = Vec::new();
+
+        for index in 2..=3 {
+            let tool_call_id = format!("call_trace_pwd_{index}");
+            let command = format!("pwd && echo {index}");
+
+            let mut tool_call_message = tool_call_template.clone();
+            tool_call_message.id = format!("tool-call-{index}");
+            if let Some(api::message::Message::ToolCall(tool_call)) =
+                tool_call_message.message.as_mut()
+            {
+                tool_call.tool_call_id = tool_call_id.clone();
+                if let Some(api::message::tool_call::Tool::RunShellCommand(command_call)) =
+                    tool_call.tool.as_mut()
+                {
+                    command_call.command = command.clone();
+                }
+            }
+            task.messages.push(tool_call_message);
+
+            let mut tool_result_message = tool_result_template.clone();
+            tool_result_message.id = format!("tool-result-{index}");
+            if let Some(api::message::Message::ToolCallResult(tool_result)) =
+                tool_result_message.message.as_mut()
+            {
+                tool_result.tool_call_id = tool_call_id;
+                if let Some(api::message::tool_call_result::Result::RunShellCommand(result)) =
+                    tool_result.result.as_mut()
+                {
+                    result.command = command;
+                    if let Some(api::run_shell_command_result::Result::CommandFinished(finished)) =
+                        result.result.as_mut()
+                    {
+                        finished.output = format!("/Users/yizhang/{index}\n");
+                    }
+                }
+            }
+            extra_tool_results.push(tool_result_message);
+        }
+        task.messages.push(first_tool_result);
+        task.messages.extend(extra_tool_results);
+        task.messages.push(final_output);
+
+        let input = vec![user_query_input("summarize those", vec![], HashMap::new())];
+        let messages = openai_messages_from_inputs_and_tasks(&input, &[task], None, true).unwrap();
+
+        assert_no_orphan_tool_calls(&messages);
+        let tool_call_ids = messages
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+            .map(|tool_call| tool_call.id.as_str())
+            .collect::<Vec<_>>();
+        let tool_result_ids = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tool_call_ids,
+            vec!["call_trace_pwd", "call_trace_pwd_2", "call_trace_pwd_3"]
+        );
+        assert_eq!(
+            tool_result_ids,
+            vec!["call_trace_pwd", "call_trace_pwd_2", "call_trace_pwd_3"]
+        );
+    }
+
+    #[test]
+    fn openai_messages_strip_unpaired_shell_tool_call_history_on_next_turn() {
+        let tasks = vec![shell_tool_history_task(false)];
+        let input = vec![user_query_input("next question", vec![], HashMap::new())];
+
+        let messages = openai_messages_from_inputs_and_tasks(&input, &tasks, None, true).unwrap();
+
+        assert_no_orphan_tool_calls(&messages);
+        assert!(
+            messages.iter().all(|message| message.tool_calls.is_none()),
+            "historical assistant tool_calls without tool results must be stripped"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.tool_call_id.as_deref() != Some("call_trace_pwd")),
+            "historical tool role messages must not appear without paired assistant tool_calls"
+        );
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert_eq!(messages.last().unwrap().content.as_str(), "next question");
     }
 
     #[test]
