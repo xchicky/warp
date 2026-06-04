@@ -8,7 +8,7 @@
 # setup (install_channel_config, binary name detection, feature-to-env-var
 # mapping). The following env vars are expected to be set by the caller:
 #   WARP_BIN_NAME  — "warp" (internal local build) or "warp-oss"
-#   WARP_CHANNEL   — "local" or "oss"
+#   WARP_CHANNEL   — "local", "local-dev", or "oss"
 #   FEATURES       — comma-separated cargo features (already normalized)
 # Must be called from the root directory of the warp repo.
 
@@ -24,9 +24,16 @@ cd "${REPO_ROOT}"
 if [ "$WARP_CHANNEL" = "local" ]; then
     WARP_APP_PATH="target/debug/bundle/osx/Warp.app"
     WARP_SCHEME_NAME="warp"
+    WARP_RESOURCE_CHANNEL="local"
+elif [ "$WARP_CHANNEL" = "local-dev" ]; then
+    WARP_APP_PATH="target/debug/bundle/osx/Warp Dev.app"
+    WARP_SCHEME_NAME="warpdev"
+    WARP_RESOURCE_CHANNEL="local"
+    WARP_DATA_PROFILE="local-dev"
 else
     WARP_APP_PATH="target/debug/bundle/osx/WarpOss.app"
     WARP_SCHEME_NAME="warposs"
+    WARP_RESOURCE_CHANNEL="$WARP_CHANNEL"
 fi
 DONT_OPEN=false
 # Launches the binary with "open", meaning the Warp process is
@@ -61,6 +68,8 @@ while (( "$#" )); do
       echo "Detected release build, pointing at release bundle under target/release/bundle"
       if [ "$WARP_CHANNEL" = "local" ]; then
           WARP_APP_PATH="target/release/bundle/osx/Warp.app"
+      elif [ "$WARP_CHANNEL" = "local-dev" ]; then
+          WARP_APP_PATH="target/release/bundle/osx/Warp Dev.app"
       else
           WARP_APP_PATH="target/release/bundle/osx/WarpOss.app"
       fi
@@ -72,6 +81,8 @@ while (( "$#" )); do
       shift 2
       if [ "$WARP_CHANNEL" = "local" ]; then
           WARP_APP_PATH="target/${PROFILE}/bundle/osx/Warp.app"
+      elif [ "$WARP_CHANNEL" = "local-dev" ]; then
+          WARP_APP_PATH="target/${PROFILE}/bundle/osx/Warp Dev.app"
       else
           WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpOss.app"
       fi
@@ -100,6 +111,12 @@ cargo bundle --bin "$WARP_BIN_NAME" --features "$FEATURES" $PARAMS
 echo "Successfully bundled..."
 popd > /dev/null
 
+if [ "$WARP_CHANNEL" = "local-dev" ]; then
+  LOCAL_DEV_CARGO_APP_PATH="${WARP_APP_PATH%/Warp Dev.app}/Warp.app"
+  rm -rf "$WARP_APP_PATH"
+  mv "$LOCAL_DEV_CARGO_APP_PATH" "$WARP_APP_PATH"
+fi
+
 if [[ ",$FEATURES," =~ ",cocoa_sentry," ]]; then
   echo "Copying Sentry framework into app bundle..."
   SENTRY_FRAMEWORK="app/frameworks/dev/Sentry-Dynamic-WithARM64e.xcframework/macos-arm64_arm64e_x86_64/Sentry.framework"
@@ -112,13 +129,19 @@ export WARP_SCHEME_NAME
 export WARP_PLIST_PATH="$WARP_APP_PATH/Contents/Info.plist"
 ./script/update_plist
 
+if [ "$WARP_CHANNEL" = "local-dev" ]; then
+  plutil -replace CFBundleIdentifier -string "dev.warp.Warp-Local-Dev" "$WARP_PLIST_PATH"
+  plutil -replace CFBundleDisplayName -string "Warp Dev" "$WARP_PLIST_PATH"
+  plutil -replace CFBundleName -string "Warp Dev" "$WARP_PLIST_PATH"
+fi
+
 echo "Preparing bundled resources..."
 if [ "${GENERATE_SCHEMA:-false}" != "true" ]; then
   export SKIP_SETTINGS_SCHEMA=1
 fi
-NO_LICENSES=1 "${REPO_ROOT}/script/prepare_bundled_resources" "$WARP_APP_PATH/Contents/Resources" "$WARP_CHANNEL"
+NO_LICENSES=1 "${REPO_ROOT}/script/prepare_bundled_resources" "$WARP_APP_PATH/Contents/Resources" "$WARP_RESOURCE_CHANNEL"
 
-"${REPO_ROOT}/script/compile_icon" "$WARP_CHANNEL" "$WARP_APP_PATH"
+"${REPO_ROOT}/script/compile_icon" "$WARP_RESOURCE_CHANNEL" "$WARP_APP_PATH"
 
 if [[ ",$FEATURES," =~ ",heap_usage_tracking," ]]; then
   echo "Bundling pprof..."
@@ -137,6 +160,10 @@ if [ "$DONT_OPEN" = false ] ; then
         tail -f ~/Library/Logs/warp_local.log
     else
         echo "Opening app at ./$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME"
-        "./$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME" "${WARP_ARGS[@]}"
+        if [ "$WARP_CHANNEL" = "local-dev" ]; then
+          WARP_DATA_PROFILE=local-dev "./$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME" "${WARP_ARGS[@]}"
+        else
+          "./$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME" "${WARP_ARGS[@]}"
+        fi
     fi
 fi
