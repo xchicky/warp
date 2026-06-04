@@ -7653,6 +7653,55 @@ mod tests {
     }
 
     #[test]
+    fn ssh_aware_local_tools_fs_tool_card_result_is_structured_error() {
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let result = execute_local_tool_with_policy_with_runtime(
+            &tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
+            Some(Path::new("/home/zhangyi")),
+            &suggestions,
+            None,
+            LocalToolPolicy::Normal,
+            LocalToolRuntimeContext {
+                session_is_local: Some(false),
+            },
+        );
+        assert_eq!(result.text, SSH_UNSUPPORTED_FS_TOOL_ERROR);
+
+        let events = structured_tool_card_events(
+            "task",
+            "request",
+            &tool_call("glob", r#"{"pattern":"**/*.rs"}"#),
+            &result.text,
+            None,
+        )
+        .unwrap();
+        let api::response_event::Type::ClientActions(actions) = events[1].r#type.as_ref().unwrap()
+        else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AddMessagesToTask(add)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected add messages");
+        };
+        let Some(api::message::Message::ToolCallResult(result_message)) =
+            add.messages[0].message.as_ref()
+        else {
+            panic!("expected tool call result message");
+        };
+        let Some(api::message::tool_call_result::Result::FileGlobV2(glob_result)) =
+            result_message.result.as_ref()
+        else {
+            panic!("expected file glob result");
+        };
+        let Some(api::file_glob_v2_result::Result::Error(error)) = glob_result.result.as_ref()
+        else {
+            panic!("expected SSH unsupported fs result to be structured error");
+        };
+        assert_eq!(error.message, SSH_UNSUPPORTED_FS_TOOL_ERROR);
+    }
+
+    #[test]
     fn ssh_aware_local_tools_policy_denial_precedes_ssh_fs_error() {
         let suggestions = Arc::new(Mutex::new(HashSet::new()));
         let result = execute_local_tool_with_policy_with_runtime(

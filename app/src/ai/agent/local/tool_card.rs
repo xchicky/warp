@@ -12,7 +12,7 @@ use super::{
     safe_shell_command::{
         is_local_autoexecute_safe_command, register_local_autoexecute_safe_tool_call,
     },
-    OpenAIChatToolCall,
+    OpenAIChatToolCall, SSH_UNSUPPORTED_FS_TOOL_ERROR,
 };
 
 pub(super) fn structured_tool_card_events(
@@ -514,6 +514,10 @@ fn apply_file_diffs_result_from_text(
 }
 
 fn tool_error(result: &str) -> Option<String> {
+    if result == SSH_UNSUPPORTED_FS_TOOL_ERROR {
+        return Some(result.to_string());
+    }
+
     result
         .strip_prefix("Tool error:")
         .map(str::trim)
