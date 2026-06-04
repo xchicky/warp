@@ -33,6 +33,7 @@ pub async fn generate_multi_agent_output(
                 params.tasks,
                 params.conversation_token.clone(),
                 local_mcp_context,
+                params.local_tool_runtime_context,
             )
             .take_until(cancellation_rx),
         ));

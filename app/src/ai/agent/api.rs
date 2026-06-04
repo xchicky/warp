@@ -22,6 +22,7 @@ use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::local::LocalToolRuntimeContext;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::{
     ai::{
@@ -122,6 +123,7 @@ pub struct RequestParams {
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
     pub allow_use_of_warp_credits_with_byok: bool,
     pub local_direct_config: Option<super::local::LocalDirectConfig>,
+    pub local_tool_runtime_context: LocalToolRuntimeContext,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
     pub web_search_enabled: bool,
@@ -146,6 +148,20 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 // execution in WoW).
 #[cfg(target_family = "wasm")]
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Event>>>;
+
+pub(crate) fn local_tool_runtime_context_for_session(
+    session_context: &SessionContext,
+) -> LocalToolRuntimeContext {
+    use crate::terminal::model::session::SessionType;
+
+    LocalToolRuntimeContext {
+        session_is_local: match session_context.session_type() {
+            Some(SessionType::Local) => Some(true),
+            Some(SessionType::WarpifiedRemote { .. }) => Some(false),
+            None => None,
+        },
+    }
+}
 
 fn local_openai_direct_config_for_model(
     api_keys: &ai::api_keys::ApiKeys,
@@ -296,6 +312,7 @@ impl RequestParams {
             &request_input.model_id,
             vision_supported,
         );
+        let local_tool_runtime_context = local_tool_runtime_context_for_session(&session_context);
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
 
@@ -380,6 +397,7 @@ impl RequestParams {
             api_keys,
             allow_use_of_warp_credits_with_byok,
             local_direct_config,
+            local_tool_runtime_context,
             autonomy_level,
             isolation_level,
             web_search_enabled,

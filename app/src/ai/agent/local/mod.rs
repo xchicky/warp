@@ -649,12 +649,27 @@ struct LocalUsageSummary {
 
 pub type LocalResponseStream = Pin<Box<dyn Stream<Item = Event> + Send + 'static>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocalToolRuntimeContext {
+    pub session_is_local: Option<bool>,
+}
+
+impl LocalToolRuntimeContext {
+    fn is_ssh_session(self) -> bool {
+        self.session_is_local == Some(false)
+    }
+}
+
+const SSH_UNSUPPORTED_FS_TOOL_ERROR: &str =
+    "tool not supported in SSH session, use run_shell_command to inspect remote files via cat/grep/ls";
+
 pub fn generate_openai_compatible_output(
     config: LocalDirectConfig,
     input: Vec<AIAgentInput>,
     tasks: Vec<api::Task>,
     conversation_token: Option<ServerConversationToken>,
     mcp_context: Option<LocalMcpContext>,
+    runtime_context: LocalToolRuntimeContext,
 ) -> LocalResponseStream {
     Box::pin(stream! {
         let request_id = Uuid::new_v4().to_string();
@@ -920,6 +935,7 @@ pub fn generate_openai_compatible_output(
                 Arc::clone(&suggested_shell_commands),
                 mcp_tool_catalog.clone().map(Arc::new),
                 tool_policy,
+                runtime_context,
                 Some(LocalSubagentRuntime {
                     config: config.clone(),
                     mcp_context: mcp_context.clone(),
@@ -2104,6 +2120,7 @@ async fn execute_local_tool_batch(
         suggested_shell_commands,
         mcp_tool_catalog,
         LocalToolPolicy::Normal,
+        LocalToolRuntimeContext::default(),
         None,
     )
     .await
@@ -2115,6 +2132,7 @@ async fn execute_local_tool_batch_with_policy(
     suggested_shell_commands: Arc<Mutex<HashSet<String>>>,
     mcp_tool_catalog: Option<Arc<LocalMcpToolCatalog>>,
     tool_policy: LocalToolPolicy,
+    runtime_context: LocalToolRuntimeContext,
     subagent_runtime: Option<LocalSubagentRuntime>,
 ) -> Vec<(OpenAIChatToolCall, LocalToolExecutionResult)> {
     #[cfg(test)]
@@ -2141,6 +2159,7 @@ async fn execute_local_tool_batch_with_policy(
                             &suggested_shell_commands,
                             mcp_tool_catalog.as_deref(),
                             tool_policy,
+                            runtime_context,
                             runtime,
                         ),
                     )
@@ -2168,12 +2187,13 @@ async fn execute_local_tool_batch_with_policy(
             let result = tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result = execute_local_tool_with_policy(
+                let result = execute_local_tool_with_policy_with_runtime(
                     &tool_call,
                     cwd.as_deref(),
                     &suggested_shell_commands,
                     mcp_tool_catalog.as_deref(),
                     tool_policy,
+                    runtime_context,
                 );
                 (tool_call, result)
             })
@@ -2206,12 +2226,13 @@ async fn execute_local_tool_batch_with_policy(
             match tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
-                let result = execute_local_tool_with_policy(
+                let result = execute_local_tool_with_policy_with_runtime(
                     &tool_call,
                     cwd.as_deref(),
                     &suggested_shell_commands,
                     mcp_tool_catalog.as_deref(),
                     tool_policy,
+                    runtime_context,
                 );
                 (tool_call, result)
             })
@@ -2228,6 +2249,20 @@ async fn execute_local_tool_batch_with_policy(
         }
     }))
     .await
+}
+
+fn is_ssh_unsupported_fs_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "grep"
+            | "glob"
+            | "list_directory"
+            | "search_codebase"
+            | "apply_file_diff"
+            | "write_file"
+            | "edit_file"
+    )
 }
 
 fn is_mutating_local_tool(name: &str) -> bool {
@@ -2270,6 +2305,17 @@ impl LocalToolExecutionResult {
             exits_plan_mode: false,
         }
     }
+
+    fn exact_tool_error(error: impl Into<String>) -> Self {
+        Self {
+            text: error.into(),
+            apply_file_diff_summary: None,
+            todo_operations: Vec::new(),
+            web_ui_status: None,
+            pending_tool_call: false,
+            exits_plan_mode: false,
+        }
+    }
 }
 
 fn execute_local_tool(
@@ -2294,8 +2340,29 @@ fn execute_local_tool_with_policy(
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
     tool_policy: LocalToolPolicy,
 ) -> LocalToolExecutionResult {
+    execute_local_tool_with_policy_with_runtime(
+        tool_call,
+        cwd,
+        suggested_shell_commands,
+        mcp_tool_catalog,
+        tool_policy,
+        LocalToolRuntimeContext::default(),
+    )
+}
+
+fn execute_local_tool_with_policy_with_runtime(
+    tool_call: &OpenAIChatToolCall,
+    cwd: Option<&Path>,
+    suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+    tool_policy: LocalToolPolicy,
+    runtime_context: LocalToolRuntimeContext,
+) -> LocalToolExecutionResult {
     if let Some(error) = tool_policy.denied_tool_error(&tool_call.function.name) {
         return LocalToolExecutionResult::tool_error(error);
+    }
+    if runtime_context.is_ssh_session() && is_ssh_unsupported_fs_tool(&tool_call.function.name) {
+        return LocalToolExecutionResult::exact_tool_error(SSH_UNSUPPORTED_FS_TOOL_ERROR);
     }
     if matches!(tool_call.function.name.as_str(), "web_search" | "web_fetch")
         && !FeatureFlag::LocalAgentWeb.is_enabled()
@@ -2350,8 +2417,12 @@ fn execute_local_tool_with_policy(
             .map(|result| (result.0, result.1, Vec::new(), None, false)),
         "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd)
             .map(|result| (result.0, result.1, Vec::new(), None, false)),
-        "run_shell_command" => execute_run_shell_command_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, true)),
+        "run_shell_command" => execute_run_shell_command_tool_with_runtime(
+            &tool_call.function.arguments,
+            cwd,
+            runtime_context,
+        )
+        .map(|text| (text, None, Vec::new(), None, true)),
         "todo_write" => execute_todo_write_tool(&tool_call.function.arguments)
             .map(|result| (result.text, None, result.operations, None, false)),
         "exit_plan_mode" => execute_exit_plan_mode_tool(&tool_call.function.arguments)
@@ -2435,6 +2506,7 @@ async fn execute_spawn_subagent_tool(
     suggested_shell_commands: &Arc<Mutex<HashSet<String>>>,
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
     tool_policy: LocalToolPolicy,
+    runtime_context: LocalToolRuntimeContext,
     runtime: &LocalSubagentRuntime,
 ) -> LocalToolExecutionResult {
     let result: anyhow::Result<String> = async {
@@ -2488,12 +2560,13 @@ async fn execute_spawn_subagent_tool(
                     continue;
                 }
                 let tool_name = tool_call.function.name.clone();
-                let result = execute_local_tool_with_policy(
+                let result = execute_local_tool_with_policy_with_runtime(
                     &tool_call,
                     cwd,
                     suggested_shell_commands,
                     mcp_tool_catalog,
                     tool_policy,
+                    runtime_context,
                 );
                 if result.exits_plan_mode || result.pending_tool_call {
                     return Ok(local_subagent_result_text(
@@ -3250,6 +3323,14 @@ fn execute_edit_file_tool(
 }
 
 fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
+    execute_run_shell_command_tool_with_runtime(arguments, cwd, LocalToolRuntimeContext::default())
+}
+
+fn execute_run_shell_command_tool_with_runtime(
+    arguments: &str,
+    cwd: Option<&Path>,
+    runtime_context: LocalToolRuntimeContext,
+) -> anyhow::Result<String> {
     if !FeatureFlag::LocalAgentShellExecution.is_enabled() {
         return Err(anyhow!("run_shell_command is disabled by feature flag"));
     }
@@ -3267,7 +3348,7 @@ fn execute_run_shell_command_tool(arguments: &str, cwd: Option<&Path>) -> anyhow
 
     let active_cwd =
         cwd.ok_or_else(|| anyhow!("run_shell_command requires a current working directory"))?;
-    let resolved_cwd = resolve_run_shell_command_cwd(&args, active_cwd)?;
+    let resolved_cwd = resolve_run_shell_command_cwd(&args, active_cwd, runtime_context)?;
     let is_read_only = optional_bool_arg(&args, "is_read_only")
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
@@ -3290,7 +3371,25 @@ fn reject_unsupported_run_shell_command_arg(args: &Value, name: &str) -> anyhow:
     Ok(())
 }
 
-fn resolve_run_shell_command_cwd(args: &Value, active_cwd: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_run_shell_command_cwd(
+    args: &Value,
+    active_cwd: &Path,
+    runtime_context: LocalToolRuntimeContext,
+) -> anyhow::Result<PathBuf> {
+    if runtime_context.is_ssh_session() {
+        if active_cwd.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "run_shell_command requires a current working directory"
+            ));
+        }
+        if optional_string_arg(args, "cwd").is_some() {
+            return Err(anyhow!(
+                "cwd overrides are not supported in SSH sessions; run_shell_command uses the active remote terminal cwd"
+            ));
+        }
+        return Ok(active_cwd.to_path_buf());
+    }
+
     let active_cwd = active_cwd.canonicalize().map_err(|_| {
         anyhow!(
             "Current working directory is not readable: {}",
@@ -5334,24 +5433,26 @@ mod tests {
         execute_apply_file_diff_tool, execute_edit_file_tool, execute_exit_plan_mode_tool,
         execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
         execute_local_tool_batch, execute_local_tool_batch_with_policy,
-        execute_local_tool_with_policy, execute_read_file_tool, execute_run_shell_command_tool,
-        execute_suggest_shell_command_tool, execute_todo_write_tool, execute_write_file_tool,
-        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
-        is_sequential_local_tool, local_mcp_tool_catalog, local_read_only_tools,
-        local_shell_action_result, local_subagent_messages, local_subagent_result_text,
-        local_tool_result_summary, local_tools, local_tools_for_context,
-        local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
-        mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
-        openai_message, openai_messages_from_inputs_and_tasks,
-        openai_messages_from_inputs_and_tasks_with_policy, root_task_id,
-        shell_command_result_for_provider, stream_finished_done, structured_mcp_tool_call_event,
-        structured_tool_call_event, take_local_autoexecute_safe_tool_call, todo_update_events,
+        execute_local_tool_with_policy, execute_local_tool_with_policy_with_runtime,
+        execute_read_file_tool, execute_run_shell_command_tool,
+        execute_run_shell_command_tool_with_runtime, execute_suggest_shell_command_tool,
+        execute_todo_write_tool, execute_write_file_tool, fallback_tool_results_message,
+        generate_openai_compatible_output, is_mutating_local_tool, is_sequential_local_tool,
+        local_mcp_tool_catalog, local_read_only_tools, local_shell_action_result,
+        local_subagent_messages, local_subagent_result_text, local_tool_result_summary,
+        local_tools, local_tools_for_context, local_tools_for_context_with_policy,
+        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
+        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
+        root_task_id, shell_command_result_for_provider, stream_finished_done,
+        structured_mcp_tool_call_event, structured_tool_call_event,
+        take_local_autoexecute_safe_tool_call, todo_update_events,
         truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
-        LocalSubagentInvocation, LocalToolPolicy, LocalUsageTelemetry, LocalWebUiStatus,
-        OpenAIChatContent, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatToolCall,
-        OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
+        LocalSubagentInvocation, LocalToolPolicy, LocalToolRuntimeContext, LocalUsageTelemetry,
+        LocalWebUiStatus, OpenAIChatContent, OpenAIChatMessage, OpenAIChatRequest,
+        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
         OpenAIToolCallAccumulator, OpenAIUsageTokenDetails, RequestMode,
         LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
@@ -5360,6 +5461,7 @@ mod tests {
         MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_SUBAGENT_DEPTH,
         MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
         MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
+        SSH_UNSUPPORTED_FS_TOOL_ERROR,
     };
     use crate::ai::agent::{
         api::{
@@ -5757,6 +5859,7 @@ mod tests {
                 Vec::new(),
                 conversation_token,
                 None,
+                LocalToolRuntimeContext::default(),
             );
             let event = stream.next().await.unwrap().unwrap();
             let Some(api::response_event::Type::Init(init)) = event.r#type else {
@@ -5835,6 +5938,7 @@ mod tests {
                     "local-conversation".to_string(),
                 )),
                 None,
+                LocalToolRuntimeContext::default(),
             );
 
             let init = stream.next().await.unwrap().unwrap();
@@ -7446,6 +7550,161 @@ mod tests {
     }
 
     #[test]
+    fn ssh_aware_local_tools_run_shell_command_accepts_remote_cwd_without_local_presence() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let remote_cwd = Path::new("/home/zhangyi/project-that-does-not-exist-locally-m7");
+
+        let result = execute_run_shell_command_tool_with_runtime(
+            r#"{"command":"pwd","is_read_only":true}"#,
+            Some(remote_cwd),
+            LocalToolRuntimeContext {
+                session_is_local: Some(false),
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("waiting for user approval"));
+        assert!(result.contains("Cwd: /home/zhangyi/project-that-does-not-exist-locally-m7"));
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_run_shell_command_rejects_cwd_override_in_ssh_session() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let error = execute_run_shell_command_tool_with_runtime(
+            r#"{"command":"pwd","cwd":"/tmp"}"#,
+            Some(Path::new("/home/zhangyi")),
+            LocalToolRuntimeContext {
+                session_is_local: Some(false),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cwd overrides are not supported in SSH sessions; run_shell_command uses the active remote terminal cwd"
+        );
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_unknown_session_keeps_local_cwd_validation() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let missing = Path::new("/home/zhangyi/project-that-does-not-exist-locally-m7");
+
+        let error = execute_run_shell_command_tool_with_runtime(
+            r#"{"command":"pwd"}"#,
+            Some(missing),
+            LocalToolRuntimeContext::default(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Current working directory is not readable"));
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_local_missing_cwd_behavior_is_unchanged() {
+        let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let missing = Path::new("/home/zhangyi/project-that-does-not-exist-locally-m7");
+
+        let error = execute_run_shell_command_tool_with_runtime(
+            r#"{"command":"pwd"}"#,
+            Some(missing),
+            LocalToolRuntimeContext {
+                session_is_local: Some(true),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Current working directory is not readable"));
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_fs_tools_return_friendly_ssh_error() {
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let runtime_context = LocalToolRuntimeContext {
+            session_is_local: Some(false),
+        };
+
+        for tool_name in [
+            "read_file",
+            "grep",
+            "glob",
+            "list_directory",
+            "search_codebase",
+            "apply_file_diff",
+            "write_file",
+            "edit_file",
+        ] {
+            let result = execute_local_tool_with_policy_with_runtime(
+                &tool_call(tool_name, "{}"),
+                Some(Path::new("/home/zhangyi")),
+                &suggestions,
+                None,
+                LocalToolPolicy::Normal,
+                runtime_context,
+            );
+
+            assert_eq!(result.text, SSH_UNSUPPORTED_FS_TOOL_ERROR, "{tool_name}");
+            assert!(!result.pending_tool_call, "{tool_name}");
+        }
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_policy_denial_precedes_ssh_fs_error() {
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let result = execute_local_tool_with_policy_with_runtime(
+            &tool_call("write_file", r#"{"path":"file.txt","content":"new"}"#),
+            Some(Path::new("/home/zhangyi")),
+            &suggestions,
+            None,
+            LocalToolPolicy::Plan,
+            LocalToolRuntimeContext {
+                session_is_local: Some(false),
+            },
+        );
+
+        assert!(result.text.contains("unavailable in plan mode"));
+        assert!(!result.text.contains(SSH_UNSUPPORTED_FS_TOOL_ERROR));
+    }
+
+    #[test]
+    fn ssh_aware_local_tools_non_fs_tools_are_not_blocked_by_ssh_policy() {
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let suggestions = Arc::new(Mutex::new(HashSet::new()));
+        let runtime_context = LocalToolRuntimeContext {
+            session_is_local: Some(false),
+        };
+
+        let todo = execute_local_tool_with_policy_with_runtime(
+            &tool_call(
+                "todo_write",
+                r#"{"todos":[{"id":"one","content":"One","status":"pending"}]}"#,
+            ),
+            Some(Path::new("/home/zhangyi")),
+            &suggestions,
+            None,
+            LocalToolPolicy::Normal,
+            runtime_context,
+        );
+        assert!(!todo.text.contains(SSH_UNSUPPORTED_FS_TOOL_ERROR));
+
+        let shell = execute_local_tool_with_policy_with_runtime(
+            &tool_call("run_shell_command", r#"{"command":"pwd"}"#),
+            Some(Path::new("/home/zhangyi")),
+            &suggestions,
+            None,
+            LocalToolPolicy::Normal,
+            runtime_context,
+        );
+        assert!(shell.pending_tool_call);
+        assert!(shell.text.contains("waiting for user approval"));
+        assert!(!shell.text.contains(SSH_UNSUPPORTED_FS_TOOL_ERROR));
+    }
+
+    #[test]
     fn run_shell_command_tool_rejects_timeout_and_rationale_until_action_path_supports_them() {
         let _flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -8574,6 +8833,7 @@ mod tests {
             suggestions,
             None,
             LocalToolPolicy::Plan,
+            LocalToolRuntimeContext::default(),
             None,
         )
         .await;

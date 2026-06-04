@@ -140,6 +140,12 @@ impl SessionContext {
             current_working_directory: None,
         }
     }
+
+    #[cfg(test)]
+    pub fn with_session_type_for_test(mut self, session_type: Option<SessionType>) -> Self {
+        self.session_type = session_type;
+        self
+    }
 }
 
 pub enum BlocklistAIControllerEvent {
