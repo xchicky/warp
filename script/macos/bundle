@@ -246,7 +246,7 @@ eval set -- "$PARAMS"
 # Infer a cargo profile from the bundle configuration.
 if [[ $DEBUG = true ]]; then
   CARGO_PROFILE="dev"
-elif [[ $RELEASE_CHANNEL = "local" || $RELEASE_CHANNEL = "dev" ]]; then
+elif [[ $RELEASE_CHANNEL = "local" || $RELEASE_CHANNEL = "local-dev" || $RELEASE_CHANNEL = "dev" ]]; then
   # For dev bundles, we want to enable debug assertions to
   # catch violations that would otherwise silently pass in
   # a normal release build (e.g. in stable).
@@ -273,8 +273,20 @@ if [[ $RELEASE_CHANNEL = "local" ]]; then
     BUNDLE_ID="dev.warp.Warp-Local"
     WARP_APP_NAME="Warp"
     WARP_SCHEME_NAME="warp"
+    WARP_RESOURCE_CHANNEL="local"
     FEATURES="$FEATURES,agent_mode_debug"
     # For local builds, use different versions of our bundled frameworks (e.g.:
+    # Sentry).  This needs to be exported so it can be referenced by
+    # app/build.rs later, while running `cargo bundle`.
+    export FRAMEWORK_OVERRIDE="dev"
+elif [[ $RELEASE_CHANNEL = "local-dev" ]]; then
+    WARP_BIN="warp"
+    BUNDLE_ID="dev.warp.Warp-Local-Dev"
+    WARP_APP_NAME="Warp Dev"
+    WARP_SCHEME_NAME="warpdev"
+    WARP_RESOURCE_CHANNEL="local"
+    FEATURES="$FEATURES,agent_mode_debug"
+    # For local-dev builds, use different versions of our bundled frameworks (e.g.:
     # Sentry).  This needs to be exported so it can be referenced by
     # app/build.rs later, while running `cargo bundle`.
     export FRAMEWORK_OVERRIDE="dev"
@@ -283,6 +295,7 @@ elif [[ $RELEASE_CHANNEL = "dev" ]]; then
     BUNDLE_ID="dev.warp.Warp-Dev"
     WARP_APP_NAME="WarpDev"
     WARP_SCHEME_NAME="warpdev"
+    WARP_RESOURCE_CHANNEL="dev"
     FEATURES="$FEATURES,agent_mode_debug"
     # Enable heap usage tracking & profiling using jemalloc through pprof.
     FEATURES="$FEATURES,jemalloc_pprof,heap_usage_tracking"
@@ -296,6 +309,7 @@ elif [[ $RELEASE_CHANNEL = "preview" ]]; then
     BUNDLE_ID="dev.warp.Warp-Preview"
     WARP_APP_NAME="WarpPreview"
     WARP_SCHEME_NAME="warppreview"
+    WARP_RESOURCE_CHANNEL="preview"
     FEATURES="$FEATURES,preview_channel"
     # Enable heap usage tracking & profiling using jemalloc through pprof.
     FEATURES="$FEATURES,jemalloc_pprof,heap_usage_tracking"
@@ -304,11 +318,13 @@ elif [[ $RELEASE_CHANNEL = "stable" ]]; then
     BUNDLE_ID="dev.warp.Warp-Stable"
     WARP_APP_NAME="Warp"
     WARP_SCHEME_NAME="warp"
+    WARP_RESOURCE_CHANNEL="stable"
 elif [[ $RELEASE_CHANNEL = "oss" ]]; then
     WARP_BIN="warp-oss"
     BUNDLE_ID="dev.warp.WarpOss"
     WARP_APP_NAME="WarpOss"
     WARP_SCHEME_NAME="warposs"
+    WARP_RESOURCE_CHANNEL="oss"
     # The OSS channel does not ship Sentry, so drop the cocoa_sentry feature
     # (which would otherwise pull in the Sentry framework dependency).
     FEATURES="release_bundle,extern_plist"
@@ -397,12 +413,23 @@ if [[ "$ARTIFACT" == "app" ]]; then
   cargo bundle --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
   popd > /dev/null
 
+  if [[ $RELEASE_CHANNEL = "local-dev" ]]; then
+    rm -rf "$BUNDLE_DIR/$WARP_APP_NAME.app"
+    mv "$BUNDLE_DIR/Warp.app" "$BUNDLE_DIR/$WARP_APP_NAME.app"
+  fi
+
   echo "Adding rpath to support mac frameworks (e.g. Sentry)"
   install_name_tool -add_rpath "@executable_path/../Frameworks" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/MacOS/$WARP_BIN"
 
   export WARP_SCHEME_NAME
   export WARP_PLIST_PATH="$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
   ./script/update_plist
+
+  if [[ $RELEASE_CHANNEL = "local-dev" ]]; then
+    plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$WARP_PLIST_PATH"
+    plutil -replace CFBundleDisplayName -string "$WARP_APP_NAME" "$WARP_PLIST_PATH"
+    plutil -replace CFBundleName -string "$WARP_APP_NAME" "$WARP_PLIST_PATH"
+  fi
 
   if [[ $REGISTER_SERVICES = true ]]; then
     plutil -insert NSServices -xml "
@@ -445,18 +472,18 @@ if [[ "$ARTIFACT" == "app" ]]; then
           <string>public.plain-text</string>
         </array>
       </dict>
-    </array>" "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/Info.plist
+    </array>" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
   fi
 
   # Temporary key that ChatGPT Desktop can use to determine if the latest version of Warp supports the ChatGPT integration.
   # Once support has been rolled out for a sufficient amount of time we (and ChatGPT) can remove this.
-  plutil -insert SUPPORTS_CHAT_GPT_WORK_WITH_APPS -bool true "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/Info.plist
+  plutil -insert SUPPORTS_CHAT_GPT_WORK_WITH_APPS -bool true "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
 
   # Add LSBackgroundOnly key and set it to false since we need a UI app
-  plutil -insert LSBackgroundOnly -bool false "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/Info.plist
+  plutil -insert LSBackgroundOnly -bool false "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
 
   # Add SMAuthorizedClients for macOS 13+ (Ventura) to support login item functionality
-  plutil -insert SMAuthorizedClients -xml "<array><string>$BUNDLE_ID</string></array>" "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/Info.plist
+  plutil -insert SMAuthorizedClients -xml "<array><string>$BUNDLE_ID</string></array>" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
 
   if [[ $UNIVERSAL_BINARY = true ]]; then
       if [[ $BUILD_BINARY = true ]]; then
@@ -511,14 +538,14 @@ if [[ "$ARTIFACT" == "app" ]]; then
   cp -R "$DOCK_TILE_PLUGIN_DIR" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/PlugIns/"
 
   echo "Updating plist with dock tile plugin entries"
-  plutil -insert NSDockTilePlugIn -string "WarpDockTilePlugin.docktileplugin" "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/Info.plist
-  plutil -insert MainAppBundleIdentifier -string "$BUNDLE_ID" "$BUNDLE_DIR"/$WARP_APP_NAME.app/Contents/PlugIns/WarpDockTilePlugin.docktileplugin/Contents/Info.plist
+  plutil -insert NSDockTilePlugIn -string "WarpDockTilePlugin.docktileplugin" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
+  plutil -insert MainAppBundleIdentifier -string "$BUNDLE_ID" "$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/PlugIns/WarpDockTilePlugin.docktileplugin/Contents/Info.plist"
 
   BUNDLED_RESOURCES_DIR="$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Resources"
   echo "Preparing bundled resources..."
-  "$WORKSPACE_ROOT_DIR/script/prepare_bundled_resources" "$BUNDLED_RESOURCES_DIR" "$RELEASE_CHANNEL" "$CARGO_PROFILE"
+  "$WORKSPACE_ROOT_DIR/script/prepare_bundled_resources" "$BUNDLED_RESOURCES_DIR" "$WARP_RESOURCE_CHANNEL" "$CARGO_PROFILE"
 
-  "$WORKSPACE_ROOT_DIR/script/compile_icon" "$RELEASE_CHANNEL" "$BUNDLE_DIR/$WARP_APP_NAME.app"
+  "$WORKSPACE_ROOT_DIR/script/compile_icon" "$WARP_RESOURCE_CHANNEL" "$BUNDLE_DIR/$WARP_APP_NAME.app"
 
   HELPERS_DIR="$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Helpers"
   if [[ ",$FEATURES," =~ ",heap_usage_tracking," ]]; then
@@ -532,6 +559,8 @@ if [[ "$ARTIFACT" == "app" ]]; then
     CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/oz"
   elif [[ $RELEASE_CHANNEL = "oss" ]]; then
     CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/warp-oss"
+  elif [[ $RELEASE_CHANNEL = "local-dev" ]]; then
+    CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/oz-local"
   else
     CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/oz-$RELEASE_CHANNEL"
   fi
