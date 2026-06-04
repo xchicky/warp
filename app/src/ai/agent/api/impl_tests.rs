@@ -1,16 +1,18 @@
 use crate::ai::agent::{
     api::{RequestParams, ServerConversationToken},
-    local::LocalDirectConfig,
+    local::{LocalDirectConfig, LocalToolRuntimeContext},
     task::TaskId,
     AIAgentActionId, AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput,
     MCPContext, MCPServer, ReadFilesResult,
 };
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::LLMId;
+use crate::terminal::model::session::SessionType;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
 use super::{get_supported_tools, local_direct_config_for_request, local_mcp_context_for_request};
+use crate::ai::agent::api::local_tool_runtime_context_for_session;
 
 fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool) -> RequestParams {
     let model = LLMId::from("test-model");
@@ -37,6 +39,7 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         api_keys: None,
         allow_use_of_warp_credits_with_byok: false,
         local_direct_config: None,
+        local_tool_runtime_context: LocalToolRuntimeContext::default(),
         autonomy_level: api::AutonomyLevel::Supervised,
         isolation_level: api::IsolationLevel::None,
         web_search_enabled: false,
@@ -90,6 +93,44 @@ fn mcp_context_with_server(name: &str) -> MCPContext {
             tools: Vec::new(),
         }],
     }
+}
+
+#[test]
+fn ssh_aware_local_tools_runtime_context_local_session() {
+    let context =
+        SessionContext::new_for_test().with_session_type_for_test(Some(SessionType::Local));
+
+    assert_eq!(
+        local_tool_runtime_context_for_session(&context),
+        LocalToolRuntimeContext {
+            session_is_local: Some(true),
+        }
+    );
+}
+
+#[test]
+fn ssh_aware_local_tools_runtime_context_warpified_remote_session() {
+    let context = SessionContext::new_for_test()
+        .with_session_type_for_test(Some(SessionType::WarpifiedRemote { host_id: None }));
+
+    assert_eq!(
+        local_tool_runtime_context_for_session(&context),
+        LocalToolRuntimeContext {
+            session_is_local: Some(false),
+        }
+    );
+}
+
+#[test]
+fn ssh_aware_local_tools_runtime_context_unknown_session() {
+    let context = SessionContext::new_for_test();
+
+    assert_eq!(
+        local_tool_runtime_context_for_session(&context),
+        LocalToolRuntimeContext {
+            session_is_local: None,
+        }
+    );
 }
 
 #[test]
