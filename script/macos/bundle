@@ -271,8 +271,8 @@ fi
 if [[ $RELEASE_CHANNEL = "local" ]]; then
     WARP_BIN="warp"
     BUNDLE_ID="dev.warp.Warp-Local"
-    WARP_APP_NAME="WarpLocal"
-    WARP_SCHEME_NAME="warplocal"
+    WARP_APP_NAME="Warp"
+    WARP_SCHEME_NAME="warp"
     FEATURES="$FEATURES,agent_mode_debug"
     # For local builds, use different versions of our bundled frameworks (e.g.:
     # Sentry).  This needs to be exported so it can be referenced by

@@ -22,8 +22,8 @@ cd "${REPO_ROOT}"
 : "${FEATURES:?FEATURES must be set (invoke via ./script/run)}"
 
 if [ "$WARP_CHANNEL" = "local" ]; then
-    WARP_APP_PATH="target/debug/bundle/osx/WarpLocal.app"
-    WARP_SCHEME_NAME="warplocal"
+    WARP_APP_PATH="target/debug/bundle/osx/Warp.app"
+    WARP_SCHEME_NAME="warp"
 else
     WARP_APP_PATH="target/debug/bundle/osx/WarpOss.app"
     WARP_SCHEME_NAME="warposs"
@@ -60,7 +60,7 @@ while (( "$#" )); do
     --release)
       echo "Detected release build, pointing at release bundle under target/release/bundle"
       if [ "$WARP_CHANNEL" = "local" ]; then
-          WARP_APP_PATH="target/release/bundle/osx/WarpLocal.app"
+          WARP_APP_PATH="target/release/bundle/osx/Warp.app"
       else
           WARP_APP_PATH="target/release/bundle/osx/WarpOss.app"
       fi
@@ -71,7 +71,7 @@ while (( "$#" )); do
       PROFILE="$2"
       shift 2
       if [ "$WARP_CHANNEL" = "local" ]; then
-          WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpLocal.app"
+          WARP_APP_PATH="target/${PROFILE}/bundle/osx/Warp.app"
       else
           WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpOss.app"
       fi
