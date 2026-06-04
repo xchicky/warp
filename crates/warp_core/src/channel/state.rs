@@ -384,7 +384,7 @@ impl ChannelState {
             Channel::Dev => "warpdev",
             // Dummy value--integration tests shouldn't support URL schemes.
             Channel::Integration => "warpintegration",
-            Channel::Local => "warplocal",
+            Channel::Local => "warp",
             Channel::Oss => "warposs",
         }
     }
