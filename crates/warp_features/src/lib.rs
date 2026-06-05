@@ -985,6 +985,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LocalAgentImageInput,
     FeatureFlag::LocalAgentShellExecution,
     FeatureFlag::LocalAgentAutoExecuteSafeCommands,
+    FeatureFlag::LocalAgentFileWrites,
     FeatureFlag::LocalAgentSkills,
     FeatureFlag::LocalAgentCodebaseIndex,
     FeatureFlag::LocalAgentMcp,
