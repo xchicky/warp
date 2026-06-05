@@ -80,6 +80,14 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlanApproval {
+    pub plan: String,
+    pub summary: Option<String>,
+    pub source_exchange_id: AIAgentExchangeId,
+    pub source_message_id: MessageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -240,6 +248,8 @@ pub struct AIConversation {
     orchestration_config: Option<OrchestrationConfig>,
     orchestration_status: OrchestrationConfigStatus,
     orchestration_plan_id: Option<String>,
+
+    pending_plan_approval: Option<PendingPlanApproval>,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -294,6 +304,7 @@ impl AIConversation {
             orchestration_config: None,
             orchestration_status: OrchestrationConfigStatus::default(),
             orchestration_plan_id: None,
+            pending_plan_approval: None,
         }
     }
 
@@ -487,6 +498,7 @@ impl AIConversation {
             orchestration_config: None,
             orchestration_status: OrchestrationConfigStatus::default(),
             orchestration_plan_id: None,
+            pending_plan_approval: None,
         })
     }
 
@@ -672,6 +684,19 @@ impl AIConversation {
     pub fn status(&self) -> &ConversationStatus {
         &self.status
     }
+
+    pub fn pending_plan_approval(&self) -> Option<&PendingPlanApproval> {
+        self.pending_plan_approval.as_ref()
+    }
+
+    pub fn set_pending_plan_approval(&mut self, pending: PendingPlanApproval) {
+        self.pending_plan_approval = Some(pending);
+    }
+
+    pub fn clear_pending_plan_approval(&mut self) -> Option<PendingPlanApproval> {
+        self.pending_plan_approval.take()
+    }
+
     pub fn status_error_message(&self) -> Option<&str> {
         self.status_error_message.as_deref()
     }

@@ -23,7 +23,9 @@ use diesel::SqliteConnection;
 
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::ConversationStatus;
-use crate::ai::agent::conversation::{ServerAIConversationMetadata, UpdateConversationError};
+use crate::ai::agent::conversation::{
+    PendingPlanApproval, ServerAIConversationMetadata, UpdateConversationError,
+};
 use crate::ai::agent::task::helper::{MessageExt, ToolCallExt};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::AIAgentExchangeId;
@@ -603,6 +605,54 @@ impl BlocklistAIHistoryModel {
         self.conversations_by_id
             .get(&conversation_id)
             .and_then(|c| c.existing_suggestions())
+    }
+
+    pub fn pending_plan_approval(
+        &self,
+        conversation_id: &AIConversationId,
+    ) -> Option<&PendingPlanApproval> {
+        self.conversations_by_id
+            .get(conversation_id)
+            .and_then(|conversation| conversation.pending_plan_approval())
+    }
+
+    pub fn set_pending_plan_approval(
+        &mut self,
+        conversation_id: AIConversationId,
+        pending: PendingPlanApproval,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(), UpdateHistoryError> {
+        let source_exchange_id = pending.source_exchange_id;
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        conversation.set_pending_plan_approval(pending);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id: source_exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden: conversation.is_exchange_hidden(source_exchange_id),
+        });
+        Ok(())
+    }
+
+    pub fn clear_pending_plan_approval(
+        &mut self,
+        conversation_id: AIConversationId,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<PendingPlanApproval> {
+        let conversation = self.conversations_by_id.get_mut(&conversation_id)?;
+        let pending = conversation.clear_pending_plan_approval()?;
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+            exchange_id: pending.source_exchange_id,
+            terminal_view_id,
+            conversation_id,
+            is_hidden: conversation.is_exchange_hidden(pending.source_exchange_id),
+        });
+        Some(pending)
     }
 
     /// The active conversation is the one we're currently or have most recently streamed outputs for.

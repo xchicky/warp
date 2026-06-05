@@ -662,6 +662,13 @@ impl LocalToolRuntimeContext {
 
 const SSH_UNSUPPORTED_FS_TOOL_ERROR: &str =
     "tool not supported in SSH session, use run_shell_command to inspect remote files via cat/grep/ls";
+pub(crate) const PLAN_READY_DEBUG_OUTPUT_PREFIX: &str = "__warp_local_plan_ready__:";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LocalPlanReadyForApproval {
+    pub plan: String,
+    pub summary: Option<String>,
+}
 
 pub fn generate_openai_compatible_output(
     config: LocalDirectConfig,
@@ -963,6 +970,14 @@ pub fn generate_openai_compatible_output(
                 }
                 if result.exits_plan_mode {
                     yield_agent_output_content!(result.text.clone());
+                    if let Some(plan_ready) = &result.plan_ready_for_approval {
+                        yield Ok(plan_ready_for_approval_event(
+                            &task_id,
+                            &request_id,
+                            &message_id,
+                            plan_ready,
+                        ));
+                    }
                     messages.push(openai_tool_message(tool_call.id, result.text));
                     yield Ok(stream_finished_done(&config, &usage_telemetry));
                     return;
@@ -2285,6 +2300,7 @@ struct LocalToolExecutionResult {
     apply_file_diff_summary: Option<ApplyFileDiffSummary>,
     todo_operations: Vec<api::message::update_todos::Operation>,
     web_ui_status: Option<LocalWebUiStatus>,
+    plan_ready_for_approval: Option<LocalPlanReadyForApproval>,
     pending_tool_call: bool,
     exits_plan_mode: bool,
 }
@@ -2301,6 +2317,7 @@ impl LocalToolExecutionResult {
             apply_file_diff_summary: None,
             todo_operations: Vec::new(),
             web_ui_status: None,
+            plan_ready_for_approval: None,
             pending_tool_call: false,
             exits_plan_mode: false,
         }
@@ -2312,6 +2329,7 @@ impl LocalToolExecutionResult {
             apply_file_diff_summary: None,
             todo_operations: Vec::new(),
             web_ui_status: None,
+            plan_ready_for_approval: None,
             pending_tool_call: false,
             exits_plan_mode: false,
         }
@@ -2387,13 +2405,13 @@ fn execute_local_tool_with_policy_with_runtime(
 
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
         "grep" => execute_grep_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
         "glob" => execute_glob_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
         "list_directory" => execute_list_directory_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
         "web_search" => {
             execute_web_search_tool(&tool_call.function.arguments).map(local_web_output_tuple)
         }
@@ -2401,7 +2419,7 @@ fn execute_local_tool_with_policy_with_runtime(
             execute_web_fetch_tool(&tool_call.function.arguments).map(local_web_output_tuple)
         }
         "search_codebase" => execute_search_codebase_tool(&tool_call.function.arguments, cwd)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
         "apply_file_diff" => {
             execute_apply_file_diff_tool(&tool_call.function.arguments, cwd).map(|summary| {
                 (
@@ -2410,23 +2428,34 @@ fn execute_local_tool_with_policy_with_runtime(
                     Vec::new(),
                     None,
                     false,
+                    None,
                 )
             })
         }
         "write_file" => execute_write_file_tool(&tool_call.function.arguments, cwd)
-            .map(|result| (result.0, result.1, Vec::new(), None, false)),
+            .map(|result| (result.0, result.1, Vec::new(), None, false, None)),
         "edit_file" => execute_edit_file_tool(&tool_call.function.arguments, cwd)
-            .map(|result| (result.0, result.1, Vec::new(), None, false)),
+            .map(|result| (result.0, result.1, Vec::new(), None, false, None)),
         "run_shell_command" => execute_run_shell_command_tool_with_runtime(
             &tool_call.function.arguments,
             cwd,
             runtime_context,
         )
-        .map(|text| (text, None, Vec::new(), None, true)),
+        .map(|text| (text, None, Vec::new(), None, true, None)),
         "todo_write" => execute_todo_write_tool(&tool_call.function.arguments)
-            .map(|result| (result.text, None, result.operations, None, false)),
-        "exit_plan_mode" => execute_exit_plan_mode_tool(&tool_call.function.arguments)
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|result| (result.text, None, result.operations, None, false, None)),
+        "exit_plan_mode" => {
+            execute_exit_plan_mode_tool(&tool_call.function.arguments).map(|result| {
+                (
+                    result.text,
+                    None,
+                    Vec::new(),
+                    None,
+                    false,
+                    Some(result.plan_ready),
+                )
+            })
+        }
         "spawn_subagent" => Err(anyhow!(
             "spawn_subagent requires the sequential local subagent runtime"
         )),
@@ -2435,7 +2464,7 @@ fn execute_local_tool_with_policy_with_runtime(
                 &tool_call.function.arguments,
                 &mut suggested_shell_commands,
             )
-            .map(|text| (text, None, Vec::new(), None, false)),
+            .map(|text| (text, None, Vec::new(), None, false, None)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
         name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
@@ -2446,38 +2475,49 @@ fn execute_local_tool_with_policy_with_runtime(
                     Vec::new(),
                     None,
                     result.pending_tool_call,
+                    None,
                 )
             }),
     };
 
-    let (text, apply_file_diff_summary, todo_operations, web_ui_status, pending_tool_call) =
-        match result {
-            Ok((
-                text,
-                apply_file_diff_summary,
-                todo_operations,
-                web_ui_status,
-                pending_tool_call,
-            )) => (
-                text,
-                apply_file_diff_summary,
-                todo_operations,
-                web_ui_status,
-                pending_tool_call,
-            ),
-            Err(error) => (
-                format!("Tool error: {error}"),
-                None,
-                Vec::new(),
-                None,
-                false,
-            ),
-        };
+    let (
+        text,
+        apply_file_diff_summary,
+        todo_operations,
+        web_ui_status,
+        pending_tool_call,
+        plan_ready_for_approval,
+    ) = match result {
+        Ok((
+            text,
+            apply_file_diff_summary,
+            todo_operations,
+            web_ui_status,
+            pending_tool_call,
+            plan_ready_for_approval,
+        )) => (
+            text,
+            apply_file_diff_summary,
+            todo_operations,
+            web_ui_status,
+            pending_tool_call,
+            plan_ready_for_approval,
+        ),
+        Err(error) => (
+            format!("Tool error: {error}"),
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+        ),
+    };
     LocalToolExecutionResult {
         text: truncate_message_content(&text, MAX_LOCAL_DIRECT_TOOL_RESULT_CHARS),
         apply_file_diff_summary,
         todo_operations,
         web_ui_status,
+        plan_ready_for_approval,
         pending_tool_call: if tool_call.function.name == "run_shell_command" {
             !text.starts_with("Tool error:")
         } else {
@@ -2496,8 +2536,16 @@ fn local_web_output_tuple(
     Vec<api::message::update_todos::Operation>,
     Option<LocalWebUiStatus>,
     bool,
+    Option<LocalPlanReadyForApproval>,
 ) {
-    (output.text, None, Vec::new(), Some(output.ui_status), false)
+    (
+        output.text,
+        None,
+        Vec::new(),
+        Some(output.ui_status),
+        false,
+        None,
+    )
 }
 
 async fn execute_spawn_subagent_tool(
@@ -2599,6 +2647,7 @@ async fn execute_spawn_subagent_tool(
             apply_file_diff_summary: None,
             todo_operations: Vec::new(),
             web_ui_status: None,
+            plan_ready_for_approval: None,
             pending_tool_call: false,
             exits_plan_mode: false,
         },
@@ -2901,7 +2950,13 @@ struct ExitPlanModeArgs {
     summary: Option<String>,
 }
 
-fn execute_exit_plan_mode_tool(arguments: &str) -> anyhow::Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitPlanModeResult {
+    text: String,
+    plan_ready: LocalPlanReadyForApproval,
+}
+
+fn execute_exit_plan_mode_tool(arguments: &str) -> anyhow::Result<ExitPlanModeResult> {
     let args: ExitPlanModeArgs =
         serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid exit_plan_mode arguments"))?;
     let plan = args.plan.trim();
@@ -2926,18 +2981,22 @@ fn execute_exit_plan_mode_tool(arguments: &str) -> anyhow::Result<String> {
             "exit_plan_mode summary exceeds {MAX_LOCAL_DIRECT_PLAN_SUMMARY_CHARS} characters"
         ));
     }
+    let plan_ready = LocalPlanReadyForApproval {
+        plan: plan.to_string(),
+        summary: summary.map(str::to_string),
+    };
 
     let mut text = String::new();
-    if let Some(summary) = summary {
+    if let Some(summary) = plan_ready.summary.as_deref() {
         text.push_str(summary);
         text.push_str("\n\n");
     }
     text.push_str("Plan ready for review:\n\n");
-    text.push_str(plan);
+    text.push_str(&plan_ready.plan);
     text.push_str(
         "\n\nNo changes were executed. Review the plan and send a normal follow-up when ready to proceed.",
     );
-    Ok(text)
+    Ok(ExitPlanModeResult { text, plan_ready })
 }
 
 fn execute_todo_write_tool(arguments: &str) -> anyhow::Result<TodoWriteResult> {
@@ -5090,6 +5149,45 @@ fn append_agent_output_message_content(
     }
 }
 
+fn plan_ready_for_approval_event(
+    task_id: &str,
+    request_id: &str,
+    source_message_id: &str,
+    plan_ready: &LocalPlanReadyForApproval,
+) -> api::ResponseEvent {
+    let marker = json!({
+        "plan": plan_ready.plan,
+        "summary": plan_ready.summary,
+        "source_message_id": source_message_id,
+    });
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.to_string(),
+                            messages: vec![api::Message {
+                                id: Uuid::new_v4().to_string(),
+                                task_id: task_id.to_string(),
+                                request_id: request_id.to_string(),
+                                timestamp: None,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::DebugOutput(
+                                    api::message::DebugOutput {
+                                        text: format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{marker}"),
+                                    },
+                                )),
+                            }],
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
 fn agent_output_content_events(
     agent_output_message_started: &mut bool,
     task_id: &str,
@@ -7231,7 +7329,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_plan_mode_validates_and_returns_assistant_visible_plan() {
+    fn plan_mode_auto_implement_exit_plan_mode_returns_structured_plan_ready_payload() {
         let empty = execute_exit_plan_mode_tool(r#"{"plan":"  "}"#).unwrap_err();
         assert!(empty.to_string().contains("plan must not be empty"));
 
@@ -7248,10 +7346,15 @@ mod tests {
             r#"{"summary":"Implementation plan","plan":"1. Inspect\n2. Patch\n3. Test"}"#,
         )
         .unwrap();
-        assert!(output.contains("Implementation plan"));
-        assert!(output.contains("Plan ready for review"));
-        assert!(output.contains("1. Inspect"));
-        assert!(output.contains("No changes were executed"));
+        assert_eq!(
+            output.plan_ready.summary.as_deref(),
+            Some("Implementation plan")
+        );
+        assert_eq!(output.plan_ready.plan, "1. Inspect\n2. Patch\n3. Test");
+        assert!(output.text.contains("Implementation plan"));
+        assert!(output.text.contains("Plan ready for review"));
+        assert!(output.text.contains("1. Inspect"));
+        assert!(output.text.contains("No changes were executed"));
     }
 
     #[test]
@@ -8861,7 +8964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_local_tool_batch_stops_at_exit_plan_mode_before_later_mutations() {
+    async fn plan_mode_auto_implement_stops_at_exit_plan_mode_before_later_mutations() {
         let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
         let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
         let suggestions = Arc::new(Mutex::new(HashSet::new()));
@@ -8890,6 +8993,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.function.name, "exit_plan_mode");
         assert!(results[0].1.exits_plan_mode);
+        let plan_ready = results[0].1.plan_ready_for_approval.as_ref().unwrap();
+        assert_eq!(plan_ready.plan, "1. Make the change\n2. Test");
         assert!(!temp_dir.path().join("created.txt").exists());
     }
 

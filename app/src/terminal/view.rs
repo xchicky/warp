@@ -19406,6 +19406,16 @@ impl TerminalView {
             AIBlockEvent::ContinueConversation { conversation_id } => {
                 self.handle_continue_conversation(conversation_id, ctx);
             }
+            AIBlockEvent::ApprovePendingPlanAndContinue { conversation_id } => {
+                self.ai_controller.update(ctx, |controller, ctx| {
+                    controller.approve_pending_plan_and_continue(*conversation_id, ctx);
+                });
+            }
+            AIBlockEvent::RevisePendingPlan { conversation_id } => {
+                self.ai_controller.update(ctx, |controller, ctx| {
+                    controller.revise_pending_plan(*conversation_id, ctx);
+                });
+            }
             AIBlockEvent::ContinuePassiveCodeDiffWithAgent {
                 conversation_id,
                 trigger_block_id,
