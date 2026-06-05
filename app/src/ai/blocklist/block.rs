@@ -789,6 +789,12 @@ pub(crate) fn received_message_collapsible_id(message_id: &str) -> MessageId {
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyboardNavigableButtonsKind {
+    SuggestNewConversation,
+    PendingPlanApproval,
+}
+
 pub struct AIBlock {
     model: Rc<dyn AIBlockModel<View = AIBlock>>,
     terminal_model: Arc<FairMutex<TerminalModel>>,
@@ -902,8 +908,9 @@ pub struct AIBlock {
 
     /// A user menu presenting an accept and reject choice.
     ///
-    /// This UI is used for the new conversation suggestion multi-select.
+    /// This UI is used for small inline two-choice flows.
     keyboard_navigable_buttons: Option<ViewHandle<KeyboardNavigableButtons>>,
+    keyboard_navigable_buttons_kind: Option<KeyboardNavigableButtonsKind>,
 
     /// The thumbs up/down rating of the AI block response.
     response_rating: OnceCell<AIBlockResponseRating>,
@@ -1144,8 +1151,9 @@ impl AIBlock {
             }
         });
 
-        // Note: UpdatedStreamingExchange is handled by the dedicated on_updated_output()
-        // callback in model_impl.rs, so we don't need to respond to it here.
+        // Most UpdatedStreamingExchange output updates are handled by the dedicated
+        // on_updated_output() callback in model_impl.rs. Pending plan approval is
+        // conversation state outside the output payload, so notify here too.
         ctx.subscribe_to_model(
             &BlocklistAIHistoryModel::handle(ctx),
             |me, _, event, ctx| {
@@ -1159,6 +1167,10 @@ impl AIBlock {
                         | BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
                         | BlocklistAIHistoryEvent::StartedNewConversation { .. }
                         | BlocklistAIHistoryEvent::SetActiveConversation { .. } => {
+                            ctx.notify();
+                        }
+                        BlocklistAIHistoryEvent::UpdatedStreamingExchange { .. } => {
+                            me.maybe_set_pending_plan_approval_buttons(ctx);
                             ctx.notify();
                         }
                         _ => {}
@@ -1364,6 +1376,7 @@ impl AIBlock {
             suggested_agent_mode_workflow: Default::default(),
             manage_rules_button,
             keyboard_navigable_buttons: None,
+            keyboard_navigable_buttons_kind: None,
             response_rating: OnceCell::new(),
             terminal_view_id,
             request_refunded_count: None,
@@ -1409,7 +1422,9 @@ impl AIBlock {
 
         match me.model.status(ctx) {
             AIBlockOutputStatus::Complete { .. } => {
-                me.finish(FinishReason::Complete, ctx);
+                if me.keyboard_navigable_buttons.is_none() {
+                    me.finish(FinishReason::Complete, ctx);
+                }
             }
             AIBlockOutputStatus::Failed { error, .. } => {
                 me.maybe_create_aws_bedrock_credentials_error_view(&error, ctx);
@@ -1979,6 +1994,7 @@ impl AIBlock {
                         continue_current_conversation_button_text,
                         accept_action,
                         reject_action,
+                        KeyboardNavigableButtonsKind::SuggestNewConversation,
                         ctx,
                     );
                 }
@@ -2103,6 +2119,7 @@ impl AIBlock {
         reject_text: String,
         accept_action: AIBlockAction,
         reject_action: AIBlockAction,
+        kind: KeyboardNavigableButtonsKind,
         ctx: &mut ViewContext<Self>,
     ) {
         let accept_button_handle = self.state_handles.menu_accept_button_handle.clone();
@@ -2195,6 +2212,41 @@ impl AIBlock {
         ];
         let menu = ctx.add_typed_action_view(|_| KeyboardNavigableButtons::new(buttons));
         self.keyboard_navigable_buttons = Some(menu);
+        self.keyboard_navigable_buttons_kind = Some(kind);
+    }
+
+    fn maybe_set_pending_plan_approval_buttons(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(pending) = BlocklistAIHistoryModel::as_ref(ctx)
+            .pending_plan_approval(&self.client_ids.conversation_id)
+            .cloned()
+        else {
+            if self.keyboard_navigable_buttons_kind
+                == Some(KeyboardNavigableButtonsKind::PendingPlanApproval)
+            {
+                self.keyboard_navigable_buttons = None;
+                self.keyboard_navigable_buttons_kind = None;
+            }
+            return;
+        };
+
+        if self.model.exchange_id(ctx) != Some(pending.source_exchange_id) {
+            if self.keyboard_navigable_buttons_kind
+                == Some(KeyboardNavigableButtonsKind::PendingPlanApproval)
+            {
+                self.keyboard_navigable_buttons = None;
+                self.keyboard_navigable_buttons_kind = None;
+            }
+            return;
+        }
+
+        self.set_keyboard_navigable_buttons(
+            "Approve plan and continue".to_string(),
+            "Revise plan".to_string(),
+            AIBlockAction::ApprovePendingPlanAndContinue,
+            AIBlockAction::RevisePendingPlan,
+            KeyboardNavigableButtonsKind::PendingPlanApproval,
+            ctx,
+        );
     }
 
     fn handle_complete_output(&mut self, output: &AIAgentOutput, ctx: &mut ViewContext<Self>) {
@@ -2620,7 +2672,8 @@ impl AIBlock {
                 ctx.emit(AIBlockEvent::OpenThemeChooser);
             }
         }
-        if self.requested_action_ids.is_empty() {
+        self.maybe_set_pending_plan_approval_buttons(ctx);
+        if self.requested_action_ids.is_empty() && self.keyboard_navigable_buttons.is_none() {
             // There are no actions to be taken in this block, it is finished.
             self.finish(FinishReason::Complete, ctx);
         }
@@ -5595,6 +5648,12 @@ pub enum AIBlockEvent {
     ContinueConversation {
         conversation_id: AIConversationId,
     },
+    ApprovePendingPlanAndContinue {
+        conversation_id: AIConversationId,
+    },
+    RevisePendingPlan {
+        conversation_id: AIConversationId,
+    },
     /// Emitted when a passive code diff should be injected into an agent context.
     ContinuePassiveCodeDiffWithAgent {
         conversation_id: AIConversationId,
@@ -5689,6 +5748,9 @@ pub enum AIBlockAction {
 
     /// Fork the conversation
     ForkConversation,
+
+    ApprovePendingPlanAndContinue,
+    RevisePendingPlan,
 
     /// Manually cancel sending an AI request or streaming an AI response for a requested action.
     /// View-based inline actions (`RequestedCommandView`, etc.) should be handling AI block
@@ -5844,6 +5906,24 @@ impl TypedActionView for AIBlock {
 
                 // Also emit focus terminal event to ensure input is focused
                 ctx.emit(AIBlockEvent::FocusTerminal);
+                ctx.notify();
+            }
+            AIBlockAction::ApprovePendingPlanAndContinue => {
+                self.keyboard_navigable_buttons = None;
+                self.keyboard_navigable_buttons_kind = None;
+                self.finish(FinishReason::Complete, ctx);
+                ctx.emit(AIBlockEvent::ApprovePendingPlanAndContinue {
+                    conversation_id: self.client_ids.conversation_id,
+                });
+                ctx.notify();
+            }
+            AIBlockAction::RevisePendingPlan => {
+                self.keyboard_navigable_buttons = None;
+                self.keyboard_navigable_buttons_kind = None;
+                self.finish(FinishReason::Complete, ctx);
+                ctx.emit(AIBlockEvent::RevisePendingPlan {
+                    conversation_id: self.client_ids.conversation_id,
+                });
                 ctx.notify();
             }
             AIBlockAction::ResumeConversation => {

@@ -23,7 +23,8 @@ use super::{
     BlocklistAIInputModel, InputType,
 };
 use crate::ai::agent::api::{self, ServerConversationToken};
-use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+use crate::ai::agent::conversation::{AIConversation, ConversationStatus, PendingPlanApproval};
+use crate::ai::agent::local::PLAN_READY_DEBUG_OUTPUT_PREFIX;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentActionResult, CancellationReason, PassiveSuggestionResultType, PassiveSuggestionTrigger,
@@ -41,8 +42,8 @@ use crate::ai::{
     agent::{
         conversation::AIConversationId, extract_user_query_mode, AIAgentActionResultType,
         AIAgentAttachment, AIAgentContext, AIAgentExchangeId, AIAgentInput, AIAgentOutputStatus,
-        AIIdentifiers, EntrypointType, FinishedAIAgentOutput, RenderableAIError, RequestCost,
-        RequestMetadata, StaticQueryType, UserQueryMode,
+        AIIdentifiers, EntrypointType, FinishedAIAgentOutput, MessageId, RenderableAIError,
+        RequestCost, RequestMetadata, StaticQueryType, UserQueryMode,
     },
     llms::LLMPreferences,
     AIRequestUsageModel,
@@ -73,6 +74,7 @@ use chrono::{DateTime, Local};
 use itertools::Itertools;
 use parking_lot::FairMutex;
 use pending_response_streams::PendingResponseStreams;
+use serde::Deserialize;
 use session_sharing_protocol::common::ParticipantId;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_family = "wasm"))]
@@ -88,6 +90,143 @@ use super::orchestration_event_streamer::{
 };
 use super::orchestration_events::{OrchestrationEventService, OrchestrationEventServiceEvent};
 use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
+
+#[derive(Debug, Deserialize)]
+struct PlanReadyDebugOutputPayload {
+    plan: String,
+    summary: Option<String>,
+    source_message_id: String,
+}
+
+fn take_plan_ready_debug_outputs(
+    client_actions: Vec<warp_multi_agent_api::ClientAction>,
+) -> (
+    Vec<warp_multi_agent_api::ClientAction>,
+    Vec<PlanReadyDebugOutputPayload>,
+) {
+    let mut filtered_actions = Vec::with_capacity(client_actions.len());
+    let mut plan_ready_payloads = Vec::new();
+
+    for mut client_action in client_actions {
+        if let Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(add)) =
+            client_action.action.as_mut()
+        {
+            add.messages.retain(|message| {
+                let Some(message::Message::DebugOutput(debug_output)) = message.message.as_ref()
+                else {
+                    return true;
+                };
+                let Some(payload) = debug_output
+                    .text
+                    .strip_prefix(PLAN_READY_DEBUG_OUTPUT_PREFIX)
+                else {
+                    return true;
+                };
+                match serde_json::from_str::<PlanReadyDebugOutputPayload>(payload) {
+                    Ok(payload) => plan_ready_payloads.push(payload),
+                    Err(error) => log::warn!("Invalid plan-ready debug output payload: {error}"),
+                }
+                false
+            });
+            if add.messages.is_empty() {
+                continue;
+            }
+        }
+        filtered_actions.push(client_action);
+    }
+
+    (filtered_actions, plan_ready_payloads)
+}
+
+#[cfg(test)]
+mod plan_mode_auto_implement_tests {
+    use super::*;
+    use serde_json::json;
+    use warp_multi_agent_api as api;
+
+    fn add_messages_action(messages: Vec<api::Message>) -> api::ClientAction {
+        api::ClientAction {
+            action: Some(api::client_action::Action::AddMessagesToTask(
+                api::client_action::AddMessagesToTask {
+                    task_id: "task".to_string(),
+                    messages,
+                },
+            )),
+        }
+    }
+
+    fn debug_output_message(text: impl Into<String>) -> api::Message {
+        api::Message {
+            id: "message".to_string(),
+            task_id: "task".to_string(),
+            request_id: "request".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::DebugOutput(
+                api::message::DebugOutput { text: text.into() },
+            )),
+        }
+    }
+
+    fn agent_output_message(text: impl Into<String>) -> api::Message {
+        api::Message {
+            id: "agent".to_string(),
+            task_id: "task".to_string(),
+            request_id: "request".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput { text: text.into() },
+            )),
+        }
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_filters_structured_marker_without_rendering_it() {
+        let payload = json!({
+            "plan": "1. Inspect\n2. Patch",
+            "summary": "Implementation plan",
+            "source_message_id": "source-message",
+        });
+        let (actions, payloads) = take_plan_ready_debug_outputs(vec![add_messages_action(vec![
+            agent_output_message("visible plan"),
+            debug_output_message(format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{payload}")),
+        ])]);
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].plan, "1. Inspect\n2. Patch");
+        assert_eq!(payloads[0].summary.as_deref(), Some("Implementation plan"));
+        assert_eq!(payloads[0].source_message_id, "source-message");
+
+        let Some(api::client_action::Action::AddMessagesToTask(add)) = actions[0].action.as_ref()
+        else {
+            panic!("expected add messages action");
+        };
+        assert_eq!(add.messages.len(), 1);
+        assert!(matches!(
+            add.messages[0].message,
+            Some(api::message::Message::AgentOutput(_))
+        ));
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_drops_marker_only_actions() {
+        let payload = json!({
+            "plan": "1. Inspect",
+            "summary": null,
+            "source_message_id": "source-message",
+        });
+        let (actions, payloads) =
+            take_plan_ready_debug_outputs(vec![add_messages_action(vec![debug_output_message(
+                format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{payload}"),
+            )])]);
+
+        assert!(actions.is_empty());
+        assert_eq!(payloads.len(), 1);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionContext {
@@ -669,10 +808,23 @@ impl BlocklistAIController {
 
         let (query, user_query_mode) = extract_user_query_mode(query);
 
-        let should_prepend_finished_action_results = matches!(
+        let is_user_submitted_query = matches!(
             input_query.input_query,
             InputQueryType::UserSubmittedQueryFromInput { .. }
         );
+        let should_prepend_finished_action_results = is_user_submitted_query;
+        if is_user_submitted_query
+            && matches!(entrypoint_type, EntrypointType::UserInitiated)
+            && matches!(user_query_mode, UserQueryMode::Normal)
+        {
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                history_model.clear_pending_plan_approval(
+                    conversation_id,
+                    self.terminal_view_id,
+                    ctx,
+                );
+            });
+        }
 
         let completed_action_results = self.action_model.update(ctx, |action_model, ctx| {
             action_model.cancel_all_pending_actions(
@@ -1015,6 +1167,59 @@ impl BlocklistAIController {
             /*is_queued_prompt*/ false,
             ctx,
         );
+    }
+
+    pub fn approve_pending_plan_and_continue(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(pending) =
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                history_model.clear_pending_plan_approval(
+                    conversation_id,
+                    self.terminal_view_id,
+                    ctx,
+                )
+            })
+        else {
+            return;
+        };
+
+        let query = format!(
+            "Implement the approved plan below. Follow the plan unless new information makes a step unsafe or impossible; if that happens, stop and explain before making further changes.\nDo not call spawn_subagent or start a nested plan-mode flow for this implementation unless the user explicitly asks for that in a later message.\n\n{}",
+            pending.plan
+        );
+        self.send_user_query_in_conversation(query, conversation_id, None, ctx);
+    }
+
+    pub fn revise_pending_plan(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(_) = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+            history_model.clear_pending_plan_approval(conversation_id, self.terminal_view_id, ctx)
+        }) else {
+            return;
+        };
+
+        self.send_user_query_in_conversation(
+            "/plan Revise the previous plan. The user did not approve it. Address the user's latest concerns before proposing a new plan.".to_string(),
+            conversation_id,
+            None,
+            ctx,
+        );
+    }
+
+    pub fn cancel_pending_plan_approval(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+            history_model.clear_pending_plan_approval(conversation_id, self.terminal_view_id, ctx);
+        });
     }
 
     /// Sends the first submission of a previously queued user prompt into an existing conversation.
@@ -2556,9 +2761,14 @@ impl BlocklistAIController {
                                 );
                             }
                             warp_multi_agent_api::response_event::Type::ClientActions(actions) => {
-                                let client_actions = actions.actions;
                                 let allow_local_autoexecute_marker =
                                     response_stream.as_ref(ctx).is_local_direct_request();
+                                let (client_actions, plan_ready_payloads) =
+                                    if allow_local_autoexecute_marker {
+                                        take_plan_ready_debug_outputs(actions.actions)
+                                    } else {
+                                        (actions.actions, Vec::new())
+                                    };
                                 let apply_result =
                                     history_model.update(ctx, |history_model, ctx| {
                                         history_model.apply_client_actions(
@@ -2574,6 +2784,46 @@ impl BlocklistAIController {
                                     log::error!(
                                         "Failed to apply client actions to conversation: {e:?}"
                                     );
+                                }
+                                if !plan_ready_payloads.is_empty() {
+                                    history_model.update(ctx, |history_model, ctx| {
+                                        let Some(source_exchange_id) = history_model
+                                            .conversation(&conversation_id)
+                                            .and_then(|conversation| {
+                                                conversation.latest_exchange().map(|exchange| exchange.id)
+                                            })
+                                        else {
+                                            log::warn!(
+                                                "Received plan-ready payload for conversation without latest exchange"
+                                            );
+                                            return;
+                                        };
+                                        for payload in plan_ready_payloads {
+                                            if payload.plan.trim().is_empty() {
+                                                continue;
+                                            }
+                                            let pending = PendingPlanApproval {
+                                                plan: payload.plan,
+                                                summary: payload.summary,
+                                                source_exchange_id,
+                                                source_message_id: MessageId::new(
+                                                    payload.source_message_id,
+                                                ),
+                                            };
+                                            if let Err(error) =
+                                                history_model.set_pending_plan_approval(
+                                                    conversation_id,
+                                                    pending,
+                                                    self.terminal_view_id,
+                                                    ctx,
+                                                )
+                                            {
+                                                log::warn!(
+                                                    "Failed to set pending plan approval: {error:?}"
+                                                );
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         }

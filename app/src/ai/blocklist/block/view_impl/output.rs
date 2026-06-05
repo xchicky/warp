@@ -72,8 +72,8 @@ use crate::{
             block::{
                 model::{AIBlockModel, AIBlockModelHelper, AIBlockOutputStatus},
                 AIBlock, AIBlockAction, AIBlockStateHandles, ActionButtons,
-                AutonomySettingSpeedbump, EmbeddedCodeEditorView, RequestedEdit, TextLocation,
-                TodoListElementState,
+                AutonomySettingSpeedbump, EmbeddedCodeEditorView, KeyboardNavigableButtonsKind,
+                RequestedEdit, TextLocation, TodoListElementState,
             },
             history_model::BlocklistAIHistoryModel,
             inline_action::{
@@ -174,6 +174,7 @@ pub(crate) struct Props<'a> {
     pub(super) suggested_agent_mode_workflow: &'a Option<ViewHandle<SuggestionChipView>>,
     pub(super) manage_rules_button: &'a ViewHandle<ActionButton>,
     pub(super) keyboard_navigable_buttons: Option<&'a ViewHandle<KeyboardNavigableButtons>>,
+    pub(super) keyboard_navigable_buttons_kind: Option<KeyboardNavigableButtonsKind>,
     pub(super) response_rating: &'a OnceCell<AIBlockResponseRating>,
     pub(super) request_refunded_count: Option<i32>,
     pub(super) search_codebase_view: &'a HashMap<AIAgentActionId, ViewHandle<SearchCodebaseView>>,
@@ -2291,13 +2292,19 @@ fn render_suggest_new_conversation(
 
     let mut content = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-    let new_conversation_header_text =
-        "It seems like the topic changed. Would you like to make a new conversation?";
-    let new_conversation_header_element = HeaderConfig::new(new_conversation_header_text, app)
+    let header_text = match props.keyboard_navigable_buttons_kind {
+        Some(KeyboardNavigableButtonsKind::PendingPlanApproval) => {
+            "Review the plan before implementation."
+        }
+        Some(KeyboardNavigableButtonsKind::SuggestNewConversation) | None => {
+            "It seems like the topic changed. Would you like to make a new conversation?"
+        }
+    };
+    let header_element = HeaderConfig::new(header_text, app)
         .with_icon(yellow_stop_icon(appearance))
         .with_corner_radius_override(CornerRadius::with_top(Radius::Pixels(8.)))
         .render(app);
-    content.add_child(new_conversation_header_element);
+    content.add_child(header_element);
 
     if let Some(menu) = props.keyboard_navigable_buttons {
         let keyboard_navigable_buttons_container = Container::new(ChildView::new(menu).finish())

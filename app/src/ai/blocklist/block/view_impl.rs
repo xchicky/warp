@@ -1033,6 +1033,7 @@ impl View for AIBlock {
                 suggested_agent_mode_workflow: &self.suggested_agent_mode_workflow,
                 manage_rules_button: &self.manage_rules_button,
                 keyboard_navigable_buttons: self.keyboard_navigable_buttons.as_ref(),
+                keyboard_navigable_buttons_kind: self.keyboard_navigable_buttons_kind,
                 response_rating: &self.response_rating,
                 request_refunded_count: self.request_refunded_count,
                 search_codebase_view: &self.search_codebase_view,
