@@ -662,7 +662,8 @@ impl LocalToolRuntimeContext {
 
 const SSH_UNSUPPORTED_FS_TOOL_ERROR: &str =
     "tool not supported in SSH session, use run_shell_command to inspect remote files via cat/grep/ls";
-pub(crate) const PLAN_READY_DEBUG_OUTPUT_PREFIX: &str = "__warp_local_plan_ready__:";
+pub(crate) const PLAN_READY_SERVER_MESSAGE_DATA_KIND: &str =
+    "warp.local_agent.plan_ready_for_approval";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LocalPlanReadyForApproval {
@@ -728,6 +729,20 @@ pub fn generate_openai_compatible_output(
                     &request_id,
                     &message_id,
                     $text,
+                ) {
+                    yield Ok(event);
+                }
+            };
+        }
+        macro_rules! yield_agent_output_content_with_server_message_data {
+            ($text:expr, $server_message_data:expr) => {
+                for event in agent_output_content_events_with_server_message_data(
+                    &mut agent_output_message_started,
+                    &task_id,
+                    &request_id,
+                    &message_id,
+                    $text,
+                    $server_message_data,
                 ) {
                     yield Ok(event);
                 }
@@ -969,15 +984,15 @@ pub fn generate_openai_compatible_output(
                     continue;
                 }
                 if result.exits_plan_mode {
-                    yield_agent_output_content!(result.text.clone());
-                    if let Some(plan_ready) = &result.plan_ready_for_approval {
-                        yield Ok(plan_ready_for_approval_event(
-                            &task_id,
-                            &request_id,
-                            &message_id,
-                            plan_ready,
-                        ));
-                    }
+                    let server_message_data = result
+                        .plan_ready_for_approval
+                        .as_ref()
+                        .map(plan_ready_server_message_data)
+                        .unwrap_or_default();
+                    yield_agent_output_content_with_server_message_data!(
+                        result.text.clone(),
+                        server_message_data
+                    );
                     messages.push(openai_tool_message(tool_call.id, result.text));
                     yield Ok(stream_finished_done(&config, &usage_telemetry));
                     return;
@@ -5078,11 +5093,12 @@ fn create_task(task_id: &str) -> api::ResponseEvent {
     }
 }
 
-fn add_agent_output_message(
+fn add_agent_output_message_with_server_message_data(
     task_id: &str,
     request_id: &str,
     message_id: &str,
     text: String,
+    server_message_data: String,
 ) -> api::ResponseEvent {
     let now = Local::now();
     api::ResponseEvent {
@@ -5100,7 +5116,7 @@ fn add_agent_output_message(
                                     seconds: now.timestamp(),
                                     nanos: now.timestamp_subsec_nanos() as i32,
                                 }),
-                                server_message_data: String::new(),
+                                server_message_data,
                                 citations: vec![],
                                 message: Some(api::message::Message::AgentOutput(
                                     api::message::AgentOutput { text },
@@ -5114,11 +5130,12 @@ fn add_agent_output_message(
     }
 }
 
-fn append_agent_output_message_content(
+fn append_agent_output_message_content_with_server_message_data(
     task_id: &str,
     request_id: &str,
     message_id: &str,
     text: String,
+    server_message_data: String,
 ) -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::ClientActions(
@@ -5132,7 +5149,7 @@ fn append_agent_output_message_content(
                                 task_id: task_id.to_string(),
                                 request_id: request_id.to_string(),
                                 timestamp: None,
-                                server_message_data: String::new(),
+                                server_message_data,
                                 citations: vec![],
                                 message: Some(api::message::Message::AgentOutput(
                                     api::message::AgentOutput { text },
@@ -5149,43 +5166,20 @@ fn append_agent_output_message_content(
     }
 }
 
-fn plan_ready_for_approval_event(
-    task_id: &str,
-    request_id: &str,
-    source_message_id: &str,
-    plan_ready: &LocalPlanReadyForApproval,
-) -> api::ResponseEvent {
-    let marker = json!({
-        "plan": plan_ready.plan,
-        "summary": plan_ready.summary,
-        "source_message_id": source_message_id,
-    });
-    api::ResponseEvent {
-        r#type: Some(api::response_event::Type::ClientActions(
-            api::response_event::ClientActions {
-                actions: vec![api::ClientAction {
-                    action: Some(api::client_action::Action::AddMessagesToTask(
-                        api::client_action::AddMessagesToTask {
-                            task_id: task_id.to_string(),
-                            messages: vec![api::Message {
-                                id: Uuid::new_v4().to_string(),
-                                task_id: task_id.to_string(),
-                                request_id: request_id.to_string(),
-                                timestamp: None,
-                                server_message_data: String::new(),
-                                citations: vec![],
-                                message: Some(api::message::Message::DebugOutput(
-                                    api::message::DebugOutput {
-                                        text: format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{marker}"),
-                                    },
-                                )),
-                            }],
-                        },
-                    )),
-                }],
-            },
-        )),
-    }
+#[derive(Debug, Deserialize, Serialize)]
+struct PlanReadyServerMessageData {
+    kind: &'static str,
+    plan: String,
+    summary: Option<String>,
+}
+
+fn plan_ready_server_message_data(plan_ready: &LocalPlanReadyForApproval) -> String {
+    serde_json::to_string(&PlanReadyServerMessageData {
+        kind: PLAN_READY_SERVER_MESSAGE_DATA_KIND,
+        plan: plan_ready.plan.clone(),
+        summary: plan_ready.summary.clone(),
+    })
+    .unwrap_or_default()
 }
 
 fn agent_output_content_events(
@@ -5195,19 +5189,49 @@ fn agent_output_content_events(
     message_id: &str,
     text: String,
 ) -> Vec<api::ResponseEvent> {
+    agent_output_content_events_with_server_message_data(
+        agent_output_message_started,
+        task_id,
+        request_id,
+        message_id,
+        text,
+        String::new(),
+    )
+}
+
+fn agent_output_content_events_with_server_message_data(
+    agent_output_message_started: &mut bool,
+    task_id: &str,
+    request_id: &str,
+    message_id: &str,
+    text: String,
+    server_message_data: String,
+) -> Vec<api::ResponseEvent> {
     let mut events = Vec::new();
+    let was_agent_output_message_started = *agent_output_message_started;
     if !*agent_output_message_started {
-        events.push(add_agent_output_message(
+        events.push(add_agent_output_message_with_server_message_data(
             task_id,
             request_id,
             message_id,
             String::new(),
+            server_message_data.clone(),
         ));
         *agent_output_message_started = true;
     }
-    events.push(append_agent_output_message_content(
-        task_id, request_id, message_id, text,
-    ));
+    events.push(
+        append_agent_output_message_content_with_server_message_data(
+            task_id,
+            request_id,
+            message_id,
+            text,
+            if was_agent_output_message_started {
+                server_message_data
+            } else {
+                String::new()
+            },
+        ),
+    );
     events
 }
 
@@ -5526,40 +5550,41 @@ fn stream_finished_done(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_output_content_events, build_local_subagent_invocation, chat_completions_url,
-        child_allowed_subagent_tools, drain_sse_events, empty_local_provider_response_resolution,
-        execute_apply_file_diff_tool, execute_edit_file_tool, execute_exit_plan_mode_tool,
-        execute_glob_tool, execute_grep_tool, execute_list_directory_tool, execute_local_tool,
-        execute_local_tool_batch, execute_local_tool_batch_with_policy,
-        execute_local_tool_with_policy, execute_local_tool_with_policy_with_runtime,
-        execute_read_file_tool, execute_run_shell_command_tool,
-        execute_run_shell_command_tool_with_runtime, execute_suggest_shell_command_tool,
-        execute_todo_write_tool, execute_write_file_tool, fallback_tool_results_message,
-        generate_openai_compatible_output, is_mutating_local_tool, is_sequential_local_tool,
-        local_mcp_tool_catalog, local_read_only_tools, local_shell_action_result,
-        local_subagent_messages, local_subagent_result_text, local_tool_result_summary,
-        local_tools, local_tools_for_context, local_tools_for_context_with_policy,
-        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
-        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
-        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
+        agent_output_content_events, agent_output_content_events_with_server_message_data,
+        build_local_subagent_invocation, chat_completions_url, child_allowed_subagent_tools,
+        drain_sse_events, empty_local_provider_response_resolution, execute_apply_file_diff_tool,
+        execute_edit_file_tool, execute_exit_plan_mode_tool, execute_glob_tool, execute_grep_tool,
+        execute_list_directory_tool, execute_local_tool, execute_local_tool_batch,
+        execute_local_tool_batch_with_policy, execute_local_tool_with_policy,
+        execute_local_tool_with_policy_with_runtime, execute_read_file_tool,
+        execute_run_shell_command_tool, execute_run_shell_command_tool_with_runtime,
+        execute_suggest_shell_command_tool, execute_todo_write_tool, execute_write_file_tool,
+        fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
+        is_sequential_local_tool, local_mcp_tool_catalog, local_read_only_tools,
+        local_shell_action_result, local_subagent_messages, local_subagent_result_text,
+        local_tool_result_summary, local_tools, local_tools_for_context,
+        local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
+        mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
+        openai_message, openai_messages_from_inputs_and_tasks,
+        openai_messages_from_inputs_and_tasks_with_policy, plan_ready_server_message_data,
         root_task_id, shell_command_result_for_provider, stream_finished_done,
         structured_mcp_tool_call_event, structured_tool_call_event,
         take_local_autoexecute_safe_tool_call, todo_update_events,
         truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, web_status_event,
         EmptyLocalProviderResponseResolution, LocalDirectConfig, LocalMcpContext,
-        LocalSubagentInvocation, LocalToolPolicy, LocalToolRuntimeContext, LocalUsageTelemetry,
-        LocalWebUiStatus, OpenAIChatContent, OpenAIChatMessage, OpenAIChatRequest,
-        OpenAIChatToolCall, OpenAIChatToolCallFunction, OpenAIStreamEvent, OpenAIStreamUsage,
-        OpenAIToolCallAccumulator, OpenAIUsageTokenDetails, RequestMode,
-        LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
+        LocalPlanReadyForApproval, LocalSubagentInvocation, LocalToolPolicy,
+        LocalToolRuntimeContext, LocalUsageTelemetry, LocalWebUiStatus, OpenAIChatContent,
+        OpenAIChatMessage, OpenAIChatRequest, OpenAIChatToolCall, OpenAIChatToolCallFunction,
+        OpenAIStreamEvent, OpenAIStreamUsage, OpenAIToolCallAccumulator, OpenAIUsageTokenDetails,
+        RequestMode, LOCAL_DIRECT_SYSTEM_PROMPT, LOCAL_DIRECT_TODO_WRITE_PROMPT,
         MAX_LOCAL_DIRECT_FALLBACK_TOOL_RESULT_CHARS, MAX_LOCAL_DIRECT_FALLBACK_TOTAL_CHARS,
         MAX_LOCAL_DIRECT_HISTORY_MESSAGES, MAX_LOCAL_DIRECT_MCP_RESULT_BYTES,
         MAX_LOCAL_DIRECT_MESSAGE_CHARS, MAX_LOCAL_DIRECT_PLAN_CHARS,
         MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_SUBAGENT_DEPTH,
         MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
         MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
-        SSH_UNSUPPORTED_FS_TOOL_ERROR,
+        PLAN_READY_SERVER_MESSAGE_DATA_KIND, SSH_UNSUPPORTED_FS_TOOL_ERROR,
     };
     use crate::ai::agent::{
         api::{
@@ -6108,6 +6133,69 @@ mod tests {
             second.iter().map(message_kind).collect::<Vec<_>>(),
             vec!["other"]
         );
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_agent_output_carries_plan_metadata_without_debug_output() {
+        let plan_ready = LocalPlanReadyForApproval {
+            plan: "1. Inspect\n2. Patch".to_string(),
+            summary: Some("Ready to implement".to_string()),
+        };
+        let server_message_data = plan_ready_server_message_data(&plan_ready);
+        let mut agent_output_started = false;
+
+        let events = agent_output_content_events_with_server_message_data(
+            &mut agent_output_started,
+            "task",
+            "request",
+            "message",
+            "visible plan".to_string(),
+            server_message_data,
+        );
+
+        let add_event = events
+            .iter()
+            .find_map(|event| {
+                let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+                    return None;
+                };
+                let Some(api::client_action::Action::AddMessagesToTask(add)) = actions
+                    .actions
+                    .first()
+                    .and_then(|action| action.action.as_ref())
+                else {
+                    return None;
+                };
+                Some(add)
+            })
+            .expect("expected add message event");
+        assert_eq!(add_event.messages.len(), 1);
+        let message = &add_event.messages[0];
+        assert!(matches!(
+            message.message,
+            Some(api::message::Message::AgentOutput(_))
+        ));
+        assert!(!message.server_message_data.is_empty());
+        let metadata: serde_json::Value =
+            serde_json::from_str(&message.server_message_data).unwrap();
+        assert_eq!(metadata["kind"], PLAN_READY_SERVER_MESSAGE_DATA_KIND);
+        assert_eq!(metadata["plan"], "1. Inspect\n2. Patch");
+        assert_eq!(metadata["summary"], "Ready to implement");
+        assert!(!events.iter().any(|event| {
+            let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+                return false;
+            };
+            actions.actions.iter().any(|action| {
+                let Some(api::client_action::Action::AddMessagesToTask(add)) =
+                    action.action.as_ref()
+                else {
+                    return false;
+                };
+                add.messages.iter().any(|message| {
+                    matches!(message.message, Some(api::message::Message::DebugOutput(_)))
+                })
+            })
+        }));
     }
 
     #[test]
@@ -8996,6 +9084,176 @@ mod tests {
         let plan_ready = results[0].1.plan_ready_for_approval.as_ref().unwrap();
         assert_eq!(plan_ready.plan, "1. Make the change\n2. Test");
         assert!(!temp_dir.path().join("created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn plan_mode_auto_implement_exit_plan_mode_stream_emits_metadata_not_debug_output() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_exit_plan\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"exit_plan_mode\",\"arguments\":\"",
+            "{\\\"summary\\\":\\\"Ready to implement\\\",\\\"plan\\\":\\\"1. Inspect\\\\n2. Patch\\\"}",
+            "\"}}]}}]}\n",
+            "data: [DONE]\n"
+        );
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let mut config = local_direct_config();
+        config.base_url = format!("{}/v1", server.url());
+        let task = api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages: vec![],
+            summary: String::new(),
+            server_data: String::new(),
+        };
+
+        let mut stream = generate_openai_compatible_output(
+            config,
+            vec![crate::ai::agent::AIAgentInput::UserQuery {
+                query: "make a plan".to_string(),
+                context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+                static_query_type: None,
+                referenced_attachments: Default::default(),
+                user_query_mode: crate::ai::agent::UserQueryMode::Plan,
+                running_command: None,
+                intended_agent: None,
+            }],
+            vec![task],
+            Some(ServerConversationToken::new("conversation".to_string())),
+            None,
+            LocalToolRuntimeContext::default(),
+        );
+
+        let mut plan_agent_output_metadata = None;
+        let mut saw_debug_output = false;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let Some(api::response_event::Type::ClientActions(actions)) = event.r#type else {
+                continue;
+            };
+            for action in actions.actions {
+                let Some(api::client_action::Action::AddMessagesToTask(add)) = action.action else {
+                    continue;
+                };
+                for message in add.messages {
+                    match message.message {
+                        Some(api::message::Message::AgentOutput(_))
+                            if !message.server_message_data.is_empty() =>
+                        {
+                            plan_agent_output_metadata = Some(message.server_message_data);
+                        }
+                        Some(api::message::Message::DebugOutput(_)) => {
+                            saw_debug_output = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(!saw_debug_output);
+        let metadata = plan_agent_output_metadata.expect("expected plan metadata");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["kind"], PLAN_READY_SERVER_MESSAGE_DATA_KIND);
+        assert_eq!(metadata["plan"], "1. Inspect\n2. Patch");
+        assert_eq!(metadata["summary"], "Ready to implement");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_auto_implement_exit_plan_mode_metadata_survives_prior_delta() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Draft plan incoming...\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_exit_plan\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"exit_plan_mode\",\"arguments\":\"",
+            "{\\\"summary\\\":\\\"Ready to implement\\\",\\\"plan\\\":\\\"1. Inspect\\\\n2. Patch\\\"}",
+            "\"}}]}}]}\n",
+            "data: [DONE]\n"
+        );
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let mut config = local_direct_config();
+        config.base_url = format!("{}/v1", server.url());
+        let task = api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages: vec![],
+            summary: String::new(),
+            server_data: String::new(),
+        };
+
+        let mut stream = generate_openai_compatible_output(
+            config,
+            vec![crate::ai::agent::AIAgentInput::UserQuery {
+                query: "make a plan".to_string(),
+                context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+                static_query_type: None,
+                referenced_attachments: Default::default(),
+                user_query_mode: crate::ai::agent::UserQueryMode::Plan,
+                running_command: None,
+                intended_agent: None,
+            }],
+            vec![task],
+            Some(ServerConversationToken::new("conversation".to_string())),
+            None,
+            LocalToolRuntimeContext::default(),
+        );
+
+        let mut first_output_started_without_metadata = false;
+        let mut append_metadata = None;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let Some(api::response_event::Type::ClientActions(actions)) = event.r#type else {
+                continue;
+            };
+            for action in actions.actions {
+                match action.action {
+                    Some(api::client_action::Action::AddMessagesToTask(add)) => {
+                        for message in add.messages {
+                            if matches!(
+                                message.message,
+                                Some(api::message::Message::AgentOutput(_))
+                            ) && message.server_message_data.is_empty()
+                            {
+                                first_output_started_without_metadata = true;
+                            }
+                        }
+                    }
+                    Some(api::client_action::Action::AppendToMessageContent(append)) => {
+                        if let Some(message) = append.message {
+                            if !message.server_message_data.is_empty() {
+                                append_metadata = Some(message.server_message_data);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(first_output_started_without_metadata);
+        let metadata = append_metadata.expect("expected plan metadata on append");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["kind"], PLAN_READY_SERVER_MESSAGE_DATA_KIND);
+        assert_eq!(metadata["plan"], "1. Inspect\n2. Patch");
+        assert_eq!(metadata["summary"], "Ready to implement");
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::{
 };
 use crate::ai::agent::api::{self, ServerConversationToken};
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus, PendingPlanApproval};
-use crate::ai::agent::local::PLAN_READY_DEBUG_OUTPUT_PREFIX;
+use crate::ai::agent::local::PLAN_READY_SERVER_MESSAGE_DATA_KIND;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentActionResult, CancellationReason, PassiveSuggestionResultType, PassiveSuggestionTrigger,
@@ -92,50 +92,115 @@ use super::orchestration_events::{OrchestrationEventService, OrchestrationEventS
 use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 #[derive(Debug, Deserialize)]
-struct PlanReadyDebugOutputPayload {
+struct PlanReadyServerMessageData {
+    kind: String,
+    plan: String,
+    summary: Option<String>,
+}
+
+#[derive(Debug)]
+struct PlanReadyMessageMetadata {
     plan: String,
     summary: Option<String>,
     source_message_id: String,
 }
 
-fn take_plan_ready_debug_outputs(
+fn take_plan_ready_metadata_from_message(
+    message: &mut warp_multi_agent_api::Message,
+) -> Option<PlanReadyMessageMetadata> {
+    if message.server_message_data.is_empty() {
+        return None;
+    }
+
+    match serde_json::from_str::<PlanReadyServerMessageData>(&message.server_message_data) {
+        Ok(metadata) if metadata.kind == PLAN_READY_SERVER_MESSAGE_DATA_KIND => {
+            message.server_message_data.clear();
+            Some(PlanReadyMessageMetadata {
+                plan: metadata.plan,
+                summary: metadata.summary,
+                source_message_id: message.id.clone(),
+            })
+        }
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!("Invalid plan-ready server message data: {error}");
+            None
+        }
+    }
+}
+
+fn take_plan_ready_message_metadata(
     client_actions: Vec<warp_multi_agent_api::ClientAction>,
 ) -> (
     Vec<warp_multi_agent_api::ClientAction>,
-    Vec<PlanReadyDebugOutputPayload>,
+    Vec<PlanReadyMessageMetadata>,
 ) {
     let mut filtered_actions = Vec::with_capacity(client_actions.len());
-    let mut plan_ready_payloads = Vec::new();
+    let mut plan_ready_metadata = Vec::new();
 
     for mut client_action in client_actions {
         if let Some(warp_multi_agent_api::client_action::Action::AddMessagesToTask(add)) =
             client_action.action.as_mut()
         {
             add.messages.retain(|message| {
-                let Some(message::Message::DebugOutput(debug_output)) = message.message.as_ref()
-                else {
-                    return true;
-                };
-                let Some(payload) = debug_output
-                    .text
-                    .strip_prefix(PLAN_READY_DEBUG_OUTPUT_PREFIX)
-                else {
-                    return true;
-                };
-                match serde_json::from_str::<PlanReadyDebugOutputPayload>(payload) {
-                    Ok(payload) => plan_ready_payloads.push(payload),
-                    Err(error) => log::warn!("Invalid plan-ready debug output payload: {error}"),
-                }
-                false
+                !matches!(
+                    message.message.as_ref(),
+                    Some(message::Message::DebugOutput(debug_output))
+                        if debug_output.text.starts_with("__warp_local_plan_ready__:")
+                )
             });
-            if add.messages.is_empty() {
-                continue;
+            for message in &mut add.messages {
+                plan_ready_metadata.extend(take_plan_ready_metadata_from_message(message));
+            }
+        } else if let Some(warp_multi_agent_api::client_action::Action::AppendToMessageContent(
+            append,
+        )) = client_action.action.as_mut()
+        {
+            if let Some(message) = append.message.as_mut() {
+                plan_ready_metadata.extend(take_plan_ready_metadata_from_message(message));
             }
         }
         filtered_actions.push(client_action);
     }
 
-    (filtered_actions, plan_ready_payloads)
+    (filtered_actions, plan_ready_metadata)
+}
+
+fn apply_plan_ready_message_metadata(
+    history_model: &mut BlocklistAIHistoryModel,
+    conversation_id: AIConversationId,
+    terminal_view_id: EntityId,
+    plan_ready_metadata: Vec<PlanReadyMessageMetadata>,
+    ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+) {
+    if plan_ready_metadata.is_empty() {
+        return;
+    }
+
+    let Some(source_exchange_id) = history_model
+        .conversation(&conversation_id)
+        .and_then(|conversation| conversation.latest_exchange().map(|exchange| exchange.id))
+    else {
+        log::warn!("Received plan-ready payload for conversation without latest exchange");
+        return;
+    };
+
+    for metadata in plan_ready_metadata {
+        if metadata.plan.trim().is_empty() {
+            continue;
+        }
+        let pending = PendingPlanApproval {
+            plan: metadata.plan,
+            summary: metadata.summary,
+            source_exchange_id,
+            source_message_id: MessageId::new(metadata.source_message_id),
+        };
+        if let Err(error) =
+            history_model.set_pending_plan_approval(conversation_id, pending, terminal_view_id, ctx)
+        {
+            log::warn!("Failed to set pending plan approval: {error:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,13 +208,55 @@ mod plan_mode_auto_implement_tests {
     use super::*;
     use serde_json::json;
     use warp_multi_agent_api as api;
+    use warpui::App;
 
     fn add_messages_action(messages: Vec<api::Message>) -> api::ClientAction {
+        add_messages_action_for_task("task", messages)
+    }
+
+    fn add_messages_action_for_task(
+        task_id: impl Into<String>,
+        messages: Vec<api::Message>,
+    ) -> api::ClientAction {
         api::ClientAction {
             action: Some(api::client_action::Action::AddMessagesToTask(
                 api::client_action::AddMessagesToTask {
-                    task_id: "task".to_string(),
+                    task_id: task_id.into(),
                     messages,
+                },
+            )),
+        }
+    }
+
+    fn create_task_action(task_id: impl Into<String>) -> api::ClientAction {
+        api::ClientAction {
+            action: Some(api::client_action::Action::CreateTask(
+                api::client_action::CreateTask {
+                    task: Some(api::Task {
+                        id: task_id.into(),
+                        description: "Local direct response".to_string(),
+                        dependencies: None,
+                        messages: vec![],
+                        summary: String::new(),
+                        server_data: String::new(),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn append_agent_output_action_for_task(
+        task_id: impl Into<String>,
+        message: api::Message,
+    ) -> api::ClientAction {
+        api::ClientAction {
+            action: Some(api::client_action::Action::AppendToMessageContent(
+                api::client_action::AppendToMessageContent {
+                    task_id: task_id.into(),
+                    message: Some(message),
+                    mask: Some(prost_types::FieldMask {
+                        paths: vec!["agent_output.text".to_string()],
+                    }),
                 },
             )),
         }
@@ -169,13 +276,17 @@ mod plan_mode_auto_implement_tests {
         }
     }
 
-    fn agent_output_message(text: impl Into<String>) -> api::Message {
+    fn agent_output_message(
+        id: impl Into<String>,
+        text: impl Into<String>,
+        server_message_data: impl Into<String>,
+    ) -> api::Message {
         api::Message {
-            id: "agent".to_string(),
+            id: id.into(),
             task_id: "task".to_string(),
             request_id: "request".to_string(),
             timestamp: None,
-            server_message_data: String::new(),
+            server_message_data: server_message_data.into(),
             citations: vec![],
             message: Some(api::message::Message::AgentOutput(
                 api::message::AgentOutput { text: text.into() },
@@ -183,28 +294,66 @@ mod plan_mode_auto_implement_tests {
         }
     }
 
+    fn request_input_for_conversation(
+        history_model: &BlocklistAIHistoryModel,
+        conversation_id: AIConversationId,
+    ) -> RequestInput {
+        let task_id = history_model
+            .conversation(&conversation_id)
+            .expect("conversation should exist")
+            .get_root_task_id()
+            .clone();
+        RequestInput {
+            conversation_id,
+            input_messages: HashMap::from([(
+                task_id,
+                vec![AIAgentInput::UserQuery {
+                    query: "make a plan".to_string(),
+                    context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+                    static_query_type: None,
+                    referenced_attachments: Default::default(),
+                    user_query_mode: UserQueryMode::Plan,
+                    running_command: None,
+                    intended_agent: None,
+                }],
+            )]),
+            working_directory: None,
+            model_id: LLMId::from("test-model"),
+            coding_model_id: LLMId::from("test-coding-model"),
+            cli_agent_model_id: LLMId::from("test-cli-agent-model"),
+            computer_use_model_id: LLMId::from("test-computer-use-model"),
+            shared_session_response_initiator: None,
+            request_start_ts: Local::now(),
+            supported_tools_override: None,
+        }
+    }
+
     #[test]
-    fn plan_mode_auto_implement_filters_structured_marker_without_rendering_it() {
-        let payload = json!({
+    fn plan_mode_auto_implement_extracts_metadata_without_rendering_it() {
+        let metadata = json!({
+            "kind": PLAN_READY_SERVER_MESSAGE_DATA_KIND,
             "plan": "1. Inspect\n2. Patch",
             "summary": "Implementation plan",
-            "source_message_id": "source-message",
         });
-        let (actions, payloads) = take_plan_ready_debug_outputs(vec![add_messages_action(vec![
-            agent_output_message("visible plan"),
-            debug_output_message(format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{payload}")),
-        ])]);
+        let (actions, metadata_items) =
+            take_plan_ready_message_metadata(vec![add_messages_action(vec![
+                agent_output_message("source-message", "visible plan", metadata.to_string()),
+            ])]);
 
-        assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0].plan, "1. Inspect\n2. Patch");
-        assert_eq!(payloads[0].summary.as_deref(), Some("Implementation plan"));
-        assert_eq!(payloads[0].source_message_id, "source-message");
+        assert_eq!(metadata_items.len(), 1);
+        assert_eq!(metadata_items[0].plan, "1. Inspect\n2. Patch");
+        assert_eq!(
+            metadata_items[0].summary.as_deref(),
+            Some("Implementation plan")
+        );
+        assert_eq!(metadata_items[0].source_message_id, "source-message");
 
         let Some(api::client_action::Action::AddMessagesToTask(add)) = actions[0].action.as_ref()
         else {
             panic!("expected add messages action");
         };
         assert_eq!(add.messages.len(), 1);
+        assert!(add.messages[0].server_message_data.is_empty());
         assert!(matches!(
             add.messages[0].message,
             Some(api::message::Message::AgentOutput(_))
@@ -212,19 +361,184 @@ mod plan_mode_auto_implement_tests {
     }
 
     #[test]
-    fn plan_mode_auto_implement_drops_marker_only_actions() {
-        let payload = json!({
+    fn plan_mode_auto_implement_strips_legacy_debug_output_markers() {
+        let legacy_marker_payload = json!({
             "plan": "1. Inspect",
             "summary": null,
             "source_message_id": "source-message",
         });
-        let (actions, payloads) =
-            take_plan_ready_debug_outputs(vec![add_messages_action(vec![debug_output_message(
-                format!("{PLAN_READY_DEBUG_OUTPUT_PREFIX}{payload}"),
-            )])]);
+        let legacy_marker = format!("__warp_local_plan_ready__:{legacy_marker_payload}");
+        let (actions, metadata_items) =
+            take_plan_ready_message_metadata(vec![add_messages_action(vec![
+                agent_output_message("agent", "visible plan", ""),
+                debug_output_message(legacy_marker.clone()),
+            ])]);
 
-        assert!(actions.is_empty());
-        assert_eq!(payloads.len(), 1);
+        assert!(metadata_items.is_empty());
+
+        let Some(api::client_action::Action::AddMessagesToTask(add)) = actions[0].action.as_ref()
+        else {
+            panic!("expected add messages action");
+        };
+        assert_eq!(add.messages.len(), 1);
+        assert!(matches!(
+            &add.messages[0].message,
+            Some(api::message::Message::AgentOutput(_))
+        ));
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_keeps_metadata_messages_visible() {
+        let metadata = json!({
+            "kind": PLAN_READY_SERVER_MESSAGE_DATA_KIND,
+            "plan": "1. Inspect",
+            "summary": null,
+        });
+        let (actions, metadata_items) =
+            take_plan_ready_message_metadata(vec![add_messages_action(vec![
+                agent_output_message("source-message", "visible plan", metadata.to_string()),
+            ])]);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(metadata_items.len(), 1);
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_extracts_metadata_from_append_message() {
+        let metadata = json!({
+            "kind": PLAN_READY_SERVER_MESSAGE_DATA_KIND,
+            "plan": "1. Inspect",
+            "summary": null,
+        });
+        let (actions, metadata_items) =
+            take_plan_ready_message_metadata(vec![append_agent_output_action_for_task(
+                "task",
+                agent_output_message("source-message", "visible plan", metadata.to_string()),
+            )]);
+
+        assert_eq!(metadata_items.len(), 1);
+        assert_eq!(metadata_items[0].source_message_id, "source-message");
+        assert_eq!(metadata_items[0].plan, "1. Inspect");
+
+        let Some(api::client_action::Action::AppendToMessageContent(append)) =
+            actions[0].action.as_ref()
+        else {
+            panic!("expected append action");
+        };
+        assert!(append
+            .message
+            .as_ref()
+            .expect("append should have message")
+            .server_message_data
+            .is_empty());
+    }
+
+    #[test]
+    fn plan_mode_auto_implement_client_actions_set_pending_plan_approval() {
+        App::test((), |mut app| async move {
+            let terminal_view_id = EntityId::new();
+            let response_stream_id = ResponseStreamId::new_for_test();
+            let history_model =
+                app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+            let metadata = json!({
+                "kind": PLAN_READY_SERVER_MESSAGE_DATA_KIND,
+                "plan": "1. Inspect\n2. Patch",
+                "summary": "Ready to implement",
+            });
+
+            let (conversation_id, source_exchange_id) =
+                history_model.update(&mut app, |history_model, ctx| {
+                    let conversation_id =
+                        history_model.start_new_conversation(terminal_view_id, false, false, ctx);
+                    let request_input =
+                        request_input_for_conversation(history_model, conversation_id);
+                    history_model
+                        .update_conversation_for_new_request_input(
+                            request_input,
+                            response_stream_id.clone(),
+                            terminal_view_id,
+                            ctx,
+                        )
+                        .expect("request input should append exchange");
+                    let source_exchange_id = history_model
+                        .conversation(&conversation_id)
+                        .and_then(|conversation| {
+                            conversation.latest_exchange().map(|exchange| exchange.id)
+                        })
+                        .expect("new conversation should have an exchange");
+                    history_model.initialize_output_for_response_stream(
+                        &response_stream_id,
+                        conversation_id,
+                        terminal_view_id,
+                        api::response_event::StreamInit {
+                            request_id: "request".to_string(),
+                            conversation_id: conversation_id.to_string(),
+                            run_id: String::new(),
+                        },
+                        ctx,
+                    );
+                    let task_id = history_model
+                        .conversation(&conversation_id)
+                        .expect("conversation should exist")
+                        .get_root_task_id()
+                        .to_string();
+                    let (actions, plan_ready_metadata) = take_plan_ready_message_metadata(vec![
+                        create_task_action(task_id.clone()),
+                        add_messages_action_for_task(
+                            task_id.clone(),
+                            vec![agent_output_message(
+                                "source-message",
+                                "prior assistant text",
+                                "",
+                            )],
+                        ),
+                        append_agent_output_action_for_task(
+                            task_id,
+                            agent_output_message(
+                                "source-message",
+                                "\nvisible plan",
+                                metadata.to_string(),
+                            ),
+                        ),
+                    ]);
+
+                    history_model
+                        .apply_client_actions(
+                            &response_stream_id,
+                            actions,
+                            conversation_id,
+                            terminal_view_id,
+                            true,
+                            ctx,
+                        )
+                        .expect("client actions should apply");
+                    apply_plan_ready_message_metadata(
+                        history_model,
+                        conversation_id,
+                        terminal_view_id,
+                        plan_ready_metadata,
+                        ctx,
+                    );
+
+                    (conversation_id, source_exchange_id)
+                });
+
+            history_model.read(&app, |history_model, _| {
+                let conversation = history_model
+                    .conversation(&conversation_id)
+                    .expect("conversation should exist");
+                let pending = conversation
+                    .pending_plan_approval()
+                    .expect("pending plan approval should be set");
+                assert_eq!(pending.plan, "1. Inspect\n2. Patch");
+                assert_eq!(pending.summary.as_deref(), Some("Ready to implement"));
+                assert_eq!(pending.source_exchange_id, source_exchange_id);
+                assert_eq!(
+                    pending.source_message_id,
+                    MessageId::new("source-message".to_string())
+                );
+            });
+        });
     }
 }
 
@@ -2763,9 +3077,9 @@ impl BlocklistAIController {
                             warp_multi_agent_api::response_event::Type::ClientActions(actions) => {
                                 let allow_local_autoexecute_marker =
                                     response_stream.as_ref(ctx).is_local_direct_request();
-                                let (client_actions, plan_ready_payloads) =
+                                let (client_actions, plan_ready_metadata) =
                                     if allow_local_autoexecute_marker {
-                                        take_plan_ready_debug_outputs(actions.actions)
+                                        take_plan_ready_message_metadata(actions.actions)
                                     } else {
                                         (actions.actions, Vec::new())
                                     };
@@ -2785,44 +3099,15 @@ impl BlocklistAIController {
                                         "Failed to apply client actions to conversation: {e:?}"
                                     );
                                 }
-                                if !plan_ready_payloads.is_empty() {
+                                if !plan_ready_metadata.is_empty() {
                                     history_model.update(ctx, |history_model, ctx| {
-                                        let Some(source_exchange_id) = history_model
-                                            .conversation(&conversation_id)
-                                            .and_then(|conversation| {
-                                                conversation.latest_exchange().map(|exchange| exchange.id)
-                                            })
-                                        else {
-                                            log::warn!(
-                                                "Received plan-ready payload for conversation without latest exchange"
-                                            );
-                                            return;
-                                        };
-                                        for payload in plan_ready_payloads {
-                                            if payload.plan.trim().is_empty() {
-                                                continue;
-                                            }
-                                            let pending = PendingPlanApproval {
-                                                plan: payload.plan,
-                                                summary: payload.summary,
-                                                source_exchange_id,
-                                                source_message_id: MessageId::new(
-                                                    payload.source_message_id,
-                                                ),
-                                            };
-                                            if let Err(error) =
-                                                history_model.set_pending_plan_approval(
-                                                    conversation_id,
-                                                    pending,
-                                                    self.terminal_view_id,
-                                                    ctx,
-                                                )
-                                            {
-                                                log::warn!(
-                                                    "Failed to set pending plan approval: {error:?}"
-                                                );
-                                            }
-                                        }
+                                        apply_plan_ready_message_metadata(
+                                            history_model,
+                                            conversation_id,
+                                            self.terminal_view_id,
+                                            plan_ready_metadata,
+                                            ctx,
+                                        );
                                     });
                                 }
                             }
