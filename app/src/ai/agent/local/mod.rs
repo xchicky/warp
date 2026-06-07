@@ -1960,7 +1960,7 @@ fn apply_file_diff_tool_definition() -> OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
             name: "apply_file_diff".to_string(),
-            description: "Apply a unified diff patch to existing UTF-8 files under the current writable workspace. Creates, deletes, renames, binary patches, and fuzzy matching are not supported.".to_string(),
+            description: "Apply a unified diff patch to existing UTF-8 files under the current writable workspace. When safe workspace file modifications are needed and this tool is available, call it instead of giving the user manual edit instructions. Creates, deletes, renames, binary patches, and fuzzy matching are not supported.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1978,7 +1978,7 @@ fn write_file_tool_definition() -> OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
             name: "write_file".to_string(),
-            description: "Create or replace a small UTF-8 text file under the current writable workspace. Does not create missing parent directories. Defaults to refusing overwrites.".to_string(),
+            description: "Create or replace a small UTF-8 text file under the current writable workspace. When safe workspace file creation is needed and this tool is available, call it instead of giving the user manual file creation instructions. Does not create missing parent directories. Defaults to refusing overwrites.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1997,7 +1997,7 @@ fn edit_file_tool_definition() -> OpenAIChatTool {
         r#type: "function",
         function: OpenAIChatToolFunction {
             name: "edit_file".to_string(),
-            description: "Edit an existing UTF-8 text file under the current writable workspace by exact string replacement. Refuses ambiguous replacements unless replace_all is true.".to_string(),
+            description: "Edit an existing UTF-8 text file under the current writable workspace by exact string replacement. When safe workspace file modifications are needed and this tool is available, call it instead of giving the user manual edit instructions. Refuses ambiguous replacements unless replace_all is true.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -2014,9 +2014,9 @@ fn edit_file_tool_definition() -> OpenAIChatTool {
 
 fn run_shell_command_tool_definition() -> OpenAIChatTool {
     let description = if FeatureFlag::LocalAgentAutoExecuteSafeCommands.is_enabled() {
-        "Request execution of an opaque shell command in the active terminal context. Warp may auto-execute only statically allowlisted read-only inspection commands; all other commands require visible user approval."
+        "Request execution of an opaque shell command in the active terminal context. When inspect, verify, build, or test commands are needed and this tool is available, call it instead of only suggesting that the user run them. Warp may auto-execute only statically allowlisted read-only inspection commands; all other commands require visible user approval."
     } else {
-        "Request execution of an opaque shell command after visible user approval in the active terminal context."
+        "Request execution of an opaque shell command after visible user approval in the active terminal context. When inspect, verify, build, or test commands are needed and this tool is available, call it instead of only suggesting that the user run them."
     };
     OpenAIChatTool {
         r#type: "function",
