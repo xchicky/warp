@@ -1501,7 +1501,7 @@ impl BlocklistAIController {
         };
 
         let query = format!(
-            "Implement the approved plan below by directly invoking the available file and shell tools (apply_file_diff, write_file, edit_file, run_shell_command) when work needs to be done. Do NOT instruct the user to manually create or modify files; if a file needs to be created or changed, call the appropriate tool yourself. Follow the plan unless new information makes a step unsafe or impossible; if that happens, stop and explain before making further changes.\nDo not call spawn_subagent or start a nested plan-mode flow for this implementation unless the user explicitly asks for that in a later message.\n\n{}",
+            "Implement the approved plan below by directly invoking the available file and shell tools (apply_file_diff, write_file, edit_file, run_shell_command) when work needs to be done. Do NOT instruct the user to manually create or modify files; if a file needs to be created or changed, call the appropriate tool yourself. Continue executing the plan to completion through all steps without pausing to ask the user for intermediate confirmation. Tool calls themselves will trigger any required user approvals separately. Only stop early if a step is unsafe or impossible due to new information that contradicts the approved plan; in that case explain the issue before making further changes.\nDo not call spawn_subagent or start a nested plan-mode flow for this implementation unless the user explicitly asks for that in a later message.\n\n{}",
             pending.plan
         );
         self.send_user_query_in_conversation(query, conversation_id, None, ctx);
