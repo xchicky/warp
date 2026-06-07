@@ -1103,6 +1103,15 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                     output_items.add_child(footer);
                 }
 
+                if let Some(pending_plan_approval) = render_pending_plan_approval(
+                    props.keyboard_navigable_buttons_kind,
+                    props.keyboard_navigable_buttons,
+                    appearance,
+                    app,
+                ) {
+                    output_items.add_child(pending_plan_approval);
+                }
+
                 if let Some(request_refunded_count) = props.request_refunded_count {
                     match request_refunded_count.cmp(&1) {
                         Ordering::Equal | Ordering::Less => {
@@ -2290,23 +2299,48 @@ fn render_suggest_new_conversation(
         );
     }
 
+    Some(render_keyboard_navigable_buttons_card(
+        "It seems like the topic changed. Would you like to make a new conversation?",
+        props.keyboard_navigable_buttons,
+        appearance,
+        app,
+    ))
+}
+
+fn render_pending_plan_approval(
+    keyboard_navigable_buttons_kind: Option<KeyboardNavigableButtonsKind>,
+    keyboard_navigable_buttons: Option<&ViewHandle<KeyboardNavigableButtons>>,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    if keyboard_navigable_buttons_kind != Some(KeyboardNavigableButtonsKind::PendingPlanApproval) {
+        return None;
+    }
+
+    Some(render_keyboard_navigable_buttons_card(
+        "Review the plan before implementation.",
+        keyboard_navigable_buttons,
+        appearance,
+        app,
+    ))
+}
+
+fn render_keyboard_navigable_buttons_card(
+    header_text: &'static str,
+    keyboard_navigable_buttons: Option<&ViewHandle<KeyboardNavigableButtons>>,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
     let mut content = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-    let header_text = match props.keyboard_navigable_buttons_kind {
-        Some(KeyboardNavigableButtonsKind::PendingPlanApproval) => {
-            "Review the plan before implementation."
-        }
-        Some(KeyboardNavigableButtonsKind::SuggestNewConversation) | None => {
-            "It seems like the topic changed. Would you like to make a new conversation?"
-        }
-    };
     let header_element = HeaderConfig::new(header_text, app)
         .with_icon(yellow_stop_icon(appearance))
         .with_corner_radius_override(CornerRadius::with_top(Radius::Pixels(8.)))
         .render(app);
     content.add_child(header_element);
 
-    if let Some(menu) = props.keyboard_navigable_buttons {
+    if let Some(menu) = keyboard_navigable_buttons {
         let keyboard_navigable_buttons_container = Container::new(ChildView::new(menu).finish())
             .with_horizontal_margin(INLINE_ACTION_HORIZONTAL_PADDING)
             .with_vertical_margin(16.);
@@ -2315,15 +2349,13 @@ fn render_suggest_new_conversation(
 
     let border_color = blended_colors::neutral_4(theme);
 
-    Some(
-        content
-            .finish()
-            .with_content_item_spacing()
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-            .with_background_color(theme.background().into_solid())
-            .with_border(Border::all(1.).with_border_fill(border_color))
-            .finish(),
-    )
+    content
+        .finish()
+        .with_content_item_spacing()
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_background_color(theme.background().into_solid())
+        .with_border(Border::all(1.).with_border_fill(border_color))
+        .finish()
 }
 
 /// Creates a FormattedText object with inline code formatting for grep queries
