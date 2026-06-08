@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::ai::agent::{
-    AIAgentActionType, AIAgentExchange, AIAgentOutput, AIAgentOutputMessageType,
-    AIAgentOutputStatus, MessageId, Shared,
+    AIAgentActionResultType, AIAgentActionType, AIAgentExchange, AIAgentOutput,
+    AIAgentOutputMessageType, AIAgentOutputStatus, MessageId, RequestFileEditsResult, Shared,
 };
 use crate::ai::llms::LLMId;
 use crate::test_util::ai_agent_tasks::{
@@ -96,6 +96,39 @@ fn assert_start_agent_prompt(
     assert_eq!(current_prompt, prompt);
 }
 
+fn create_apply_file_diffs_result_message(
+    id: &str,
+    task_id: &str,
+    tool_call_id: &str,
+) -> api::Message {
+    api::Message {
+        id: id.to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::ToolCallResult(
+            api::message::ToolCallResult {
+                tool_call_id: tool_call_id.to_string(),
+                context: None,
+                result: Some(api::message::tool_call_result::Result::ApplyFileDiffs(
+                    api::ApplyFileDiffsResult {
+                        result: Some(api::apply_file_diffs_result::Result::Success(
+                            #[allow(deprecated)]
+                            api::apply_file_diffs_result::Success {
+                                updated_files_v2: vec![],
+                                updated_files: vec![],
+                                deleted_files: vec![],
+                            },
+                        )),
+                    },
+                )),
+            },
+        )),
+        request_id: String::new(),
+        timestamp: None,
+    }
+}
+
 #[test]
 fn test_upsert_message_adds_start_agent_prompt_to_output() {
     let task_id = "task1";
@@ -122,6 +155,40 @@ fn test_upsert_message_adds_start_agent_prompt_to_output() {
     )
     .expect("initial upsert should succeed");
     assert_start_agent_prompt(&task, exchange_id, "run tests");
+}
+
+#[test]
+fn test_upsert_message_inserts_absent_converted_action_result_input() {
+    let task_id = "task1";
+    let mut task = create_server_task(create_api_task(task_id, vec![]));
+
+    let exchange = create_streaming_exchange_with_output();
+    let exchange_id = exchange.id;
+    task.append_exchange(exchange);
+
+    task.upsert_message(
+        create_apply_file_diffs_result_message("result_message", task_id, "apply_file_diff_1"),
+        exchange_id,
+        None,
+        None,
+        FieldMask {
+            paths: vec!["message.tool_call_result".to_string()],
+        },
+        true,
+    )
+    .expect("tool result upsert should succeed");
+
+    let exchange = task.exchange(exchange_id).expect("exchange should exist");
+    let result = exchange
+        .input
+        .iter()
+        .find_map(|input| input.action_result())
+        .expect("converted action result should be inserted");
+    assert_eq!(result.id.to_string(), "apply_file_diff_1");
+    assert!(matches!(
+        result.result,
+        AIAgentActionResultType::RequestFileEdits(RequestFileEditsResult::Success { .. })
+    ));
 }
 
 // =============================================================================

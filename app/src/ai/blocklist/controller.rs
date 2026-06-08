@@ -22,9 +22,12 @@ use super::{
     input_model::InputConfig,
     BlocklistAIInputModel, InputType,
 };
-use crate::ai::agent::api::{self, ServerConversationToken};
+use crate::ai::agent::api::{
+    self, convert_conversation::convert_tool_call_result_to_input, ServerConversationToken,
+};
 use crate::ai::agent::conversation::{AIConversation, ConversationStatus, PendingPlanApproval};
 use crate::ai::agent::local::PLAN_READY_SERVER_MESSAGE_DATA_KIND;
+use crate::ai::agent::task::helper::MessageExt;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentActionResult, CancellationReason, PassiveSuggestionResultType, PassiveSuggestionTrigger,
@@ -203,12 +206,109 @@ fn apply_plan_ready_message_metadata(
     }
 }
 
+fn new_local_direct_apply_file_diff_results(
+    conversation: &AIConversation,
+    stream_id: &ResponseStreamId,
+) -> Vec<AIAgentActionResult> {
+    conversation
+        .new_exchange_ids_for_response(stream_id)
+        .filter_map(|exchange_id| conversation.exchange_with_id(exchange_id))
+        .flat_map(|exchange| {
+            let output_action_ids = exchange
+                .output_status
+                .output()
+                .into_iter()
+                .flat_map(|output| {
+                    output
+                        .get()
+                        .actions()
+                        .map(|action| action.id.clone())
+                        .collect_vec()
+                })
+                .collect::<HashSet<_>>();
+
+            let input_results = exchange
+                .input
+                .iter()
+                .filter_map(|input| input.action_result().cloned());
+
+            let message_results = conversation
+                .all_tasks()
+                .flat_map(|task| task.messages())
+                .filter(|message| {
+                    exchange
+                        .added_message_ids
+                        .contains(&MessageId::new(message.id.clone()))
+                })
+                .filter_map(|message| {
+                    message.tool_call_result().map(|tool_call_result| {
+                        (TaskId::new(message.task_id.clone()), tool_call_result)
+                    })
+                })
+                .filter(|tool_call_result| {
+                    matches!(
+                        tool_call_result.1.result,
+                        Some(message::tool_call_result::Result::ApplyFileDiffs(_))
+                    )
+                })
+                .filter_map(|(task_id, tool_call_result)| {
+                    let mut document_versions = HashMap::new();
+                    convert_tool_call_result_to_input(
+                        &task_id,
+                        tool_call_result,
+                        &HashMap::new(),
+                        &mut document_versions,
+                    )
+                    .and_then(|input| input.action_result().cloned())
+                });
+
+            input_results
+                .chain(message_results)
+                .filter(|result| {
+                    output_action_ids.contains(&result.id)
+                        && matches!(result.result, AIAgentActionResultType::RequestFileEdits(_))
+                })
+                .unique_by(|result| result.id.clone())
+                .collect_vec()
+        })
+        .collect()
+}
+
+fn apply_local_direct_apply_file_diff_results(
+    action_model: &ModelHandle<BlocklistAIActionModel>,
+    conversation_id: AIConversationId,
+    results: Vec<AIAgentActionResult>,
+    ctx: &mut ModelContext<BlocklistAIController>,
+) {
+    for result in results {
+        action_model.update(ctx, |action_model, ctx| {
+            action_model.apply_finished_local_direct_file_edit_result_if_absent_for_conversation(
+                conversation_id,
+                result,
+                ctx,
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 mod plan_mode_auto_implement_tests {
     use super::*;
+    use crate::ai::agent::{
+        AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentOutput, AIAgentOutputMessage,
+        AIAgentOutputMessageType, FileEdit, RequestFileEditsResult, Shared,
+    };
+    use crate::ai::get_relevant_files::controller::GetRelevantFilesController;
+    use crate::terminal::model::session::active_session::ActiveSession;
+    use crate::terminal::model::session::Sessions;
+    use crate::terminal::model::terminal_model::TerminalModel;
+    use crate::terminal::model_events::ModelEventDispatcher;
+    use crate::test_util::terminal::initialize_app_for_terminal_view;
+    use parking_lot::FairMutex;
     use serde_json::json;
+    use std::sync::Arc;
     use warp_multi_agent_api as api;
-    use warpui::App;
+    use warpui::{App, ReadModel};
 
     fn add_messages_action(messages: Vec<api::Message>) -> api::ClientAction {
         add_messages_action_for_task("task", messages)
@@ -292,6 +392,91 @@ mod plan_mode_auto_implement_tests {
                 api::message::AgentOutput { text: text.into() },
             )),
         }
+    }
+
+    fn tool_call_message(id: impl Into<String>, tool_call_id: impl Into<String>) -> api::Message {
+        api::Message {
+            id: id.into(),
+            task_id: "task".to_string(),
+            request_id: "request".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: tool_call_id.into(),
+                tool: Some(api::message::tool_call::Tool::ApplyFileDiffs(
+                    api::message::tool_call::ApplyFileDiffs {
+                        summary: "Update file".to_string(),
+                        new_files: vec![],
+                        diffs: vec![],
+                        v4a_updates: vec![],
+                        deleted_files: vec![],
+                    },
+                )),
+            })),
+        }
+    }
+
+    fn apply_file_diffs_result_message(
+        id: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        result: api::apply_file_diffs_result::Result,
+    ) -> api::Message {
+        api::Message {
+            id: id.into(),
+            task_id: "task".to_string(),
+            request_id: "request".to_string(),
+            timestamp: None,
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::ToolCallResult(
+                api::message::ToolCallResult {
+                    tool_call_id: tool_call_id.into(),
+                    context: None,
+                    result: Some(api::message::tool_call_result::Result::ApplyFileDiffs(
+                        api::ApplyFileDiffsResult {
+                            result: Some(result),
+                        },
+                    )),
+                },
+            )),
+        }
+    }
+
+    fn request_file_edits_action(tool_call_id: impl Into<String>) -> AIAgentAction {
+        AIAgentAction {
+            id: AIAgentActionId::from(tool_call_id.into()),
+            task_id: TaskId::new("task".to_string()),
+            action: AIAgentActionType::RequestFileEdits {
+                file_edits: vec![FileEdit::Create {
+                    file: Some("created.txt".to_string()),
+                    content: Some("contents".to_string()),
+                }],
+                title: Some("Update file".to_string()),
+            },
+            requires_result: true,
+        }
+    }
+
+    fn create_action_model(app: &mut App) -> ModelHandle<BlocklistAIActionModel> {
+        let terminal_model = Arc::new(FairMutex::new(TerminalModel::mock(None, None)));
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let (_, model_events_rx) = async_channel::unbounded();
+        let model_event_dispatcher =
+            app.add_model(|ctx| ModelEventDispatcher::new(model_events_rx, sessions.clone(), ctx));
+        let active_session =
+            app.add_model(|ctx| ActiveSession::new(sessions, model_event_dispatcher.clone(), ctx));
+        let get_relevant_files_controller = app.add_model(GetRelevantFilesController::new);
+        app.add_model(|ctx| {
+            BlocklistAIActionModel::new(
+                terminal_model,
+                active_session,
+                &model_event_dispatcher,
+                get_relevant_files_controller,
+                EntityId::new(),
+                ctx,
+            )
+        })
     }
 
     fn request_input_for_conversation(
@@ -537,6 +722,269 @@ mod plan_mode_auto_implement_tests {
                     pending.source_message_id,
                     MessageId::new("source-message".to_string())
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_apply_file_diffs_success_finishes_action_model_result() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal_view_id = EntityId::new();
+            let response_stream_id = ResponseStreamId::new_for_test();
+            let history_model = BlocklistAIHistoryModel::handle(&app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let action_model = create_action_model(&mut app);
+
+            let (conversation_id, results) =
+                history_model.update(&mut app, |history_model, ctx| {
+                    let conversation_id =
+                        history_model.start_new_conversation(terminal_view_id, false, false, ctx);
+                    let request_input =
+                        request_input_for_conversation(history_model, conversation_id);
+                    history_model
+                        .update_conversation_for_new_request_input(
+                            request_input,
+                            response_stream_id.clone(),
+                            terminal_view_id,
+                            ctx,
+                        )
+                        .expect("request input should append exchange");
+                    history_model.initialize_output_for_response_stream(
+                        &response_stream_id,
+                        conversation_id,
+                        terminal_view_id,
+                        api::response_event::StreamInit {
+                            request_id: "request".to_string(),
+                            conversation_id: conversation_id.to_string(),
+                            run_id: String::new(),
+                        },
+                        ctx,
+                    );
+
+                    let mut output = AIAgentOutput::default();
+                    output.messages.push(AIAgentOutputMessage {
+                        id: MessageId::new("tool-call-output".to_string()),
+                        message: AIAgentOutputMessageType::Action(request_file_edits_action(
+                            "apply-file-diff-1",
+                        )),
+                        citations: vec![],
+                    });
+                    let exchange_id = history_model
+                        .conversation_mut(&conversation_id)
+                        .and_then(|conversation| {
+                            conversation.latest_exchange().map(|exchange| exchange.id)
+                        })
+                        .expect("exchange should exist");
+                    history_model
+                        .conversation_mut(&conversation_id)
+                        .expect("conversation should exist")
+                        .get_exchange_to_update(exchange_id)
+                        .expect("exchange should exist")
+                        .output_status = AIAgentOutputStatus::Streaming {
+                        output: Some(Shared::new(output)),
+                    };
+
+                    let task_id = history_model
+                        .conversation(&conversation_id)
+                        .expect("conversation should exist")
+                        .get_root_task_id()
+                        .to_string();
+                    history_model
+                        .apply_client_actions(
+                            &response_stream_id,
+                            vec![
+                                create_task_action(task_id.clone()),
+                                add_messages_action_for_task(
+                                    task_id,
+                                    vec![
+                                        tool_call_message("tool-call-message", "apply-file-diff-1"),
+                                        apply_file_diffs_result_message(
+                                            "tool-result-message",
+                                            "apply-file-diff-1",
+                                            api::apply_file_diffs_result::Result::Success(
+                                                #[allow(deprecated)]
+                                                api::apply_file_diffs_result::Success {
+                                                    updated_files_v2: vec![],
+                                                    updated_files: vec![],
+                                                    deleted_files: vec![],
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                            ],
+                            conversation_id,
+                            terminal_view_id,
+                            true,
+                            ctx,
+                        )
+                        .expect("client actions should apply");
+
+                    let results = history_model
+                        .conversation(&conversation_id)
+                        .map(|conversation| {
+                            new_local_direct_apply_file_diff_results(
+                                conversation,
+                                &response_stream_id,
+                            )
+                        })
+                        .expect("conversation should exist");
+                    (conversation_id, results)
+                });
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, action_id);
+            assert!(matches!(
+                results[0].result,
+                AIAgentActionResultType::RequestFileEdits(RequestFileEditsResult::Success { .. })
+            ));
+            for result in results {
+                action_model.update(&mut app, |action_model, ctx| {
+                    action_model.apply_finished_action_result(conversation_id, result, ctx);
+                });
+            }
+            app.read_model(&action_model, |action_model, _| {
+                let result = action_model
+                    .get_action_result(&action_id)
+                    .expect("success result should be applied to action model");
+                assert!(matches!(
+                    result.result,
+                    AIAgentActionResultType::RequestFileEdits(
+                        RequestFileEditsResult::Success { .. }
+                    )
+                ));
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_apply_file_diffs_error_does_not_render_success() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal_view_id = EntityId::new();
+            let response_stream_id = ResponseStreamId::new_for_test();
+            let history_model = BlocklistAIHistoryModel::handle(&app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let action_model = create_action_model(&mut app);
+
+            let (conversation_id, results) =
+                history_model.update(&mut app, |history_model, ctx| {
+                    let conversation_id =
+                        history_model.start_new_conversation(terminal_view_id, false, false, ctx);
+                    let request_input =
+                        request_input_for_conversation(history_model, conversation_id);
+                    history_model
+                        .update_conversation_for_new_request_input(
+                            request_input,
+                            response_stream_id.clone(),
+                            terminal_view_id,
+                            ctx,
+                        )
+                        .expect("request input should append exchange");
+                    history_model.initialize_output_for_response_stream(
+                        &response_stream_id,
+                        conversation_id,
+                        terminal_view_id,
+                        api::response_event::StreamInit {
+                            request_id: "request".to_string(),
+                            conversation_id: conversation_id.to_string(),
+                            run_id: String::new(),
+                        },
+                        ctx,
+                    );
+
+                    let mut output = AIAgentOutput::default();
+                    output.messages.push(AIAgentOutputMessage {
+                        id: MessageId::new("tool-call-output".to_string()),
+                        message: AIAgentOutputMessageType::Action(request_file_edits_action(
+                            "apply-file-diff-1",
+                        )),
+                        citations: vec![],
+                    });
+                    let exchange_id = history_model
+                        .conversation_mut(&conversation_id)
+                        .and_then(|conversation| {
+                            conversation.latest_exchange().map(|exchange| exchange.id)
+                        })
+                        .expect("exchange should exist");
+                    history_model
+                        .conversation_mut(&conversation_id)
+                        .expect("conversation should exist")
+                        .get_exchange_to_update(exchange_id)
+                        .expect("exchange should exist")
+                        .output_status = AIAgentOutputStatus::Streaming {
+                        output: Some(Shared::new(output)),
+                    };
+
+                    let task_id = history_model
+                        .conversation(&conversation_id)
+                        .expect("conversation should exist")
+                        .get_root_task_id()
+                        .to_string();
+                    history_model
+                        .apply_client_actions(
+                            &response_stream_id,
+                            vec![
+                                create_task_action(task_id.clone()),
+                                add_messages_action_for_task(
+                                    task_id,
+                                    vec![
+                                        tool_call_message("tool-call-message", "apply-file-diff-1"),
+                                        apply_file_diffs_result_message(
+                                            "tool-result-message",
+                                            "apply-file-diff-1",
+                                            api::apply_file_diffs_result::Result::Error(
+                                                api::apply_file_diffs_result::Error {
+                                                    message: "patch failed".to_string(),
+                                                },
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                            ],
+                            conversation_id,
+                            terminal_view_id,
+                            true,
+                            ctx,
+                        )
+                        .expect("client actions should apply");
+
+                    let results = history_model
+                        .conversation(&conversation_id)
+                        .map(|conversation| {
+                            new_local_direct_apply_file_diff_results(
+                                conversation,
+                                &response_stream_id,
+                            )
+                        })
+                        .expect("conversation should exist");
+                    (conversation_id, results)
+                });
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, action_id);
+            assert!(matches!(
+                results[0].result,
+                AIAgentActionResultType::RequestFileEdits(
+                    RequestFileEditsResult::DiffApplicationFailed { .. }
+                )
+            ));
+            for result in results {
+                action_model.update(&mut app, |action_model, ctx| {
+                    action_model.apply_finished_action_result(conversation_id, result, ctx);
+                });
+            }
+            app.read_model(&action_model, |action_model, _| {
+                let result = action_model
+                    .get_action_result(&action_id)
+                    .expect("failure result should be applied to action model");
+                assert!(matches!(
+                    result.result,
+                    AIAgentActionResultType::RequestFileEdits(
+                        RequestFileEditsResult::DiffApplicationFailed { .. }
+                    )
+                ));
             });
         });
     }
@@ -3097,6 +3545,24 @@ impl BlocklistAIController {
                                 if let Err(e) = apply_result {
                                     log::error!(
                                         "Failed to apply client actions to conversation: {e:?}"
+                                    );
+                                }
+                                if allow_local_autoexecute_marker {
+                                    let results = history_model
+                                        .as_ref(ctx)
+                                        .conversation(&conversation_id)
+                                        .map(|conversation| {
+                                            new_local_direct_apply_file_diff_results(
+                                                conversation,
+                                                &stream_id,
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    apply_local_direct_apply_file_diff_results(
+                                        &self.action_model,
+                                        conversation_id,
+                                        results,
+                                        ctx,
                                     );
                                 }
                                 if !plan_ready_metadata.is_empty() {
