@@ -769,7 +769,7 @@ pub fn generate_openai_compatible_output(
         let mut tool_result_summaries = Vec::new();
         let suggested_shell_commands = Arc::new(Mutex::new(HashSet::new()));
 
-        let max_tool_rounds = if has_user_query { MAX_LOCAL_DIRECT_TOOL_ROUNDS } else { 0 };
+        let max_tool_rounds = local_direct_tool_round_limit(has_user_query, has_shell_action_result);
         for round in 0..max_tool_rounds {
             log::debug!("Starting local direct tool loop round {}", round + 1);
             let mcp_tool_catalog = local_mcp_tool_catalog_for_policy(mcp_context.as_ref(), tool_policy);
@@ -1387,6 +1387,14 @@ fn tool_calls_require_finalize(tool_calls: &[OpenAIChatToolCall]) -> bool {
     tool_calls
         .iter()
         .any(|call| call.function.name == "suggest_shell_command")
+}
+
+fn local_direct_tool_round_limit(has_user_query: bool, has_shell_action_result: bool) -> usize {
+    if has_user_query || has_shell_action_result {
+        MAX_LOCAL_DIRECT_TOOL_ROUNDS
+    } else {
+        0
+    }
 }
 
 fn local_direct_input_kind(input: &AIAgentInput) -> &'static str {
@@ -5560,15 +5568,15 @@ mod tests {
         execute_run_shell_command_tool, execute_run_shell_command_tool_with_runtime,
         execute_suggest_shell_command_tool, execute_todo_write_tool, execute_write_file_tool,
         fallback_tool_results_message, generate_openai_compatible_output, is_mutating_local_tool,
-        is_sequential_local_tool, local_mcp_tool_catalog, local_read_only_tools,
-        local_shell_action_result, local_subagent_messages, local_subagent_result_text,
-        local_tool_result_summary, local_tools, local_tools_for_context,
-        local_tools_for_context_with_policy, mcp_tool_api_result_for_provider,
-        mcp_tool_result_for_provider, mcp_unavailable_result_for_provider, openai_chat_request,
-        openai_message, openai_messages_from_inputs_and_tasks,
-        openai_messages_from_inputs_and_tasks_with_policy, plan_ready_server_message_data,
-        root_task_id, shell_command_result_for_provider, stream_finished_done,
-        structured_mcp_tool_call_event, structured_tool_call_event,
+        is_sequential_local_tool, local_direct_tool_round_limit, local_mcp_tool_catalog,
+        local_read_only_tools, local_shell_action_result, local_subagent_messages,
+        local_subagent_result_text, local_tool_result_summary, local_tools,
+        local_tools_for_context, local_tools_for_context_with_policy,
+        mcp_tool_api_result_for_provider, mcp_tool_result_for_provider,
+        mcp_unavailable_result_for_provider, openai_chat_request, openai_message,
+        openai_messages_from_inputs_and_tasks, openai_messages_from_inputs_and_tasks_with_policy,
+        plan_ready_server_message_data, root_task_id, shell_command_result_for_provider,
+        stream_finished_done, structured_mcp_tool_call_event, structured_tool_call_event,
         take_local_autoexecute_safe_tool_call, todo_update_events,
         truncate_mcp_output_for_provider, truncate_shell_output_for_provider,
         unsupported_stream_options_response, web_status_event,
@@ -5584,7 +5592,8 @@ mod tests {
         MAX_LOCAL_DIRECT_SHELL_RESULT_BYTES, MAX_LOCAL_DIRECT_SUBAGENT_DEPTH,
         MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS, MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS,
         MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS, MAX_LOCAL_DIRECT_TOOL_FILE_BYTES,
-        PLAN_READY_SERVER_MESSAGE_DATA_KIND, SSH_UNSUPPORTED_FS_TOOL_ERROR,
+        MAX_LOCAL_DIRECT_TOOL_ROUNDS, PLAN_READY_SERVER_MESSAGE_DATA_KIND,
+        SSH_UNSUPPORTED_FS_TOOL_ERROR,
     };
     use crate::ai::agent::{
         api::{
@@ -6016,6 +6025,97 @@ mod tests {
         }
     }
 
+    fn agent_output_text(event: &api::ResponseEvent) -> Option<&str> {
+        let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+            return None;
+        };
+        actions
+            .actions
+            .iter()
+            .filter_map(|action| action.action.as_ref())
+            .find_map(|action| match action {
+                api::client_action::Action::AddMessagesToTask(add) => add
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.message.as_ref())
+                    .find_map(|message| match message {
+                        api::message::Message::AgentOutput(output) => Some(output.text.as_str()),
+                        _ => None,
+                    }),
+                api::client_action::Action::AppendToMessageContent(append) => append
+                    .message
+                    .as_ref()
+                    .and_then(|message| match message.message.as_ref() {
+                        Some(api::message::Message::AgentOutput(output)) => {
+                            Some(output.text.as_str())
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+    }
+
+    fn response_has_tool_call(event: &api::ResponseEvent, expected_tool_call_id: &str) -> bool {
+        let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+            return false;
+        };
+        actions
+            .actions
+            .iter()
+            .filter_map(|action| action.action.as_ref())
+            .any(|action| {
+                let api::client_action::Action::AddMessagesToTask(add) = action else {
+                    return false;
+                };
+                add.messages.iter().any(|message| {
+                    matches!(
+                        message.message.as_ref(),
+                        Some(api::message::Message::ToolCall(tool_call))
+                            if tool_call.tool_call_id == expected_tool_call_id
+                    )
+                })
+            })
+    }
+
+    fn completed_shell_action_result(
+        command: &str,
+        output: &str,
+        context: Vec<AIAgentContext>,
+    ) -> AIAgentInput {
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_shell".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("root".to_string()),
+            result: AIAgentActionResultType::RequestCommandOutput(
+                RequestCommandOutputResult::Completed {
+                    block_id: BlockId::from("block".to_string()),
+                    command: command.to_string(),
+                    output: output.to_string(),
+                    exit_code: ExitCode::from(0),
+                },
+            ),
+        };
+        AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(context.into_boxed_slice()),
+        }
+    }
+
+    fn completed_mcp_action_result() -> AIAgentInput {
+        let action_result = crate::ai::agent::AIAgentActionResult {
+            id: AIAgentActionId::from("call_mcp".to_string()),
+            task_id: crate::ai::agent::task::TaskId::new("root".to_string()),
+            result: AIAgentActionResultType::CallMCPTool(CallMCPToolResult::Success {
+                result: rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(
+                    "mcp ok",
+                )]),
+            }),
+        };
+        AIAgentInput::ActionResult {
+            result: action_result,
+            context: Arc::from(Vec::<AIAgentContext>::new().into_boxed_slice()),
+        }
+    }
+
     #[test]
     fn chat_completions_url_appends_path_to_base_url() {
         assert_eq!(
@@ -6077,6 +6177,233 @@ mod tests {
             ));
             assert!(stream.next().await.is_none());
         });
+    }
+
+    #[test]
+    fn action_result_resume_tool_round_limit_allows_shell_and_mcp_results() {
+        assert_eq!(
+            local_direct_tool_round_limit(true, false),
+            MAX_LOCAL_DIRECT_TOOL_ROUNDS
+        );
+        assert_eq!(
+            local_direct_tool_round_limit(false, true),
+            MAX_LOCAL_DIRECT_TOOL_ROUNDS
+        );
+        assert_eq!(local_direct_tool_round_limit(false, false), 0);
+    }
+
+    #[tokio::test]
+    async fn action_result_resume_shell_output_uses_tool_loop_and_executes_write_file() {
+        let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let mut server = mockito::Server::new_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let write_args = serde_json::json!({
+            "path": "created.txt",
+            "content": "created after shell approval\n"
+        })
+        .to_string();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_write",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": write_args,
+                            }
+                        }]
+                    }
+                }]
+            })
+        );
+        let request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let request_bodies_for_mock = Arc::clone(&request_bodies);
+        let first_mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::Regex(
+                r#""tool_call_id":"call_shell""#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(move |request| {
+                request_bodies_for_mock
+                    .lock()
+                    .unwrap()
+                    .push(request.utf8_lossy_body().unwrap().into_owned());
+                body.as_bytes().to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let final_mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::Regex(
+                r#""tool_call_id":"call_write""#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+                "data: [DONE]\n"
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let mut config = local_direct_config();
+        config.base_url = format!("{}/v1", server.url());
+
+        let mut stream = generate_openai_compatible_output(
+            config,
+            vec![completed_shell_action_result(
+                "mkdir -p m8-test",
+                "",
+                vec![AIAgentContext::Directory {
+                    pwd: Some(temp_dir.path().to_string_lossy().to_string()),
+                    home_dir: None,
+                    are_file_symbols_indexed: false,
+                }],
+            )],
+            Vec::new(),
+            Some(ServerConversationToken::new("conversation".to_string())),
+            None,
+            LocalToolRuntimeContext::default(),
+        );
+
+        let mut saw_write_tool_call = false;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            saw_write_tool_call |= response_has_tool_call(&event, "call_write");
+        }
+
+        first_mock.assert_async().await;
+        final_mock.assert_async().await;
+        let request_body = request_bodies.lock().unwrap().join("\n");
+        assert!(request_body.contains(r#""tools":["#));
+        assert!(request_body.contains(r#""name":"write_file""#));
+        assert!(request_body.contains(r#""role":"tool""#));
+        assert!(saw_write_tool_call);
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("created.txt")).unwrap(),
+            "created after shell approval\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_result_resume_mcp_output_uses_tool_loop_with_tools() {
+        let _write_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"continued after mcp\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""tools":\["#.to_string()),
+                mockito::Matcher::Regex(r#""name":"write_file""#.to_string()),
+                mockito::Matcher::Regex(r#""role":"tool""#.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut config = local_direct_config();
+        config.base_url = format!("{}/v1", server.url());
+
+        let mut stream = generate_openai_compatible_output(
+            config,
+            vec![completed_mcp_action_result()],
+            Vec::new(),
+            Some(ServerConversationToken::new("conversation".to_string())),
+            None,
+            LocalToolRuntimeContext::default(),
+        );
+
+        let mut output = String::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if let Some(text) = agent_output_text(&event) {
+                output.push_str(text);
+            }
+        }
+
+        mock.assert_async().await;
+        assert!(output.contains("continued after mcp"));
+    }
+
+    #[tokio::test]
+    async fn suggest_shell_command_still_breaks_to_finalize_without_tools() {
+        let mut server = mockito::Server::new_async().await;
+        let tool_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_suggest\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"suggest_shell_command\",\"arguments\":\"",
+            "{\\\"command\\\":\\\"cargo test\\\",\\\"is_read_only\\\":true}",
+            "\"}}]}}]}\n",
+            "data: [DONE]\n"
+        );
+        let finalize_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"suggested command only\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let request_bodies_for_mock = Arc::clone(&request_bodies);
+        let tool_body = tool_body.as_bytes().to_vec();
+        let finalize_body = finalize_body.as_bytes().to_vec();
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(move |request| {
+                let mut request_bodies = request_bodies_for_mock.lock().unwrap();
+                request_bodies.push(request.utf8_lossy_body().unwrap().into_owned());
+                if request_bodies.len() == 1 {
+                    tool_body.clone()
+                } else {
+                    finalize_body.clone()
+                }
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let mut config = local_direct_config();
+        config.base_url = format!("{}/v1", server.url());
+
+        let mut stream = generate_openai_compatible_output(
+            config,
+            vec![user_query_input(
+                "suggest checks",
+                Vec::new(),
+                HashMap::new(),
+            )],
+            Vec::new(),
+            Some(ServerConversationToken::new("conversation".to_string())),
+            None,
+            LocalToolRuntimeContext::default(),
+        );
+
+        let mut output = String::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if let Some(text) = agent_output_text(&event) {
+                output.push_str(text);
+            }
+        }
+
+        mock.assert_async().await;
+        let request_bodies = request_bodies.lock().unwrap();
+        assert!(request_bodies[0].contains(r#""tools":["#));
+        assert!(request_bodies[0].contains(r#""name":"suggest_shell_command""#));
+        let finalize_request: serde_json::Value = serde_json::from_str(&request_bodies[1]).unwrap();
+        assert!(!finalize_request.as_object().unwrap().contains_key("tools"));
+        assert_eq!(finalize_request["tool_choice"], "none");
+        assert!(output.contains("suggested command only"));
     }
 
     #[test]
