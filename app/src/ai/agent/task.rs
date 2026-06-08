@@ -735,6 +735,8 @@ impl Task {
                             })
                         {
                             *existing_result = input;
+                        } else {
+                            exchange_to_update.input.push(input);
                         }
                     } else {
                         exchange_to_update.input.push(input)

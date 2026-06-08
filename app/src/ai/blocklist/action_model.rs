@@ -247,6 +247,12 @@ pub struct BlocklistAIActionModel {
     /// Past actions and their corresponding statuses from previous AI exchanges.
     past_action_results: HashMap<AIAgentActionId, Arc<AIAgentActionResult>>,
 
+    /// Local-direct sync file edit action results that were produced by local tool execution.
+    ///
+    /// Action IDs are not guaranteed to be globally unique across conversations, so the marker is
+    /// scoped by conversation.
+    local_direct_file_edit_results: HashMap<AIConversationId, HashSet<AIAgentActionId>>,
+
     /// The ID of the terminal view this controller is associated with.
     terminal_view_id: EntityId,
 
@@ -314,6 +320,7 @@ impl BlocklistAIActionModel {
             finished_action_results: Default::default(),
             executor,
             past_action_results: HashMap::new(),
+            local_direct_file_edit_results: HashMap::new(),
             running_actions: Default::default(),
             action_order: Default::default(),
             terminal_view_id,
@@ -650,6 +657,46 @@ impl BlocklistAIActionModel {
             })
     }
 
+    pub fn get_action_status_for_conversation(
+        &self,
+        conversation_id: AIConversationId,
+        id: &AIAgentActionId,
+    ) -> Option<AIActionStatus> {
+        if let Some(pending_actions_for_conversation) = self.pending_actions.get(&conversation_id) {
+            for (index, action) in pending_actions_for_conversation.iter().enumerate() {
+                if &action.id != id {
+                    continue;
+                }
+
+                if index == 0
+                    && !self.is_view_only
+                    && !self.running_actions.contains_key(&conversation_id)
+                {
+                    return Some(AIActionStatus::Blocked);
+                }
+
+                return Some(AIActionStatus::Queued);
+            }
+        }
+
+        if self
+            .running_actions
+            .get(&conversation_id)
+            .is_some_and(|running| running.contains(id))
+        {
+            return Some(AIActionStatus::RunningAsync);
+        }
+
+        self.get_action_result_for_conversation(conversation_id, id)
+            .map(|result| AIActionStatus::Finished(result.clone()))
+            .or_else(|| {
+                self.pending_preprocessed_actions
+                    .get(&conversation_id)
+                    .is_some_and(|preprocessing| preprocessing.contains(id))
+                    .then_some(AIActionStatus::Preprocessing)
+            })
+    }
+
     pub fn get_action_result(&self, id: &AIAgentActionId) -> Option<&Arc<AIAgentActionResult>> {
         // Search through all conversations' finished action results
         self.finished_action_results
@@ -657,6 +704,18 @@ impl BlocklistAIActionModel {
             .flat_map(|results| results.iter())
             .find(|result| &result.id == id)
             .or_else(|| self.past_action_results.get(id))
+    }
+
+    pub fn get_action_result_for_conversation(
+        &self,
+        conversation_id: AIConversationId,
+        id: &AIAgentActionId,
+    ) -> Option<&Arc<AIAgentActionResult>> {
+        self.finished_action_results
+            .get(&conversation_id)
+            .into_iter()
+            .flat_map(|results| results.iter())
+            .find(|result| &result.id == id)
     }
 
     /// Bulk restore action results from a list of exchanges (used when loading conversations from tasks)
@@ -1051,6 +1110,52 @@ impl BlocklistAIActionModel {
         );
 
         self.handle_action_result(conversation_id, Arc::new(action_result), None, ctx);
+    }
+
+    pub fn apply_finished_local_direct_file_edit_result(
+        &mut self,
+        conversation_id: AIConversationId,
+        action_result: AIAgentActionResult,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !matches!(
+            action_result.result,
+            AIAgentActionResultType::RequestFileEdits(_)
+        ) {
+            log::warn!(
+                "Tried to mark non-file-edit action result as a local-direct file edit result"
+            );
+            return;
+        }
+        self.local_direct_file_edit_results
+            .entry(conversation_id)
+            .or_default()
+            .insert(action_result.id.clone());
+        self.apply_finished_action_result(conversation_id, action_result, ctx);
+    }
+
+    pub fn apply_finished_local_direct_file_edit_result_if_absent_for_conversation(
+        &mut self,
+        conversation_id: AIConversationId,
+        action_result: AIAgentActionResult,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self
+            .get_action_result_for_conversation(conversation_id, &action_result.id)
+            .is_none()
+        {
+            self.apply_finished_local_direct_file_edit_result(conversation_id, action_result, ctx);
+        }
+    }
+
+    pub fn has_local_direct_file_edit_result(
+        &self,
+        conversation_id: AIConversationId,
+        action_id: &AIAgentActionId,
+    ) -> bool {
+        self.local_direct_file_edit_results
+            .get(&conversation_id)
+            .is_some_and(|action_ids| action_ids.contains(action_id))
     }
 
     pub(super) fn cancel_action_with_id(

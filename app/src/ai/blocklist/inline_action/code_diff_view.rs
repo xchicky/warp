@@ -55,6 +55,7 @@ use crate::view_components::action_button::{ActionButton, NakedTheme};
 use crate::{
     ai::{
         agent::{
+            conversation::AIConversationId,
             icons::{self, yellow_stop_icon},
             AIAgentActionId, AIIdentifiers, FileEdit, FileLocations, ServerOutputId,
         },
@@ -478,6 +479,7 @@ struct PendingDiff {
 #[derive(Clone)]
 pub struct CodeDiffView {
     action_id: AIAgentActionId,
+    conversation_id: Option<AIConversationId>,
 
     pending_diffs: Vec<PendingDiff>,
     button_mouse_states: CodeDiffViewMouseStates,
@@ -697,6 +699,9 @@ impl CodeDiffView {
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let is_passive = model.request_type(ctx).is_passive_code_diff();
+        let conversation_id = model
+            .conversation_id(ctx)
+            .or(identifiers.client_conversation_id);
         let initial_state = if action_model.as_ref(ctx).is_view_only() {
             CodeDiffState::ViewOnly { is_complete: false }
         } else if model.is_first_action_in_output(action_id, ctx) {
@@ -714,14 +719,34 @@ impl CodeDiffView {
             edit_format_kind,
             should_show_speedbump,
             session_platform,
+            conversation_id,
             ctx,
         );
 
         ctx.subscribe_to_model(
             &action_model,
             move |me, action_model, event, ctx| match event {
-                BlocklistAIActionEvent::FinishedAction { action_id, .. } if !me.is_complete() => {
-                    match action_model.as_ref(ctx).get_action_status(&me.action_id) {
+                BlocklistAIActionEvent::FinishedAction {
+                    action_id,
+                    conversation_id,
+                    ..
+                } if !me.is_complete() => {
+                    if me.conversation_id.is_some_and(|id| id != *conversation_id) {
+                        return;
+                    }
+                    let local_direct_file_edit_status = action_model
+                        .as_ref(ctx)
+                        .has_local_direct_file_edit_result(*conversation_id, &me.action_id)
+                        .then(|| {
+                            action_model
+                                .as_ref(ctx)
+                                .get_action_status_for_conversation(*conversation_id, &me.action_id)
+                        })
+                        .flatten();
+                    let action_status = local_direct_file_edit_status
+                        .clone()
+                        .or_else(|| action_model.as_ref(ctx).get_action_status(&me.action_id));
+                    match action_status {
                         Some(AIActionStatus::Blocked) => {
                             me.state = CodeDiffState::WaitingForUser;
                             ctx.notify();
@@ -731,6 +756,13 @@ impl CodeDiffView {
                                 && status.is_success()
                             {
                                 me.state = CodeDiffState::ViewOnly { is_complete: true };
+                                me.should_expand_when_complete = false;
+                            } else if local_direct_file_edit_status.is_some() {
+                                if status.is_success() {
+                                    me.state = CodeDiffState::Accepted(None);
+                                } else if status.is_done() {
+                                    me.state = CodeDiffState::Rejected;
+                                }
                                 me.should_expand_when_complete = false;
                             } else if status.is_cancelled() {
                                 me.state = CodeDiffState::Rejected;
@@ -776,6 +808,7 @@ impl CodeDiffView {
             edit_format_kind,
             should_show_speedbump,
             session_platform,
+            None,
             ctx,
         )
     }
@@ -790,6 +823,7 @@ impl CodeDiffView {
         edit_format_kind: RequestFileEditsFormatKind,
         should_show_speedbump: bool,
         session_platform: Option<SessionPlatform>,
+        conversation_id: Option<AIConversationId>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let display_mode = if is_passive {
@@ -923,6 +957,7 @@ impl CodeDiffView {
 
         Self {
             action_id: action_id.clone(),
+            conversation_id,
             pending_diffs: Vec::new(),
             button_mouse_states: Default::default(),
             cancel_button,
@@ -3186,5 +3221,309 @@ fn keystroke_for_mode(key: &str, is_passive: bool) -> Keystroke {
         shift: !is_mac && is_passive,
         key: key.to_owned(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::agent::task::TaskId;
+    use crate::ai::agent::{
+        conversation::AIConversationId, AIAgentAction, AIAgentActionResult,
+        AIAgentActionResultType, AIAgentActionType, AIAgentOutput, AIAgentOutputMessage,
+        AIAgentOutputMessageType, MessageId, RequestFileEditsResult,
+    };
+    use crate::ai::blocklist::block::model::testing::FakeAIBlockModel;
+    use crate::ai::get_relevant_files::controller::GetRelevantFilesController;
+    use crate::terminal::model::session::active_session::ActiveSession;
+    use crate::terminal::model::session::Sessions;
+    use crate::terminal::model::terminal_model::TerminalModel;
+    use crate::terminal::model_events::ModelEventDispatcher;
+    use crate::test_util::terminal::initialize_app_for_terminal_view;
+    use parking_lot::FairMutex;
+    use warpui::platform::WindowStyle;
+    use warpui::{App, EntityId};
+
+    fn create_action_model(app: &mut App) -> ModelHandle<BlocklistAIActionModel> {
+        let terminal_model = Arc::new(FairMutex::new(TerminalModel::mock(None, None)));
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let (_, model_events_rx) = async_channel::unbounded();
+        let model_event_dispatcher =
+            app.add_model(|ctx| ModelEventDispatcher::new(model_events_rx, sessions.clone(), ctx));
+        let active_session =
+            app.add_model(|ctx| ActiveSession::new(sessions, model_event_dispatcher.clone(), ctx));
+        let get_relevant_files_controller = app.add_model(GetRelevantFilesController::new);
+        app.add_model(|ctx| {
+            BlocklistAIActionModel::new(
+                terminal_model,
+                active_session,
+                &model_event_dispatcher,
+                get_relevant_files_controller,
+                EntityId::new(),
+                ctx,
+            )
+        })
+    }
+
+    fn request_file_edits_action(action_id: &AIAgentActionId) -> AIAgentAction {
+        AIAgentAction {
+            id: action_id.clone(),
+            task_id: TaskId::new("task".to_string()),
+            action: AIAgentActionType::RequestFileEdits {
+                file_edits: vec![FileEdit::Create {
+                    file: Some("created.txt".to_string()),
+                    content: Some("contents".to_string()),
+                }],
+                title: Some("Create file".to_string()),
+            },
+            requires_result: true,
+        }
+    }
+
+    fn successful_file_edit_result(action_id: AIAgentActionId) -> AIAgentActionResult {
+        AIAgentActionResult {
+            id: action_id,
+            task_id: TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::RequestFileEdits(RequestFileEditsResult::Success {
+                diff: String::new(),
+                updated_files: vec![],
+                deleted_files: vec![],
+                lines_added: 0,
+                lines_removed: 0,
+            }),
+        }
+    }
+
+    fn failed_file_edit_result(action_id: AIAgentActionId) -> AIAgentActionResult {
+        AIAgentActionResult {
+            id: action_id,
+            task_id: TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::RequestFileEdits(
+                RequestFileEditsResult::DiffApplicationFailed {
+                    error: "patch failed".to_string(),
+                },
+            ),
+        }
+    }
+
+    fn code_diff_view_for_test(
+        action_id: AIAgentActionId,
+        conversation_id: AIConversationId,
+        action_model: ModelHandle<BlocklistAIActionModel>,
+        ctx: &mut ViewContext<CodeDiffView>,
+    ) -> CodeDiffView {
+        let mut output = AIAgentOutput::default();
+        output.messages.push(AIAgentOutputMessage {
+            id: MessageId::new("action-message".to_string()),
+            message: AIAgentOutputMessageType::Action(request_file_edits_action(&action_id)),
+            citations: vec![],
+        });
+        let model = FakeAIBlockModel::new(vec![], output);
+        CodeDiffView::new(
+            &action_id,
+            &model,
+            Some("Create file".to_string()),
+            AIIdentifiers {
+                client_conversation_id: Some(conversation_id),
+                ..Default::default()
+            },
+            RequestFileEditsFormatKind::Unknown,
+            false,
+            action_model,
+            None,
+            ctx,
+        )
+    }
+
+    #[test]
+    fn local_direct_file_edit_success_marks_live_code_diff_accepted() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_id = AIConversationId::new();
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_id,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_id,
+                    successful_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::Accepted(None)));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_failure_does_not_mark_live_code_diff_accepted() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_id = AIConversationId::new();
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_id,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_id,
+                    failed_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::Rejected));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_marker_is_scoped_by_conversation() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let local_direct_conversation_id = AIConversationId::new();
+            let other_conversation_id = AIConversationId::new();
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    other_conversation_id,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    local_direct_conversation_id,
+                    successful_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::WaitingForUser));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_duplicate_check_is_scoped_by_conversation() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_a = AIConversationId::new();
+            let conversation_b = AIConversationId::new();
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model
+                    .apply_finished_local_direct_file_edit_result_if_absent_for_conversation(
+                        conversation_a,
+                        successful_file_edit_result(action_id.clone()),
+                        ctx,
+                    );
+                action_model
+                    .apply_finished_local_direct_file_edit_result_if_absent_for_conversation(
+                        conversation_b,
+                        failed_file_edit_result(action_id.clone()),
+                        ctx,
+                    );
+            });
+
+            app.read(|ctx| {
+                action_model.read(ctx, |action_model, _| {
+                    let result_a = action_model
+                        .get_action_result_for_conversation(conversation_a, &action_id)
+                        .expect("conversation A result should be present");
+                    assert!(matches!(
+                        result_a.result,
+                        AIAgentActionResultType::RequestFileEdits(
+                            RequestFileEditsResult::Success { .. }
+                        )
+                    ));
+
+                    let result_b = action_model
+                        .get_action_result_for_conversation(conversation_b, &action_id)
+                        .expect("conversation B result should not be skipped");
+                    assert!(matches!(
+                        result_b.result,
+                        AIAgentActionResultType::RequestFileEdits(
+                            RequestFileEditsResult::DiffApplicationFailed { .. }
+                        )
+                    ));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_status_is_scoped_by_conversation() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_a = AIConversationId::new();
+            let conversation_b = AIConversationId::new();
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_b,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_a,
+                    successful_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::WaitingForUser));
+                });
+            });
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_b,
+                    failed_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::Rejected));
+                });
+            });
+        });
     }
 }
