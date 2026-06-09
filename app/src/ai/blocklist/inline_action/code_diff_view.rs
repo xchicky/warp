@@ -702,13 +702,33 @@ impl CodeDiffView {
         let conversation_id = model
             .conversation_id(ctx)
             .or(identifiers.client_conversation_id);
-        let initial_state = if action_model.as_ref(ctx).is_view_only() {
-            CodeDiffState::ViewOnly { is_complete: false }
-        } else if model.is_first_action_in_output(action_id, ctx) {
-            CodeDiffState::WaitingForUser
-        } else {
-            CodeDiffState::Queued
-        };
+        let local_direct_file_edit_initial_state = conversation_id.and_then(|conversation_id| {
+            let action_model = action_model.as_ref(ctx);
+            action_model
+                .has_local_direct_file_edit_result(conversation_id, action_id)
+                .then(|| {
+                    action_model.get_action_status_for_conversation(conversation_id, action_id)
+                })
+                .flatten()
+                .and_then(|status| {
+                    if status.is_success() {
+                        Some(CodeDiffState::Accepted(None))
+                    } else if status.is_done() {
+                        Some(CodeDiffState::Rejected)
+                    } else {
+                        None
+                    }
+                })
+        });
+        let initial_state = local_direct_file_edit_initial_state.unwrap_or_else(|| {
+            if action_model.as_ref(ctx).is_view_only() {
+                CodeDiffState::ViewOnly { is_complete: false }
+            } else if model.is_first_action_in_output(action_id, ctx) {
+                CodeDiffState::WaitingForUser
+            } else {
+                CodeDiffState::Queued
+            }
+        });
 
         let view = Self::build(
             action_id,
@@ -3522,6 +3542,106 @@ mod tests {
             app.read(|ctx| {
                 code_diff_view.read(ctx, |view, _| {
                     assert!(matches!(view.state, CodeDiffState::Rejected));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_result_first_success_initializes_accepted() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_id = AIConversationId::new();
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_id,
+                    successful_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_id,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::Accepted(None)));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_result_first_failure_initializes_rejected() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_id = AIConversationId::new();
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_id,
+                    failed_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_id,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::Rejected));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn local_direct_file_edit_result_first_init_is_scoped_by_conversation() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let action_model = create_action_model(&mut app);
+            let action_id = AIAgentActionId::from("apply-file-diff-1".to_string());
+            let conversation_a = AIConversationId::new();
+            let conversation_b = AIConversationId::new();
+
+            action_model.update(&mut app, |action_model, ctx| {
+                action_model.apply_finished_local_direct_file_edit_result(
+                    conversation_a,
+                    successful_file_edit_result(action_id.clone()),
+                    ctx,
+                );
+            });
+
+            let (_, code_diff_view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+                code_diff_view_for_test(
+                    action_id.clone(),
+                    conversation_b,
+                    action_model.clone(),
+                    ctx,
+                )
+            });
+
+            app.read(|ctx| {
+                code_diff_view.read(ctx, |view, _| {
+                    assert!(matches!(view.state, CodeDiffState::WaitingForUser));
                 });
             });
         });
