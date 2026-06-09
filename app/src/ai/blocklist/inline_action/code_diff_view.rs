@@ -1021,6 +1021,11 @@ impl CodeDiffView {
         self.pending_diffs.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn state_for_test(&self) -> &CodeDiffState {
+        &self.state
+    }
+
     /// Returns the number of lines added and removed across all files.
     fn pending_diffs_line_counts(&self, app: &AppContext) -> (usize, usize) {
         let mut total_added = 0;

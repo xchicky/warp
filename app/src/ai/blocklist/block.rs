@@ -2934,18 +2934,37 @@ impl AIBlock {
             executor.register_requested_edits(action_id, &view);
         });
 
+        let (active_shell_launch_data, active_current_working_directory) = {
+            let active_session = self.active_session.as_ref(ctx);
+            (
+                active_session.shell_launch_data(ctx),
+                active_session.current_working_directory().cloned(),
+            )
+        };
+
         // If the diff is being viewed in a shared session (read-only mode), populate diffs from the payload.
         if self.action_model.as_ref(ctx).is_view_only() {
-            let active_session = self.active_session.as_ref(ctx);
             let file_diffs = convert_file_edits_to_file_diffs(
-                file_edits,
-                &active_session.shell_launch_data(ctx),
-                &active_session.current_working_directory().cloned(),
+                file_edits.clone(),
+                &active_shell_launch_data,
+                &active_current_working_directory,
             );
             view.update(ctx, |diff_view, ctx| {
                 diff_view.set_candidate_diffs(file_diffs, ctx);
             });
         }
+        populate_local_direct_completed_file_edit_diffs(
+            &self.action_model,
+            self.client_ids.conversation_id,
+            action_id,
+            &view,
+            file_edits,
+            LocalDirectCompletedFileEditDiffsContext {
+                shell_launch_data: &active_shell_launch_data,
+                current_working_directory: &active_current_working_directory,
+            },
+            ctx,
+        );
 
         let action_id_clone = action_id.clone();
         ctx.subscribe_to_view(&view, move |me, view, event, ctx| {
@@ -3219,6 +3238,21 @@ impl AIBlock {
                     .insert(action_id.clone(), RequestedCommand { view });
             }
         }
+    }
+
+    #[cfg(test)]
+    fn handle_requested_edit_complete_for_test(
+        &mut self,
+        action_id: &AIAgentActionId,
+        file_edits: Vec<FileEdit>,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<CodeDiffView> {
+        self.handle_requested_edit_complete(action_id, &None, file_edits, None, ctx);
+        self.requested_edits
+            .get(action_id)
+            .expect("requested edit view should be registered")
+            .view
+            .clone()
     }
 
     fn handle_requested_command_view_event(
@@ -4023,6 +4057,45 @@ impl AIBlock {
             }
         }
     }
+}
+
+struct LocalDirectCompletedFileEditDiffsContext<'a> {
+    shell_launch_data: &'a Option<ShellLaunchData>,
+    current_working_directory: &'a Option<String>,
+}
+
+fn populate_local_direct_completed_file_edit_diffs<C>(
+    action_model: &ModelHandle<BlocklistAIActionModel>,
+    conversation_id: AIConversationId,
+    action_id: &AIAgentActionId,
+    view: &ViewHandle<CodeDiffView>,
+    file_edits: Vec<FileEdit>,
+    display_context: LocalDirectCompletedFileEditDiffsContext<'_>,
+    ctx: &mut C,
+) where
+    C: warpui::ReadModel + warpui::UpdateView,
+{
+    let should_populate = action_model.read(ctx, |action_model, _| {
+        !action_model.is_view_only()
+            && action_model.has_local_direct_file_edit_result(conversation_id, action_id)
+            && action_model
+                .get_action_status_for_conversation(conversation_id, action_id)
+                .is_some_and(|status| status.is_done())
+    });
+    if !should_populate {
+        return;
+    }
+
+    let file_diffs = convert_file_edits_to_file_diffs(
+        file_edits,
+        display_context.shell_launch_data,
+        display_context.current_working_directory,
+    );
+    view.update(ctx, |diff_view, ctx| {
+        if diff_view.is_pending_diffs_empty() {
+            diff_view.set_candidate_diffs(file_diffs, ctx);
+        }
+    });
 }
 
 impl AIBlock {
