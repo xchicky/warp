@@ -142,16 +142,268 @@ fn classify_git(tokens: &[String]) -> bool {
     let Some(subcommand) = tokens.get(1).map(String::as_str) else {
         return false;
     };
-    if !GIT_ALLOWED_SUBCOMMANDS.contains(&subcommand) {
-        return false;
-    }
-    !tokens.iter().any(|token| {
+    if tokens.iter().any(|token| {
         let token = token.as_str();
         GIT_DENIED_OPTIONS.contains(&token)
             || GIT_DENIED_OPTIONS
                 .iter()
                 .any(|option| token.starts_with(&format!("{option}=")))
-    })
+    }) {
+        return false;
+    }
+
+    let args = &tokens[2..];
+    match subcommand {
+        allowed if GIT_ALLOWED_SUBCOMMANDS.contains(&allowed) => true,
+        "branch" => classify_git_branch(args),
+        "remote" => classify_git_remote(args),
+        "config" => classify_git_config(args),
+        "describe" => classify_git_describe(args),
+        "blame" => classify_git_blame(args),
+        _ => false,
+    }
+}
+
+fn classify_git_branch(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut allow_patterns = false;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if is_git_branch_denied_option(arg) {
+            return false;
+        }
+        match arg {
+            "--list" | "-l" | "--all" | "-a" | "--remotes" | "-r" => {
+                allow_patterns = true;
+                index += 1;
+            }
+            "--show-current" | "--verbose" | "-v" | "-vv" => {
+                index += 1;
+            }
+            "--merged" | "--no-merged" | "--contains" => {
+                allow_patterns = true;
+                index += 1;
+                if args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                    index += 1;
+                }
+            }
+            "--format" | "--sort" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with("--format=") || arg.starts_with("--sort=") => {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ if allow_patterns => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_git_branch_denied_option(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-d" | "-D"
+            | "-m"
+            | "-M"
+            | "-c"
+            | "-C"
+            | "-u"
+            | "--delete"
+            | "--move"
+            | "--copy"
+            | "--set-upstream-to"
+            | "--unset-upstream"
+            | "--edit-description"
+            | "--recurse-submodules"
+    ) || [
+        "--delete=",
+        "--move=",
+        "--copy=",
+        "--set-upstream-to=",
+        "--recurse-submodules=",
+    ]
+    .iter()
+    .any(|prefix| arg.starts_with(prefix))
+}
+
+fn classify_git_remote(args: &[String]) -> bool {
+    match args {
+        [] => true,
+        [arg] => matches!(arg.as_str(), "-v" | "--verbose" | "show"),
+        [subcommand, name] if subcommand == "show" => !name.starts_with('-'),
+        [subcommand, name] if subcommand == "get-url" => !name.starts_with('-'),
+        [subcommand, option, name]
+            if subcommand == "get-url" && matches!(option.as_str(), "--push" | "--all") =>
+        {
+            !name.starts_with('-')
+        }
+        _ => false,
+    }
+}
+
+fn classify_git_config(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut operation: Option<&str> = None;
+    let mut operands = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if is_git_config_denied_option(arg) {
+            return false;
+        }
+        match arg {
+            "--local" | "--global" | "--system" | "--worktree" => {
+                index += 1;
+            }
+            "--file" | "--blob" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with("--file=") || arg.starts_with("--blob=") => {
+                index += 1;
+            }
+            "--get" | "--get-all" | "--get-regexp" => {
+                if operation.replace(arg).is_some() {
+                    return false;
+                }
+                index += 1;
+            }
+            "--list" | "-l" => {
+                if operation.replace(arg).is_some() {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => {
+                operands += 1;
+                index += 1;
+            }
+        }
+    }
+
+    match operation {
+        Some("--get" | "--get-all" | "--get-regexp") => operands == 1,
+        Some("--list" | "-l") => operands == 0,
+        _ => false,
+    }
+}
+
+fn is_git_config_denied_option(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--set"
+            | "--add"
+            | "--replace-all"
+            | "--unset"
+            | "--unset-all"
+            | "--remove-section"
+            | "--rename-section"
+            | "-f"
+    ) || [
+        "--set=",
+        "--add=",
+        "--replace-all=",
+        "--unset=",
+        "--unset-all=",
+        "--remove-section=",
+        "--rename-section=",
+        "-f",
+    ]
+    .iter()
+    .any(|prefix| arg.starts_with(prefix))
+}
+
+fn classify_git_describe(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut revisions = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--tags" | "--always" | "--dirty" | "--long" => {
+                index += 1;
+            }
+            "--abbrev" | "--match" | "--exclude" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with("--abbrev=")
+                || arg.starts_with("--match=")
+                || arg.starts_with("--exclude=") =>
+            {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => {
+                revisions += 1;
+                if revisions > 1 {
+                    return false;
+                }
+                index += 1;
+            }
+        }
+    }
+    true
+}
+
+fn classify_git_blame(args: &[String]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+
+    let mut index = 0;
+    let mut paths = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--contents" || arg.starts_with("--contents=") {
+            return false;
+        }
+        match arg {
+            "--" => {
+                index += 1;
+                if index >= args.len() {
+                    return false;
+                }
+                while index < args.len() {
+                    paths += 1;
+                    index += 1;
+                }
+            }
+            "-L" | "--reverse" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with("-L") && arg.len() > 2 => {
+                index += 1;
+            }
+            "--line-porcelain" | "--porcelain" | "--incremental" | "-w" => {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => {
+                paths += 1;
+                index += 1;
+            }
+        }
+    }
+
+    paths == 1
 }
 
 fn classify_grep_like(tokens: &[String]) -> bool {
@@ -215,6 +467,21 @@ mod tests {
             "git rev-parse --show-toplevel",
             "git ls-files",
             "git grep LocalAgent",
+            "git branch",
+            "git branch --show-current",
+            "git branch --all",
+            "git branch --format='%(refname:short)'",
+            "git remote",
+            "git remote -v",
+            "git remote get-url origin",
+            "git remote show origin",
+            "git config --get user.name",
+            "git config --get-all remote.origin.url",
+            "git config --list",
+            "git describe --tags --always",
+            "git describe HEAD",
+            "git blame -L 1,20 -- app/src/lib.rs",
+            "git blame --line-porcelain app/src/lib.rs",
             "top -l 1 -stats pid,command",
             "top -b -n 1",
         ] {
@@ -243,6 +510,9 @@ mod tests {
             "echo `rm x`",
             "cat <(echo x)",
             "cat >(tee x)",
+            "git branch && rm -rf /",
+            "git remote -v > out",
+            "git describe `rm x`",
         ] {
             assert!(
                 !is_local_autoexecute_safe_command(command),
@@ -276,6 +546,16 @@ mod tests {
             "git -c core.pager=cat status",
             "git status -c core.pager=cat",
             "git log --config-env=foo=bar",
+            "git branch -d old",
+            "git branch -m old new",
+            "git branch --set-upstream-to origin/main",
+            "git remote add origin https://example.com/repo.git",
+            "git remote set-url origin https://example.com/repo.git",
+            "git remote update",
+            "git config user.name value",
+            "git config --add alias.x y",
+            "git config --unset user.name",
+            "git blame --contents other-file app/src/lib.rs",
             "tree -o out.txt .",
             "tree --output out.txt .",
             "tree --output=out.txt .",
