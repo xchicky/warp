@@ -7472,6 +7472,9 @@ mod tests {
         let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
         let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
         let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
         let suggestions = Arc::new(Mutex::new(HashSet::new()));
         let temp_dir = tempfile::tempdir().unwrap();
         let file = temp_dir.path().join("target.txt");
@@ -7513,6 +7516,16 @@ mod tests {
         );
         assert!(todo.text.contains("unavailable in plan mode"));
         assert!(todo.todo_operations.is_empty());
+
+        let shell = execute_local_tool_with_policy(
+            &tool_call("run_shell_command", r#"{"command":"git branch"}"#),
+            Some(temp_dir.path()),
+            &suggestions,
+            None,
+            LocalToolPolicy::Plan,
+        );
+        assert!(!shell.pending_tool_call);
+        assert!(shell.text.contains("unavailable in plan mode"));
     }
 
     #[test]
@@ -8363,6 +8376,80 @@ mod tests {
 
     #[test]
     #[serial]
+    fn run_shell_command_tool_card_marks_new_git_allowlist_command_when_flag_enabled() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"git branch --show-current","is_read_only":false,"is_risky":true,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(command.command, "git branch --show-current");
+        assert!(command.is_read_only);
+        assert!(!command.is_risky);
+        assert!(take_local_autoexecute_safe_tool_call(
+            "task",
+            "request",
+            &call.tool_call_id,
+            &command.command
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn run_shell_command_tool_card_does_not_mark_new_git_allowlist_when_flag_disabled() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(false);
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"git branch --show-current","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(command.command, "git branch --show-current");
+        assert!(!command.is_read_only);
+        assert!(command.is_risky);
+        assert!(!take_local_autoexecute_safe_tool_call(
+            "task",
+            "request",
+            &call.tool_call_id,
+            &command.command
+        ));
+    }
+
+    #[test]
+    #[serial]
     fn run_shell_command_tool_card_converts_to_local_static_safe_action() {
         let _autoexecute_flag =
             FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
@@ -8478,36 +8565,40 @@ mod tests {
     fn run_shell_command_tool_card_ignores_model_claim_for_unsafe_command() {
         let _autoexecute_flag =
             FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
-        let tool_call = tool_call(
-            "run_shell_command",
-            r#"{"command":"rm file","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
-        );
+        for command_text in ["rm file", "git remote update"] {
+            let tool_call = tool_call(
+                "run_shell_command",
+                &format!(
+                    r#"{{"command":"{command_text}","is_read_only":true,"is_risky":false,"uses_pager":false}}"#
+                ),
+            );
 
-        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
-        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
-            panic!("expected client actions");
-        };
-        let api::client_action::Action::AddMessagesToTask(add) =
-            actions.actions[0].action.as_ref().unwrap()
-        else {
-            panic!("expected add message");
-        };
-        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
-            panic!("expected tool call");
-        };
-        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
-            panic!("expected run shell command");
-        };
+            let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+            let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+                panic!("expected client actions");
+            };
+            let api::client_action::Action::AddMessagesToTask(add) =
+                actions.actions[0].action.as_ref().unwrap()
+            else {
+                panic!("expected add message");
+            };
+            let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+                panic!("expected tool call");
+            };
+            let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+                panic!("expected run shell command");
+            };
 
-        assert_eq!(command.command, "rm file");
-        assert!(!command.is_read_only);
-        assert!(command.is_risky);
-        assert!(!take_local_autoexecute_safe_tool_call(
-            "task",
-            "request",
-            &call.tool_call_id,
-            &command.command
-        ));
+            assert_eq!(command.command, command_text);
+            assert!(!command.is_read_only);
+            assert!(command.is_risky);
+            assert!(!take_local_autoexecute_safe_tool_call(
+                "task",
+                "request",
+                &call.tool_call_id,
+                &command.command
+            ));
+        }
     }
 
     #[test]

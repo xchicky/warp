@@ -698,6 +698,11 @@ fn test_can_autoexecute_local_static_safe_command_denylist_precedence() {
                 &AgentModeCommandExecutionPredicate::new_regex("pwd").unwrap(),
                 ctx,
             );
+            model.add_to_command_denylist(
+                *model.active_profile(Some(terminal_view_id), ctx).id(),
+                &AgentModeCommandExecutionPredicate::new_regex("^git branch$").unwrap(),
+                ctx,
+            );
         });
 
         permissions.read(&app, |model, ctx| {
@@ -718,6 +723,34 @@ fn test_can_autoexecute_local_static_safe_command_denylist_precedence() {
             let result = model.can_autoexecute_local_static_safe_command(
                 &convo_id,
                 "ls",
+                EscapeChar::Backslash,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Allowed(
+                    CommandExecutionPermissionAllowedReason::LocalStaticSafeCommand
+                )
+            ));
+
+            let result = model.can_autoexecute_local_static_safe_command(
+                &convo_id,
+                "git branch",
+                EscapeChar::Backslash,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Denied(
+                    CommandExecutionPermissionDeniedReason::ExplicitlyDenylisted
+                )
+            ));
+
+            let result = model.can_autoexecute_local_static_safe_command(
+                &convo_id,
+                "git status",
                 EscapeChar::Backslash,
                 Some(terminal_view_id),
                 ctx,
