@@ -703,6 +703,11 @@ fn test_can_autoexecute_local_static_safe_command_denylist_precedence() {
                 &AgentModeCommandExecutionPredicate::new_regex("^git branch$").unwrap(),
                 ctx,
             );
+            model.add_to_command_denylist(
+                *model.active_profile(Some(terminal_view_id), ctx).id(),
+                &AgentModeCommandExecutionPredicate::new_regex("^jq \\. package\\.json$").unwrap(),
+                ctx,
+            );
         });
 
         permissions.read(&app, |model, ctx| {
@@ -759,6 +764,20 @@ fn test_can_autoexecute_local_static_safe_command_denylist_precedence() {
                 result,
                 CommandExecutionPermission::Allowed(
                     CommandExecutionPermissionAllowedReason::LocalStaticSafeCommand
+                )
+            ));
+
+            let result = model.can_autoexecute_local_static_safe_command(
+                &convo_id,
+                "jq . package.json",
+                EscapeChar::Backslash,
+                Some(terminal_view_id),
+                ctx,
+            );
+            assert!(matches!(
+                result,
+                CommandExecutionPermission::Denied(
+                    CommandExecutionPermissionDeniedReason::ExplicitlyDenylisted
                 )
             ));
         });

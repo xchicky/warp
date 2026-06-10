@@ -7518,7 +7518,7 @@ mod tests {
         assert!(todo.todo_operations.is_empty());
 
         let shell = execute_local_tool_with_policy(
-            &tool_call("run_shell_command", r#"{"command":"git branch"}"#),
+            &tool_call("run_shell_command", r#"{"command":"jq . package.json"}"#),
             Some(temp_dir.path()),
             &suggestions,
             None,
@@ -8413,12 +8413,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn run_shell_command_tool_card_does_not_mark_new_git_allowlist_when_flag_disabled() {
+    fn run_shell_command_tool_card_marks_new_m83_allowlist_command_when_flag_enabled() {
         let _autoexecute_flag =
-            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(false);
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
         let tool_call = tool_call(
             "run_shell_command",
-            r#"{"command":"git branch --show-current","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
+            r#"{"command":"jq . package.json","is_read_only":false,"is_risky":true,"uses_pager":false}"#,
         );
 
         let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
@@ -8437,7 +8437,44 @@ mod tests {
             panic!("expected run shell command");
         };
 
-        assert_eq!(command.command, "git branch --show-current");
+        assert_eq!(command.command, "jq . package.json");
+        assert!(command.is_read_only);
+        assert!(!command.is_risky);
+        assert!(take_local_autoexecute_safe_tool_call(
+            "task",
+            "request",
+            &call.tool_call_id,
+            &command.command
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn run_shell_command_tool_card_does_not_mark_new_m83_allowlist_when_flag_disabled() {
+        let _autoexecute_flag =
+            FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(false);
+        let tool_call = tool_call(
+            "run_shell_command",
+            r#"{"command":"jq . package.json","is_read_only":true,"is_risky":false,"uses_pager":false}"#,
+        );
+
+        let event = structured_tool_call_event("task", "request", &tool_call).unwrap();
+        let api::response_event::Type::ClientActions(actions) = event.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let api::client_action::Action::AddMessagesToTask(add) =
+            actions.actions[0].action.as_ref().unwrap()
+        else {
+            panic!("expected add message");
+        };
+        let Some(api::message::Message::ToolCall(call)) = &add.messages[0].message else {
+            panic!("expected tool call");
+        };
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = &call.tool else {
+            panic!("expected run shell command");
+        };
+
+        assert_eq!(command.command, "jq . package.json");
         assert!(!command.is_read_only);
         assert!(command.is_risky);
         assert!(!take_local_autoexecute_safe_tool_call(
@@ -8565,7 +8602,7 @@ mod tests {
     fn run_shell_command_tool_card_ignores_model_claim_for_unsafe_command() {
         let _autoexecute_flag =
             FeatureFlag::LocalAgentAutoExecuteSafeCommands.override_enabled(true);
-        for command_text in ["rm file", "git remote update"] {
+        for command_text in ["rm file", "git remote update", "docker run hello-world"] {
             let tool_call = tool_call(
                 "run_shell_command",
                 &format!(

@@ -118,6 +118,13 @@ fn classify_tokens(tokens: &[String]) -> bool {
     }
     match command {
         "command" => matches!(tokens.get(1).map(String::as_str), Some("-v")) && tokens.len() >= 3,
+        "jq" => classify_jq(&tokens[1..]),
+        "yq" => classify_yq(&tokens[1..]),
+        "env" => classify_env(&tokens[1..]),
+        "printenv" => classify_printenv(&tokens[1..]),
+        "tmux" => classify_tmux(&tokens[1..]),
+        "docker" => classify_docker(&tokens[1..]),
+        "kubectl" => classify_kubectl(&tokens[1..]),
         "git" => classify_git(tokens),
         "top" => classify_top(tokens),
         "tree" => classify_tree(tokens),
@@ -127,6 +134,293 @@ fn classify_tokens(tokens: &[String]) -> bool {
         "grep" | "rg" => classify_grep_like(tokens),
         allowed => DIRECTLY_ALLOWED_COMMANDS.contains(&allowed),
     }
+}
+
+fn classify_jq(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut operands = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(
+            arg,
+            "-i" | "--in-place"
+                | "-f"
+                | "--from-file"
+                | "--rcfile"
+                | "--slurpfile"
+                | "--rawfile"
+                | "--run-tests"
+        ) {
+            return false;
+        }
+        match arg {
+            "-r" | "--raw-output" | "-c" | "--compact-output" | "-s" | "--slurp" | "-n"
+            | "--null-input" => {
+                index += 1;
+            }
+            "--arg" | "--argjson" => {
+                index += 1;
+                let Some(name) = args.get(index) else {
+                    return false;
+                };
+                if !is_environment_variable_name(name) {
+                    return false;
+                }
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => {
+                operands += 1;
+                index += 1;
+            }
+        }
+    }
+    operands >= 1
+}
+
+fn classify_yq(args: &[String]) -> bool {
+    let args = match args {
+        [subcommand, rest @ ..] if matches!(subcommand.as_str(), "eval" | "e") => rest,
+        [subcommand, ..] if is_yq_known_subcommand(subcommand) => return false,
+        _ => args,
+    };
+
+    let mut index = 0;
+    let mut operands = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(
+            arg,
+            "-i" | "--inplace" | "--from-file" | "-f" | "--split-exp"
+        ) {
+            return false;
+        }
+        match arg {
+            "-r" | "--unwrapScalar" | "-N" | "--no-doc" => {
+                index += 1;
+            }
+            "-o" | "--output-format" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ if arg.starts_with("-o=") || arg.starts_with("--output-format=") => {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => {
+                operands += 1;
+                index += 1;
+            }
+        }
+    }
+    operands >= 1
+}
+
+fn is_yq_known_subcommand(command: &str) -> bool {
+    matches!(
+        command,
+        "eval-all"
+            | "ea"
+            | "write"
+            | "w"
+            | "read"
+            | "r"
+            | "delete"
+            | "d"
+            | "merge"
+            | "m"
+            | "new"
+            | "n"
+            | "shell-completion"
+    )
+}
+
+fn classify_env(args: &[String]) -> bool {
+    args.iter().all(|arg| arg == "--null")
+}
+
+fn classify_printenv(args: &[String]) -> bool {
+    args.iter().all(|arg| {
+        let arg = arg.as_str();
+        matches!(arg, "--null" | "-0")
+            || (!arg.starts_with('-') && is_environment_variable_name(arg))
+    })
+}
+
+fn is_environment_variable_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn classify_tmux(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+    let args = &args[1..];
+    match subcommand {
+        "list-sessions" | "ls" | "list-windows" | "list-panes" => classify_tmux_list(args),
+        "display-message" => classify_tmux_display_message(args),
+        _ => false,
+    }
+}
+
+fn classify_tmux_list(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-a" => {
+                index += 1;
+            }
+            "-t" | "-F" | "-f" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn classify_tmux_display_message(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut print = false;
+    let mut format_operands = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-p" => {
+                print = true;
+                index += 1;
+            }
+            "-t" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            arg if arg.starts_with('-') => return false,
+            _ => {
+                format_operands += 1;
+                index += 1;
+            }
+        }
+    }
+    print && format_operands <= 1
+}
+
+fn classify_docker(args: &[String]) -> bool {
+    match args {
+        [subcommand, rest @ ..] if subcommand == "ps" || subcommand == "images" => {
+            classify_docker_list(rest)
+        }
+        [group, subcommand, rest @ ..] if group == "image" && subcommand == "ls" => {
+            classify_docker_list(rest)
+        }
+        _ => false,
+    }
+}
+
+fn classify_docker_list(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-a" | "--all" | "--no-trunc" | "-q" | "--quiet" => {
+                index += 1;
+            }
+            "-f" | "--filter" | "--format" => {
+                index += 1;
+                if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+                index += 1;
+            }
+            arg if arg.starts_with("--filter=") || arg.starts_with("--format=") => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn classify_kubectl(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+    let args = &args[1..];
+    match subcommand {
+        "get" | "describe" => classify_kubectl_inspect(args),
+        "version" => args.is_empty() || args.iter().all(|arg| arg == "--client"),
+        "cluster-info" => args.is_empty(),
+        "config" => classify_kubectl_config(args),
+        _ => false,
+    }
+}
+
+fn classify_kubectl_inspect(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut operands = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-A" | "--all-namespaces" => {
+                index += 1;
+            }
+            "-n" | "--namespace" | "-o" | "--output" => {
+                let is_output = matches!(args[index].as_str(), "-o" | "--output");
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return false;
+                };
+                if value.starts_with('-') || (is_output && !is_kubectl_output_format(value)) {
+                    return false;
+                }
+                index += 1;
+            }
+            arg if arg.starts_with("--namespace=") => {
+                index += 1;
+            }
+            arg if arg.starts_with("--output=") => {
+                let Some((_, value)) = arg.split_once('=') else {
+                    return false;
+                };
+                if !is_kubectl_output_format(value) {
+                    return false;
+                }
+                index += 1;
+            }
+            arg if arg.starts_with('-') => return false,
+            _ => {
+                operands += 1;
+                index += 1;
+            }
+        }
+    }
+    operands >= 1
+}
+
+fn is_kubectl_output_format(value: &str) -> bool {
+    matches!(value, "wide" | "yaml" | "json" | "name")
+}
+
+fn classify_kubectl_config(args: &[String]) -> bool {
+    matches!(
+        args,
+        [subcommand] if matches!(subcommand.as_str(), "view" | "current-context" | "get-contexts")
+    )
 }
 
 fn classify_tree(tokens: &[String]) -> bool {
@@ -482,6 +776,28 @@ mod tests {
             "git describe HEAD",
             "git blame -L 1,20 -- app/src/lib.rs",
             "git blame --line-porcelain app/src/lib.rs",
+            "jq . package.json",
+            "jq -r '.name' package.json",
+            "jq --arg name Warp '.name = $name' package.json",
+            "yq . config.yml",
+            "yq eval '.metadata.name' manifest.yml",
+            "yq -o=json '.' manifest.yml",
+            "env",
+            "env --null",
+            "printenv",
+            "printenv PATH",
+            "printenv --null",
+            "tmux list-sessions",
+            "tmux list-panes -a",
+            "tmux display-message -p '#S'",
+            "docker ps",
+            "docker ps -a",
+            "docker images",
+            "docker image ls",
+            "kubectl get pods",
+            "kubectl describe pod app",
+            "kubectl version --client",
+            "kubectl config view",
             "top -l 1 -stats pid,command",
             "top -b -n 1",
         ] {
@@ -513,6 +829,9 @@ mod tests {
             "git branch && rm -rf /",
             "git remote -v > out",
             "git describe `rm x`",
+            "jq . package.json > out",
+            "docker ps && docker rm app",
+            "kubectl get pods | tee out",
         ] {
             assert!(
                 !is_local_autoexecute_safe_command(command),
@@ -556,6 +875,33 @@ mod tests {
             "git config --add alias.x y",
             "git config --unset user.name",
             "git blame --contents other-file app/src/lib.rs",
+            "jq -i '.x=1' file.json",
+            "jq -f filter.jq file.json",
+            "jq --rawfile extra ../../secret.txt '.x' file.json",
+            "yq -i '.x=1' config.yml",
+            "yq --from-file expression.yq config.yml",
+            "python -m yq '.x' config.yml",
+            "env PATH HOME",
+            "env true",
+            "env sh",
+            "env python",
+            "env VAR=value",
+            "env VAR=value printenv",
+            "env -i",
+            "env --unset=PATH",
+            "printenv --unknown",
+            "tmux attach",
+            "tmux kill-session",
+            "tmux send-keys ls Enter",
+            "docker run hello-world",
+            "docker exec app sh",
+            "docker pull alpine",
+            "docker logs app",
+            "kubectl apply -f deploy.yml",
+            "kubectl delete pod app",
+            "kubectl exec pod -- sh",
+            "kubectl port-forward pod/app 8080:80",
+            "kubectl config set-context prod",
             "tree -o out.txt .",
             "tree --output out.txt .",
             "tree --output=out.txt .",
