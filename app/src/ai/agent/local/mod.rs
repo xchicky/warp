@@ -7975,6 +7975,147 @@ mod tests {
     }
 
     #[test]
+    fn harness_plan_state_advertises_only_plan_tools() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+
+        let tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Plan);
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(tool_names.contains(&"exit_plan_mode"));
+        assert!(tool_names.contains(&"spawn_subagent"));
+        assert!(!tool_names.contains(&"apply_file_diff"));
+        assert!(!tool_names.contains(&"write_file"));
+        assert!(!tool_names.contains(&"edit_file"));
+        assert!(!tool_names.contains(&"run_shell_command"));
+    }
+
+    #[test]
+    fn harness_approved_implementation_state_advertises_normal_tools() {
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+
+        let tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Normal);
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(tool_names.contains(&"apply_file_diff"));
+        assert!(tool_names.contains(&"write_file"));
+        assert!(tool_names.contains(&"run_shell_command"));
+        assert!(!tool_names.contains(&"exit_plan_mode"));
+    }
+
+    #[test]
+    fn harness_approved_implementation_request_contains_plan_instruction() {
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let approved_plan = "1. Create src/lib.rs\n2. Add tests";
+        let query = format!(
+            "Implement the approved plan below by directly invoking the available file and shell tools (apply_file_diff, write_file, edit_file, run_shell_command) when work needs to be done. Do NOT instruct the user to manually create or modify files; if a file needs to be created or changed, call the appropriate tool yourself. Continue executing the plan to completion through all steps without pausing to ask the user for intermediate confirmation. Tool calls themselves will trigger any required user approvals separately. Only stop early if a step is unsafe or impossible due to new information that contradicts the approved plan; in that case explain the issue before making further changes.\nDo not call spawn_subagent or start a nested plan-mode flow for this implementation unless the user explicitly asks for that in a later message.\n\n{}",
+            approved_plan
+        );
+        let input = user_query_input(&query, Vec::new(), HashMap::new());
+        let messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[input],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+        let user_message = messages.last().unwrap();
+
+        assert_eq!(user_message.role, "user");
+        assert!(user_message
+            .content
+            .as_str()
+            .contains("Implement the approved plan"));
+        assert!(user_message
+            .content
+            .as_str()
+            .contains("1. Create src/lib.rs"));
+    }
+
+    #[test]
+    fn harness_action_result_resume_produces_tool_messages_without_user_query() {
+        let action_result = completed_shell_action_result("ls -la", "total 42\n", Vec::new());
+        let messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[action_result],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+
+        assert!(messages.len() >= 2);
+        let has_tool_message = messages
+            .iter()
+            .any(|m| m.role == "tool" && m.content.as_str().contains("ls -la"));
+        assert!(
+            has_tool_message,
+            "action result resume must include tool message"
+        );
+        let has_user_message = messages.iter().any(|m| m.role == "user");
+        assert!(
+            !has_user_message,
+            "action result resume should not have user message"
+        );
+    }
+
+    #[test]
+    fn harness_follow_up_request_uses_normal_policy_with_history() {
+        let _file_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _shell_flag = FeatureFlag::LocalAgentShellExecution.override_enabled(true);
+        let input = user_query_input("now fix the test", Vec::new(), HashMap::new());
+        let messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[input],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+        let system_prompt = system_prompt_text(&messages);
+
+        assert!(!system_prompt.contains("You are in plan mode"));
+        assert!(!system_prompt.contains("exit_plan_mode"));
+        assert!(system_prompt.contains("Most local tools are read-only"));
+        let user_message = messages.last().unwrap();
+        assert_eq!(user_message.role, "user");
+        assert!(user_message.content.as_str().contains("now fix the test"));
+    }
+
+    #[test]
+    fn harness_mcp_action_result_resume_produces_tool_message() {
+        let action_result = completed_mcp_action_result();
+        let messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[action_result],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+
+        let has_tool_message = messages.iter().any(|m| m.role == "tool");
+        assert!(
+            has_tool_message,
+            "MCP action result must produce tool message"
+        );
+        let has_user_message = messages.iter().any(|m| m.role == "user");
+        assert!(
+            !has_user_message,
+            "MCP action result resume should not have user message"
+        );
+    }
+
+    #[test]
     fn local_plan_mode_system_prompt_is_injected() {
         let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
         let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
