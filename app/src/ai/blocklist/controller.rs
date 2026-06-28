@@ -995,14 +995,27 @@ pub struct SessionContext {
     session_type: Option<SessionType>,
     shell: Option<ShellLaunchData>,
     current_working_directory: Option<String>,
+    ssh_remote_host: Option<String>,
+    tty: Option<bool>,
 }
 
 impl SessionContext {
     pub fn from_session(session: &ActiveSession, app: &AppContext) -> Self {
+        let active_session = session.session(app);
+        let session_type = active_session
+            .as_ref()
+            .map(|session| session.session_type());
+        let ssh_remote_host = active_session
+            .as_ref()
+            .filter(|session| !session.is_local())
+            .map(|session| session.hostname().to_owned())
+            .filter(|hostname| !hostname.is_empty());
         SessionContext {
-            session_type: session.session_type(app),
+            session_type,
             shell: session.shell_launch_data(app),
             current_working_directory: session.current_working_directory().cloned(),
+            ssh_remote_host,
+            tty: active_session.as_ref().map(|_| true),
         }
     }
 
@@ -1016,6 +1029,14 @@ impl SessionContext {
 
     pub fn current_working_directory(&self) -> &Option<String> {
         &self.current_working_directory
+    }
+
+    pub fn ssh_remote_host(&self) -> &Option<String> {
+        &self.ssh_remote_host
+    }
+
+    pub fn tty(&self) -> Option<bool> {
+        self.tty
     }
 
     /// Returns the remote host ID if this is a `WarpifiedRemote` session with
@@ -1039,12 +1060,26 @@ impl SessionContext {
             session_type: None,
             shell: None,
             current_working_directory: None,
+            ssh_remote_host: None,
+            tty: None,
         }
     }
 
     #[cfg(test)]
     pub fn with_session_type_for_test(mut self, session_type: Option<SessionType>) -> Self {
         self.session_type = session_type;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_ssh_remote_host_for_test(mut self, ssh_remote_host: Option<String>) -> Self {
+        self.ssh_remote_host = ssh_remote_host;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_tty_for_test(mut self, tty: Option<bool>) -> Self {
+        self.tty = tty;
         self
     }
 }

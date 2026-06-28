@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use ai::skills::{parse_skill, ParsedSkill, SkillProvider, SkillScope};
@@ -379,7 +378,9 @@ mod tests {
         );
         let skill = parse_skill(&skill_path).unwrap();
         let input = AIAgentInput::InvokeSkill {
-            context: Arc::from(Vec::<crate::ai::agent::AIAgentContext>::new().into_boxed_slice()),
+            context: std::sync::Arc::from(
+                Vec::<crate::ai::agent::AIAgentContext>::new().into_boxed_slice(),
+            ),
             skill,
             user_query: Some(crate::ai::agent::InvokeSkillUserQuery {
                 query: "inspect failing test".to_string(),

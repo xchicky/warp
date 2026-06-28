@@ -104,6 +104,7 @@ fn ssh_aware_local_tools_runtime_context_local_session() {
         local_tool_runtime_context_for_session(&context),
         LocalToolRuntimeContext {
             session_is_local: Some(true),
+            ..Default::default()
         }
     );
 }
@@ -111,12 +112,17 @@ fn ssh_aware_local_tools_runtime_context_local_session() {
 #[test]
 fn ssh_aware_local_tools_runtime_context_warpified_remote_session() {
     let context = SessionContext::new_for_test()
-        .with_session_type_for_test(Some(SessionType::WarpifiedRemote { host_id: None }));
+        .with_session_type_for_test(Some(SessionType::WarpifiedRemote { host_id: None }))
+        .with_ssh_remote_host_for_test(Some("build-host".to_string()))
+        .with_tty_for_test(Some(true));
 
     assert_eq!(
         local_tool_runtime_context_for_session(&context),
         LocalToolRuntimeContext {
             session_is_local: Some(false),
+            ssh_remote_host: Some("build-host".to_string()),
+            tty: Some(true),
+            ..Default::default()
         }
     );
 }
@@ -129,6 +135,7 @@ fn ssh_aware_local_tools_runtime_context_unknown_session() {
         local_tool_runtime_context_for_session(&context),
         LocalToolRuntimeContext {
             session_is_local: None,
+            ..Default::default()
         }
     );
 }

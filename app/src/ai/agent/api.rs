@@ -154,12 +154,21 @@ pub(crate) fn local_tool_runtime_context_for_session(
 ) -> LocalToolRuntimeContext {
     use crate::terminal::model::session::SessionType;
 
+    let session_is_local = match session_context.session_type() {
+        Some(SessionType::Local) => Some(true),
+        Some(SessionType::WarpifiedRemote { .. }) => Some(false),
+        None => None,
+    };
+
     LocalToolRuntimeContext {
-        session_is_local: match session_context.session_type() {
-            Some(SessionType::Local) => Some(true),
-            Some(SessionType::WarpifiedRemote { .. }) => Some(false),
-            None => None,
-        },
+        session_is_local,
+        ssh_remote_host: session_context
+            .ssh_remote_host()
+            .as_ref()
+            .filter(|_| session_is_local == Some(false))
+            .cloned(),
+        tty: session_context.tty(),
+        git_modified_files_count: None,
     }
 }
 
