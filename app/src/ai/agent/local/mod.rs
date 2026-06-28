@@ -1574,21 +1574,12 @@ fn local_system_prompt_layers(
         if FeatureFlag::LocalAgentCodebaseIndex.is_enabled() {
             push_prompt_section(&mut capability, LOCAL_DIRECT_CODEBASE_INDEX_PROMPT);
         }
-        if let Some(todo_context) = local_plan_mode_todo_context(tasks) {
-            push_prompt_section(&mut capability, &todo_context);
-        }
     } else {
         if FeatureFlag::LocalAgentTodoWrite.is_enabled() {
             push_prompt_section(&mut capability, LOCAL_DIRECT_TODO_WRITE_PROMPT);
         }
         if FeatureFlag::LocalAgentCodebaseIndex.is_enabled() {
             push_prompt_section(&mut capability, LOCAL_DIRECT_CODEBASE_INDEX_PROMPT);
-        }
-        if FeatureFlag::LocalAgentSkills.is_enabled() {
-            let cwd = local_tool_cwd(input);
-            if let Some(skill_context) = local_skill_metadata_context(cwd.as_deref()) {
-                push_prompt_section(&mut capability, &skill_context);
-            }
         }
     }
 
@@ -1612,6 +1603,10 @@ fn local_system_prompt_layers(
         LocalPromptLayer {
             name: "Dynamic Environment Context",
             body: LocalEnvironmentContext::from_inputs(input, runtime_context).render(),
+        },
+        LocalPromptLayer {
+            name: "Dynamic Session Context",
+            body: local_dynamic_session_context(input, tasks, tool_policy),
         },
         LocalPromptLayer {
             name: "Current Turn",
@@ -1798,6 +1793,27 @@ fn truncate_environment_value(value: &str, max_chars: usize) -> String {
         .take(max_chars.saturating_sub(1))
         .collect::<String>();
     format!("{truncated}…")
+}
+
+fn local_dynamic_session_context(
+    input: &[AIAgentInput],
+    tasks: &[api::Task],
+    tool_policy: LocalToolPolicy,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    if tool_policy.is_plan() {
+        if let Some(todo_context) = local_plan_mode_todo_context(tasks) {
+            sections.push(todo_context);
+        }
+    } else if FeatureFlag::LocalAgentSkills.is_enabled() {
+        let cwd = local_tool_cwd(input);
+        if let Some(skill_context) = local_skill_metadata_context(cwd.as_deref()) {
+            sections.push(skill_context);
+        }
+    }
+
+    sections.join("\n\n")
 }
 
 fn render_local_system_prompt(layers: &[LocalPromptLayer]) -> String {
@@ -5876,6 +5892,7 @@ mod tests {
             "## Safety Boundaries",
             "## Tool Catalog",
             "## Dynamic Environment Context",
+            "## Dynamic Session Context",
             "## Current Turn",
         ] {
             let index = system_prompt
@@ -7770,6 +7787,191 @@ mod tests {
         assert!(!first_static_prefix.contains("/tmp/warp-m9-secret"));
         assert!(!first_static_prefix.contains("User message:"));
         assert!(!first_static_prefix.contains("Current todo list snapshot"));
+    }
+
+    #[test]
+    fn local_stable_prefix_unchanged_with_skills_and_todos() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(false);
+        let _skills_flag = FeatureFlag::LocalAgentSkills.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let mut first_input = local_environment_context_input("first query");
+        let mut second_input = local_environment_context_input("second query");
+        let AIAgentInput::UserQuery {
+            context: first_context,
+            ..
+        } = &mut first_input
+        else {
+            panic!("expected user query");
+        };
+        let AIAgentInput::UserQuery {
+            context: second_context,
+            ..
+        } = &mut second_input
+        else {
+            panic!("expected user query");
+        };
+        *first_context = Arc::from(
+            vec![
+                AIAgentContext::Directory {
+                    pwd: Some("/workspace/alpha".to_string()),
+                    home_dir: None,
+                    are_file_symbols_indexed: false,
+                },
+                AIAgentContext::Git {
+                    head: "abc1234".to_string(),
+                    branch: Some("feature-a".to_string()),
+                },
+                AIAgentContext::CurrentTime {
+                    current_time: Local.with_ymd_and_hms(2026, 6, 10, 9, 0, 0).unwrap(),
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        *second_context = Arc::from(
+            vec![
+                AIAgentContext::Directory {
+                    pwd: Some("/workspace/beta".to_string()),
+                    home_dir: None,
+                    are_file_symbols_indexed: false,
+                },
+                AIAgentContext::Git {
+                    head: "def5678".to_string(),
+                    branch: Some("feature-b".to_string()),
+                },
+                AIAgentContext::CurrentTime {
+                    current_time: Local.with_ymd_and_hms(2026, 6, 10, 15, 30, 0).unwrap(),
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        let first_prompt = local_environment_system_prompt(
+            first_input,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        );
+        let second_prompt = local_environment_system_prompt(
+            second_input,
+            LocalToolPolicy::Normal,
+            &local_environment_runtime_context(),
+        );
+        let first_prefix = first_prompt
+            .split("## Dynamic Environment Context")
+            .next()
+            .unwrap();
+        let second_prefix = second_prompt
+            .split("## Dynamic Environment Context")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            first_prefix, second_prefix,
+            "stable prefix must be byte-identical when only cwd/branch/time differ"
+        );
+    }
+
+    #[test]
+    fn local_plan_mode_stable_prefix_unchanged_with_different_todos() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _codebase_flag = FeatureFlag::LocalAgentCodebaseIndex.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let mut first_input = local_environment_context_input("plan something");
+        let AIAgentInput::UserQuery {
+            user_query_mode: first_mode,
+            ..
+        } = &mut first_input
+        else {
+            panic!("expected user query");
+        };
+        *first_mode = UserQueryMode::Plan;
+        let mut second_input = local_environment_context_input("plan something else");
+        let AIAgentInput::UserQuery {
+            user_query_mode: second_mode,
+            ..
+        } = &mut second_input
+        else {
+            panic!("expected user query");
+        };
+        *second_mode = UserQueryMode::Plan;
+        let first_messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[first_input],
+            &[],
+            None,
+            true,
+            LocalToolPolicy::Plan,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+        let todos = vec![api::TodoItem {
+            id: "1".to_string(),
+            title: "Step one".to_string(),
+            description: String::new(),
+        }];
+        let second_messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[second_input],
+            &[task_with_todo_list(todos)],
+            None,
+            true,
+            LocalToolPolicy::Plan,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+        let first_prefix = system_prompt_text(&first_messages)
+            .split("## Dynamic Environment Context")
+            .next()
+            .unwrap()
+            .to_string();
+        let second_prefix = system_prompt_text(&second_messages)
+            .split("## Dynamic Environment Context")
+            .next()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            first_prefix, second_prefix,
+            "plan mode stable prefix must not change with todo state"
+        );
+    }
+
+    #[test]
+    fn local_dynamic_session_context_contains_todo_in_plan_mode() {
+        let _plan_flag = FeatureFlag::LocalAgentPlanMode.override_enabled(true);
+        let _todo_flag = FeatureFlag::LocalAgentTodoWrite.override_enabled(true);
+        let mut input = local_environment_context_input("plan the change");
+        let AIAgentInput::UserQuery {
+            user_query_mode, ..
+        } = &mut input
+        else {
+            panic!("expected user query");
+        };
+        *user_query_mode = UserQueryMode::Plan;
+        let todos = vec![
+            api::TodoItem {
+                id: "1".to_string(),
+                title: "Step one".to_string(),
+                description: String::new(),
+            },
+            api::TodoItem {
+                id: "2".to_string(),
+                title: "Step two".to_string(),
+                description: String::new(),
+            },
+        ];
+        let messages = openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+            &[input],
+            &[task_with_todo_list(todos)],
+            None,
+            true,
+            LocalToolPolicy::Plan,
+            &local_environment_runtime_context(),
+        )
+        .unwrap();
+        let system_prompt = system_prompt_text(&messages);
+        let session_context = prompt_layer_body(system_prompt, "Dynamic Session Context");
+
+        assert!(session_context.contains("todo list"));
+        assert!(session_context.contains("Step one"));
+        assert!(session_context.contains("Step two"));
     }
 
     #[test]
