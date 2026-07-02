@@ -48,6 +48,8 @@ Primary docs consulted:
 
 ### M9.1 Layered Prompt Base
 
+**Status: Merged — PR #68 (2026-06-27)**
+
 Introduce a small local request-layer abstraction inside `app/src/ai/agent/local/mod.rs`, not a new prompt framework. The target shape is:
 
 1. Stable base instructions.
@@ -79,6 +81,8 @@ Trace/e2e:
 - PR description must include a request-body trace showing the system message layer order in normal mode and plan mode, or a local mocked provider capture that records the serialized OpenAI request body.
 
 ### M9.2 Environment Context Block
+
+**Status: Merged — PR #70 (2026-06-28)**
 
 Add a bounded `AIAgentContext::Environment` variant or a private local-agent environment render helper. Prefer a new context variant if the same data should survive through history/task conversion; prefer a private helper if the data can be derived at request-build time without persistence. The implementation should decide after checking proto/persistence impact, but the rendered provider text must be one labeled block.
 
@@ -127,6 +131,8 @@ Trace/e2e:
 
 ### M9.3 Cache-Friendly Ordering and Telemetry
 
+**Status: Merged — PR #71 (2026-07-02)**
+
 M9.3 should not add correctness dependence on prompt caching. It only makes the OpenAI-compatible request more cache-friendly and records provider metadata when available.
 
 Implementation plan:
@@ -150,6 +156,8 @@ Trace/e2e:
 - PR description must include request-prefix diff evidence and provider usage evidence when available. If new-api omits cache fields, explicitly show graceful absence.
 
 ### M9.4 Harness State Machine, Narrowed V0
+
+**Status: Merged — PR #72 (2026-07-02)**
 
 Do not create a large product state machine. Add a local-agent harness helper that can script request input, mocked provider responses, local tool results, and expected serialized request properties.
 
@@ -186,6 +194,8 @@ Trace/e2e:
 - Request trace for approve path: plan ToolUse with plan tools, approve implementation ToolUse with normal tools, shell/MCP action-result resume ToolUse with tools present.
 
 ### M9.5 Docs and Rollout
+
+**Status: In Progress — no dedicated feature flag required (M9 is internal refactor + tests only)**
 
 Feature flag strategy:
 
