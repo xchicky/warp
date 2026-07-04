@@ -60,6 +60,7 @@ fn local_direct_config() -> LocalDirectConfig {
         model: "test-model".to_string(),
         vision_supported: true,
         cost_telemetry: Default::default(),
+        context_window_tokens: None,
     }
 }
 

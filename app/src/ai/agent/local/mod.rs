@@ -53,8 +53,8 @@ use crate::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, AIAgentTodo, AIAgentTodoId, CallMCPToolResult, ImageContext, MCPContext,
-        RequestCommandOutputResult, UserQueryMode,
+        AIAgentInput, AIAgentTodo, AIAgentTodoId, AskUserQuestionResult, CallMCPToolResult,
+        ImageContext, MCPContext, RequestCommandOutputResult, UserQueryMode,
     },
     features::FeatureFlag,
     persistence::model::PRIMARY_AGENT_CATEGORY,
@@ -73,6 +73,7 @@ pub struct LocalDirectConfig {
     pub model: String,
     pub vision_supported: bool,
     pub cost_telemetry: LocalAgentCostTelemetryConfig,
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -460,12 +461,17 @@ const LOCAL_DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LOCAL_DIRECT_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOCAL_DIRECT_HISTORY_MESSAGES: usize = 20;
 const MAX_LOCAL_DIRECT_MESSAGE_CHARS: usize = 32 * 1024;
+const LOCAL_DIRECT_SUMMARIZATION_THRESHOLD: usize = 12;
+const LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES: usize = 6;
+const MAX_LOCAL_DIRECT_SUMMARY_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FILE_ATTACHMENT_BYTES: u64 = 256 * 1024;
-const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 5;
-const MAX_LOCAL_DIRECT_SUBAGENT_ROUNDS: usize = 2;
+const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 15;
+const MAX_LOCAL_DIRECT_RETRY_ATTEMPTS: usize = 2;
+const LOCAL_DIRECT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const MAX_LOCAL_DIRECT_SUBAGENT_ROUNDS: usize = 5;
 const MAX_LOCAL_DIRECT_SUBAGENT_DEPTH: usize = 1;
-const MAX_LOCAL_DIRECT_SUBAGENTS_PER_BATCH: usize = 1;
-const LOCAL_DIRECT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_LOCAL_DIRECT_SUBAGENTS_PER_BATCH: usize = 3;
+const LOCAL_DIRECT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOCAL_DIRECT_SUBAGENT_TASK_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_SUBAGENT_CONTEXT_CHARS: usize = 12 * 1024;
 const MAX_LOCAL_DIRECT_SUBAGENT_LABEL_CHARS: usize = 128;
@@ -499,6 +505,7 @@ const LOCAL_DIRECT_CURRENT_TURN_PROMPT: &str =
 const LOCAL_DIRECT_TODO_WRITE_PROMPT: &str = "When todo_write is advertised and the user explicitly asks you to create, update, track, or maintain a todo list, checklist, task list, or multi-step plan with todos, call todo_write to replace the visible todo list instead of responding with only markdown. Keep the list complete and ordered, use at most one in_progress todo, and call todo_write again whenever todo status changes.";
 const LOCAL_DIRECT_CODEBASE_INDEX_PROMPT: &str = "When search_codebase is advertised and the user asks to search, inspect, find, locate, or verify code in the current workspace, call search_codebase for the current request instead of relying on previous code snippets, old search results, or legacy codebase context. If search_codebase returns Status: stale, tell the user the local in-memory index changed and call search_codebase again before answering from code search results.";
 const LOCAL_DIRECT_PLAN_MODE_PROMPT: &str = "You are in plan mode. Inspect the workspace using only read-only tools, search_codebase, web_search, web_fetch, suggest_shell_command, and read-only subagents. Do not modify files, execute commands, call MCP tools, or update todos. CRITICAL: Plan mode does NOT show your plan to the user via normal assistant messages. You MUST call the exit_plan_mode tool with your complete plan to present it for review. Inline plan text in normal assistant output will be invisible to the user. The user will only see your plan after you call exit_plan_mode. When ready, call exit_plan_mode with the complete plan. No changes will be executed in plan mode.";
+const LOCAL_DIRECT_SUMMARIZATION_PROMPT: &str = "Summarize the following conversation history concisely. Focus on: key decisions made, files modified or discussed, tasks completed, current goals, and any important context the assistant needs to continue helping effectively. Be factual and brief.";
 
 struct LocalPromptLayer {
     name: &'static str,
@@ -765,13 +772,24 @@ pub fn generate_openai_compatible_output(
             };
         }
 
-        let mut messages = match openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+        let history_summary = if FeatureFlag::LocalAgentHistorySummarization.is_enabled() {
+            if let Some(older_messages) = history_messages_needing_summarization(&tasks) {
+                summarize_history_messages(&config, &older_messages).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut messages = match openai_messages_from_inputs_and_tasks_with_summary(
             &input,
             &tasks,
             mcp_context.as_ref(),
             config.vision_supported,
             tool_policy,
             &runtime_context,
+            history_summary.as_deref(),
         ) {
             Ok(messages) => messages,
             Err(error) => {
@@ -1235,38 +1253,57 @@ async fn request_openai_compatible_completion(
     tool_policy: LocalToolPolicy,
 ) -> anyhow::Result<LocalProviderResponse> {
     let include_usage = FeatureFlag::LocalAgentCostTelemetry.is_enabled();
-    let request = openai_chat_request_with_policy(
-        config,
-        messages.clone(),
-        mode,
-        mcp_context,
-        include_usage,
-        tool_policy,
-    );
-    match send_openai_compatible_request(config, request).await {
-        Ok(response) => Ok(LocalProviderResponse {
-            response,
-            usage_available: include_usage,
-        }),
-        Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
-            let request = openai_chat_request_with_policy(
-                config,
-                messages,
-                mode,
-                mcp_context,
-                false,
-                tool_policy,
-            );
-            let response = send_openai_compatible_request(config, request)
-                .await
-                .map_err(LocalProviderRequestError::into_anyhow)?;
-            Ok(LocalProviderResponse {
-                response,
-                usage_available: false,
-            })
+
+    for attempt in 0..=MAX_LOCAL_DIRECT_RETRY_ATTEMPTS {
+        let request = openai_chat_request_with_policy(
+            config,
+            messages.clone(),
+            mode,
+            mcp_context,
+            include_usage,
+            tool_policy,
+        );
+        match send_openai_compatible_request(config, request).await {
+            Ok(response) => {
+                return Ok(LocalProviderResponse {
+                    response,
+                    usage_available: include_usage,
+                });
+            }
+            Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
+                let request = openai_chat_request_with_policy(
+                    config,
+                    messages,
+                    mode,
+                    mcp_context,
+                    false,
+                    tool_policy,
+                );
+                let response = send_openai_compatible_request(config, request)
+                    .await
+                    .map_err(LocalProviderRequestError::into_anyhow)?;
+                return Ok(LocalProviderResponse {
+                    response,
+                    usage_available: false,
+                });
+            }
+            Err(error) if error.is_transient() && attempt < MAX_LOCAL_DIRECT_RETRY_ATTEMPTS => {
+                let delay = LOCAL_DIRECT_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt as u32);
+                log::warn!(
+                    "Local direct provider transient error (attempt {}/{}), retrying in {:?}",
+                    attempt + 1,
+                    MAX_LOCAL_DIRECT_RETRY_ATTEMPTS + 1,
+                    delay,
+                );
+                async_io::Timer::after(delay).await;
+            }
+            Err(error) => {
+                return Err(error.into_anyhow());
+            }
         }
-        Err(error) => Err(error.into_anyhow()),
     }
+
+    unreachable!()
 }
 
 struct LocalProviderResponse {
@@ -1338,10 +1375,16 @@ async fn send_openai_compatible_request(
         .json(&request)
         .send()
         .await
-        .map_err(|_| {
-            LocalProviderRequestError::Other(anyhow!(
-                "Failed to send request to local direct provider"
-            ))
+        .map_err(|e| {
+            if e.is_timeout() || e.is_connect() {
+                LocalProviderRequestError::Transient(anyhow!(
+                    "Failed to send request to local direct provider (transient): {e}"
+                ))
+            } else {
+                LocalProviderRequestError::Other(anyhow!(
+                    "Failed to send request to local direct provider"
+                ))
+            }
         })?;
 
     let status = response.status();
@@ -1355,6 +1398,11 @@ async fn send_openai_compatible_request(
                 "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
             )));
         }
+        if is_transient_http_status(status) {
+            return Err(LocalProviderRequestError::Transient(anyhow!(
+                "Local direct provider request failed with transient status {status}"
+            )));
+        }
         return Err(LocalProviderRequestError::Other(anyhow!(
             "Local direct provider request failed with status {status}"
         )));
@@ -1363,18 +1411,30 @@ async fn send_openai_compatible_request(
     Ok(response)
 }
 
+fn is_transient_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 429 | 502 | 503 | 504
+    )
+}
+
 enum LocalProviderRequestError {
     UnsupportedStreamOptions,
+    Transient(anyhow::Error),
     Other(anyhow::Error),
 }
 
 impl LocalProviderRequestError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::UnsupportedStreamOptions => {
                 anyhow!("Local provider rejected stream usage options before streaming began")
             }
-            Self::Other(error) => error,
+            Self::Transient(error) | Self::Other(error) => error,
         }
     }
 }
@@ -1443,7 +1503,8 @@ fn local_shell_action_result(input: &AIAgentInput) -> bool {
         AIAgentInput::ActionResult {
             result: AIAgentActionResult {
                 result: AIAgentActionResultType::RequestCommandOutput(_)
-                    | AIAgentActionResultType::CallMCPTool(_),
+                    | AIAgentActionResultType::CallMCPTool(_)
+                    | AIAgentActionResultType::AskUserQuestion(_),
                 ..
             },
             ..
@@ -1491,6 +1552,26 @@ fn openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
     tool_policy: LocalToolPolicy,
     runtime_context: &LocalToolRuntimeContext,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
+    openai_messages_from_inputs_and_tasks_with_summary(
+        input,
+        tasks,
+        mcp_context,
+        vision_supported,
+        tool_policy,
+        runtime_context,
+        None,
+    )
+}
+
+fn openai_messages_from_inputs_and_tasks_with_summary(
+    input: &[AIAgentInput],
+    tasks: &[api::Task],
+    mcp_context: Option<&LocalMcpContext>,
+    vision_supported: bool,
+    tool_policy: LocalToolPolicy,
+    runtime_context: &LocalToolRuntimeContext,
+    history_summary: Option<&str>,
+) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let system_prompt = render_local_system_prompt(&local_system_prompt_layers(
         input,
         tasks,
@@ -1502,7 +1583,7 @@ fn openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
     let mcp_tool_call_metadata_by_id =
         mcp_tool_call_metadata_by_id(tasks, mcp_tool_catalog.as_ref());
 
-    append_history_messages(&mut messages, tasks, mcp_tool_catalog.as_ref());
+    append_history_messages_with_summary(&mut messages, tasks, mcp_tool_catalog.as_ref(), history_summary);
     let mut appended_action_result = false;
     for input in input {
         if let AIAgentInput::ActionResult { result, .. } = input {
@@ -1901,6 +1982,10 @@ fn openai_tool_message_from_action_result(
                 mcp_result,
             ),
         )),
+        AIAgentActionResultType::AskUserQuestion(ask_result) => Some(openai_tool_message(
+            result.id.to_string(),
+            ask_user_question_result_for_provider(ask_result),
+        )),
         _ => None,
     }
 }
@@ -1933,6 +2018,14 @@ fn openai_tool_call_from_action_result(
                 name: mcp_metadata
                     .map(|metadata| metadata.openai_name.clone())
                     .unwrap_or_else(|| "mcp__unknown__tool".to_string()),
+                arguments: json!({}).to_string(),
+            },
+        }),
+        AIAgentActionResultType::AskUserQuestion(_) => Some(OpenAIChatToolCall {
+            id: result.id.to_string(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: "ask_user_question".to_string(),
                 arguments: json!({}).to_string(),
             },
         }),
@@ -1974,6 +2067,27 @@ fn shell_command_result_for_provider(result: &RequestCommandOutputResult) -> Str
         RequestCommandOutputResult::Denylisted { command } => format!(
             "run_shell_command result\nStatus: permission-denied/denylisted\nCommand: {command}\nOutput:\n"
         ),
+    }
+}
+
+fn ask_user_question_result_for_provider(result: &AskUserQuestionResult) -> String {
+    match result {
+        AskUserQuestionResult::Success { answers } => {
+            let mut parts = Vec::new();
+            for answer in answers {
+                parts.push(answer.display_text());
+            }
+            format!("User answered: {}", parts.join("; "))
+        }
+        AskUserQuestionResult::Error(msg) => {
+            format!("ask_user_question error: {msg}")
+        }
+        AskUserQuestionResult::Cancelled => {
+            "User cancelled the question.".to_string()
+        }
+        AskUserQuestionResult::SkippedByAutoApprove { .. } => {
+            "Question was auto-skipped (auto-approve mode is active).".to_string()
+        }
     }
 }
 
@@ -2123,6 +2237,9 @@ fn local_tools_without_mcp() -> Vec<OpenAIChatTool> {
     }
     if FeatureFlag::LocalAgentSubagent.is_enabled() {
         tools.push(spawn_subagent_tool_definition());
+    }
+    if FeatureFlag::AskUserQuestion.is_enabled() {
+        tools.push(ask_user_question_tool_definition());
     }
     tools
 }
@@ -2384,6 +2501,36 @@ fn exit_plan_mode_tool_definition() -> OpenAIChatTool {
                 },
                 "required": ["plan"],
                 "additionalProperties": false
+            }),
+        },
+    }
+}
+
+fn ask_user_question_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "ask_user_question".to_string(),
+            description: "Ask the user a structured question when you need their input to proceed. Use this when you face a decision that requires user preference or clarification. The user will see options and can pick one or provide a custom answer.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to ask the user." },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string", "description": "Short display text for this option." },
+                                "recommended": { "type": "boolean", "description": "Whether this is the recommended option." }
+                            },
+                            "required": ["label"]
+                        },
+                        "description": "Optional multiple-choice options. If omitted, the user can provide a free-text answer."
+                    },
+                    "is_multiselect": { "type": "boolean", "description": "Whether the user can select multiple options. Defaults to false." }
+                },
+                "required": ["question"]
             }),
         },
     }
@@ -2770,6 +2917,8 @@ fn execute_local_tool_with_policy_with_runtime(
             .map(|text| (text, None, Vec::new(), None, false, None)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
+        "ask_user_question" => execute_ask_user_question_tool(&tool_call.function.arguments)
+            .map(|text| (text, None, Vec::new(), None, true, None)),
         name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
             .map(|result| {
                 (
@@ -3045,8 +3194,10 @@ fn child_allowed_subagent_tools(
 }
 
 fn is_subagent_forbidden_tool(name: &str) -> bool {
-    is_mutating_local_tool(name)
-        || name == "spawn_subagent"
+    if is_mutating_local_tool(name) {
+        return !FeatureFlag::LocalAgentSubagentMutatingTools.is_enabled();
+    }
+    name == "spawn_subagent"
         || name == "exit_plan_mode"
         || name.starts_with("mcp__")
 }
@@ -3058,7 +3209,7 @@ fn local_subagent_messages(
     let mode = if tool_policy.is_plan() {
         "Parent plan mode is active. You are a read-only planning/research child. Do not execute changes, call MCP tools, run shell commands, update todos, or call exit_plan_mode."
     } else {
-        "Use only the tools explicitly advertised to this child. Mutating and out-of-band approval tools are not advertised in M5.3 V0."
+        "Use only the tools explicitly advertised to this child. Do not call spawn_subagent, exit_plan_mode, or MCP tools."
     };
     let mut user = format!(
         "Child task:\n{}\n\nExplicit context from parent:\n{}",
@@ -3185,6 +3336,88 @@ async fn drain_local_subagent_response(
         }
     }
     Ok((content, tool_call_accumulator.into_tool_calls()))
+}
+
+async fn summarize_history_messages(
+    config: &LocalDirectConfig,
+    messages_to_summarize: &[OpenAIChatMessage],
+) -> Option<String> {
+    if messages_to_summarize.is_empty() {
+        return None;
+    }
+
+    let mut conversation_text = String::new();
+    for message in messages_to_summarize {
+        let role_label = match message.role {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "tool" => "Tool result",
+            _ => message.role,
+        };
+        let content_text = message.content.as_str();
+        if !content_text.is_empty() {
+            conversation_text.push_str(role_label);
+            conversation_text.push_str(": ");
+            conversation_text.push_str(&truncate_message_content(content_text, 2048));
+            conversation_text.push('\n');
+        }
+    }
+
+    if conversation_text.is_empty() {
+        return None;
+    }
+
+    let summarization_messages = vec![
+        openai_message("system", LOCAL_DIRECT_SUMMARIZATION_PROMPT.to_string()),
+        openai_message("user", conversation_text),
+    ];
+
+    let request = OpenAIChatRequest {
+        model: config.model.clone(),
+        messages: summarization_messages,
+        stream: true,
+        stream_options: None,
+        tools: Vec::new(),
+        tool_choice: Some("none"),
+    };
+
+    let response = match send_openai_compatible_request(config, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            log::warn!("History summarization request failed: {}", error.into_anyhow());
+            return None;
+        }
+    };
+
+    let mut body = response.bytes_stream();
+    let mut pending = String::new();
+    let mut bytes_read = 0u64;
+    let mut content = String::new();
+
+    while let Some(chunk) = body.next().await {
+        let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
+            Ok(events) => events,
+            Err(_) => break,
+        };
+        for event in events {
+            match event {
+                OpenAIStreamEvent::Delta(token) => {
+                    content.push_str(&token);
+                }
+                OpenAIStreamEvent::Done => {
+                    let summary = truncate_message_content(&content, MAX_LOCAL_DIRECT_SUMMARY_CHARS);
+                    return Some(summary);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(truncate_message_content(&content, MAX_LOCAL_DIRECT_SUMMARY_CHARS))
+    }
 }
 
 fn execute_mcp_tool_request(
@@ -3965,6 +4198,16 @@ fn execute_suggest_shell_command_tool(
     ))
 }
 
+fn execute_ask_user_question_tool(arguments: &str) -> anyhow::Result<String> {
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|_| anyhow!("Invalid ask_user_question arguments"))?;
+    let question = required_string_arg(&args, "question")?.trim();
+    if question.is_empty() {
+        return Err(anyhow!("question cannot be empty"));
+    }
+    Ok("Question delivered to the user. Waiting for their response.".to_string())
+}
+
 fn execute_read_file_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
     let args: Value =
         serde_json::from_str(arguments).map_err(|_| anyhow!("Invalid read_file arguments"))?;
@@ -4292,6 +4535,15 @@ fn append_history_messages(
     tasks: &[api::Task],
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
 ) {
+    append_history_messages_with_summary(messages, tasks, mcp_tool_catalog, None);
+}
+
+fn append_history_messages_with_summary(
+    messages: &mut Vec<OpenAIChatMessage>,
+    tasks: &[api::Task],
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+    summary: Option<&str>,
+) {
     let Some(root) = root_task(tasks) else {
         return;
     };
@@ -4303,6 +4555,21 @@ fn append_history_messages(
         .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
         .collect::<Vec<_>>();
     history.reverse();
+
+    if let Some(summary_text) = summary {
+        let recent_count = LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES.min(history.len());
+        let recent_start = history.len().saturating_sub(recent_count);
+        messages.push(openai_message(
+            "user",
+            format!("[Conversation summary]\n{summary_text}"),
+        ));
+        messages.push(openai_message(
+            "assistant",
+            "Understood. I have the conversation context from the summary above.".to_string(),
+        ));
+        history = history[recent_start..].to_vec();
+    }
+
     let mut mcp_tool_calls_by_id: HashMap<String, McpToolCallMetadata> = HashMap::new();
     for message in &history {
         let Some(api::message::Message::ToolCall(tool_call)) = &message.message else {
@@ -4346,6 +4613,56 @@ fn append_history_messages(
             _ => {}
         }
     }
+}
+
+fn history_messages_needing_summarization(
+    tasks: &[api::Task],
+) -> Option<Vec<OpenAIChatMessage>> {
+    let root = root_task(tasks)?;
+    let total_messages: Vec<_> = root
+        .messages
+        .iter()
+        .rev()
+        .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
+        .collect();
+
+    if total_messages.len() < LOCAL_DIRECT_SUMMARIZATION_THRESHOLD {
+        return None;
+    }
+
+    let recent_count = LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES.min(total_messages.len());
+    let older_count = total_messages.len() - recent_count;
+    let older_messages: Vec<_> = root
+        .messages
+        .iter()
+        .rev()
+        .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(older_count)
+        .collect();
+
+    let mut result = Vec::new();
+    for message in older_messages {
+        match &message.message {
+            Some(api::message::Message::UserQuery(query)) if !query.query.is_empty() => {
+                result.push(openai_message(
+                    "user",
+                    truncate_message_content(&query.query, 2048),
+                ));
+            }
+            Some(api::message::Message::AgentOutput(output)) if !output.text.is_empty() => {
+                result.push(openai_message(
+                    "assistant",
+                    truncate_message_content(&output.text, 2048),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if result.is_empty() { None } else { Some(result) }
 }
 
 fn history_tool_call_ids_with_results(
@@ -5737,6 +6054,17 @@ fn stream_finished_done(
     usage_telemetry: &LocalUsageTelemetry,
 ) -> api::ResponseEvent {
     let usage_summary = usage_telemetry.summary(config);
+    let context_window_usage = usage_summary
+        .as_ref()
+        .and_then(|summary| {
+            config.context_window_tokens.map(|cw| {
+                if cw == 0 {
+                    return 0.;
+                }
+                (summary.counts.prompt_tokens as f32) / (cw as f32)
+            })
+        })
+        .unwrap_or(0.);
     let (token_usage, request_cost, credits_spent, byok_token_usage) = match usage_summary.as_ref()
     {
         Some(summary) => {
@@ -5787,7 +6115,7 @@ fn stream_finished_done(
                 request_cost,
                 conversation_usage_metadata: Some(
                     api::response_event::stream_finished::ConversationUsageMetadata {
-                        context_window_usage: 0.,
+                        context_window_usage,
                         summarized: false,
                         credits_spent,
                         #[allow(deprecated)]
@@ -5842,8 +6170,15 @@ mod tests {
         MAX_LOCAL_DIRECT_SUBAGENT_DEPTH, MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS,
         MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS, MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS,
         MAX_LOCAL_DIRECT_TOOL_FILE_BYTES, MAX_LOCAL_DIRECT_TOOL_ROUNDS,
+        MAX_LOCAL_DIRECT_RETRY_ATTEMPTS, LOCAL_DIRECT_RETRY_BASE_DELAY,
         PLAN_READY_SERVER_MESSAGE_DATA_KIND, SSH_UNSUPPORTED_FS_TOOL_ERROR,
+        is_transient_http_status, LocalProviderRequestError,
+        ask_user_question_result_for_provider, execute_ask_user_question_tool,
+        local_tools_without_mcp,
+        append_history_messages_with_summary, history_messages_needing_summarization,
+        LOCAL_DIRECT_SUMMARIZATION_THRESHOLD, LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES,
     };
+    use anyhow::anyhow;
     use crate::ai::agent::{
         api::{
             ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
@@ -5854,7 +6189,8 @@ mod tests {
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
         AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput,
-        AIAgentOutputMessageType, CallMCPToolResult, InvokeSkillUserQuery, MCPContext, MCPServer,
+        AIAgentOutputMessageType, AskUserQuestionAnswerItem, AskUserQuestionResult,
+        CallMCPToolResult, InvokeSkillUserQuery, MCPContext, MCPServer,
         RequestCommandOutputResult, UserQueryMode,
     };
     use crate::features::FeatureFlag;
@@ -6048,6 +6384,7 @@ mod tests {
             model: "test-model".to_string(),
             vision_supported: true,
             cost_telemetry: Default::default(),
+            context_window_tokens: None,
         }
     }
 
@@ -6532,6 +6869,146 @@ mod tests {
             MAX_LOCAL_DIRECT_TOOL_ROUNDS
         );
         assert_eq!(local_direct_tool_round_limit(false, false), 0);
+    }
+
+    #[test]
+    fn transient_http_status_classification() {
+        use reqwest::StatusCode;
+
+        assert!(is_transient_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_transient_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_http_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_http_status(StatusCode::GATEWAY_TIMEOUT));
+
+        assert!(!is_transient_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_http_status(StatusCode::FORBIDDEN));
+        assert!(!is_transient_http_status(StatusCode::NOT_FOUND));
+        assert!(!is_transient_http_status(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn transient_error_is_retryable() {
+        let transient = LocalProviderRequestError::Transient(anyhow!("timeout"));
+        assert!(transient.is_transient());
+
+        let permanent = LocalProviderRequestError::Other(anyhow!("bad request"));
+        assert!(!permanent.is_transient());
+
+        let unsupported = LocalProviderRequestError::UnsupportedStreamOptions;
+        assert!(!unsupported.is_transient());
+    }
+
+    #[test]
+    fn retry_constants_are_sensible() {
+        assert_eq!(MAX_LOCAL_DIRECT_RETRY_ATTEMPTS, 2);
+        assert_eq!(LOCAL_DIRECT_RETRY_BASE_DELAY, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn context_window_usage_computed_from_prompt_tokens() {
+        let config = LocalDirectConfig {
+            context_window_tokens: Some(128_000),
+            ..local_direct_config()
+        };
+        let mut telemetry = LocalUsageTelemetry::new(true);
+        telemetry.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(64_000),
+            completion_tokens: Some(1_000),
+            total_tokens: Some(65_000),
+            prompt_tokens_details: None,
+        });
+
+        let event = stream_finished_done(&config, &telemetry);
+        let finished = match event.r#type {
+            Some(api::response_event::Type::Finished(f)) => f,
+            _ => panic!("expected finished event"),
+        };
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        let usage = metadata.context_window_usage;
+        assert!((usage - 0.5).abs() < 0.01, "expected ~0.5, got {usage}");
+    }
+
+    #[test]
+    fn context_window_usage_zero_when_not_configured() {
+        let config = LocalDirectConfig {
+            context_window_tokens: None,
+            ..local_direct_config()
+        };
+        let mut telemetry = LocalUsageTelemetry::new(true);
+        telemetry.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(64_000),
+            completion_tokens: Some(1_000),
+            total_tokens: Some(65_000),
+            prompt_tokens_details: None,
+        });
+
+        let event = stream_finished_done(&config, &telemetry);
+        let finished = match event.r#type {
+            Some(api::response_event::Type::Finished(f)) => f,
+            _ => panic!("expected finished event"),
+        };
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        assert_eq!(metadata.context_window_usage, 0.);
+    }
+
+    #[test]
+    fn ask_user_question_tool_included_when_flag_enabled() {
+        let _flag = FeatureFlag::AskUserQuestion.override_enabled(true);
+        let tools = local_tools_without_mcp();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.function.name == "ask_user_question"),
+            "ask_user_question should be present when flag enabled"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_tool_excluded_when_flag_disabled() {
+        let _flag = FeatureFlag::AskUserQuestion.override_enabled(false);
+        let tools = local_tools_without_mcp();
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.function.name == "ask_user_question"),
+            "ask_user_question should not be present when flag disabled"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_execution_returns_pending() {
+        let args = json!({ "question": "Which approach?" }).to_string();
+        let result = execute_ask_user_question_tool(&args).unwrap();
+        assert!(result.contains("Waiting for their response"));
+    }
+
+    #[test]
+    fn ask_user_question_execution_rejects_empty_question() {
+        let args = json!({ "question": "" }).to_string();
+        assert!(execute_ask_user_question_tool(&args).is_err());
+    }
+
+    #[test]
+    fn ask_user_question_result_formats_success() {
+        use crate::ai::agent::AskUserQuestionAnswerItem;
+        let result = AskUserQuestionResult::Success {
+            answers: vec![AskUserQuestionAnswerItem::Answered {
+                question_id: "q1".to_string(),
+                selected_options: vec!["Option A".to_string()],
+                other_text: String::new(),
+            }],
+        };
+        let text = ask_user_question_result_for_provider(&result);
+        assert!(text.contains("Option A"));
+    }
+
+    #[test]
+    fn ask_user_question_result_formats_cancelled() {
+        let result = AskUserQuestionResult::Cancelled;
+        let text = ask_user_question_result_for_provider(&result);
+        assert!(text.contains("cancelled"));
     }
 
     #[tokio::test]
@@ -8710,6 +9187,38 @@ mod tests {
 
         assert!(!child_tools.iter().any(|name| name == "spawn_subagent"));
         assert!(!child_tools.iter().any(|name| name == "exit_plan_mode"));
+    }
+
+    #[test]
+    fn local_subagent_child_excludes_mutating_tools_by_default() {
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+        let _file_writes_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _mutating_flag = FeatureFlag::LocalAgentSubagentMutatingTools.override_enabled(false);
+        let parent_tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Normal);
+        let child_tools = child_allowed_subagent_tools(parent_tools, LocalToolPolicy::Normal)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(!child_tools.iter().any(|name| name == "write_file"));
+        assert!(!child_tools.iter().any(|name| name == "edit_file"));
+        assert!(!child_tools.iter().any(|name| name == "apply_file_diff"));
+    }
+
+    #[test]
+    fn local_subagent_child_includes_mutating_tools_when_flag_enabled() {
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+        let _file_writes_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _mutating_flag = FeatureFlag::LocalAgentSubagentMutatingTools.override_enabled(true);
+        let parent_tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Normal);
+        let child_tools = child_allowed_subagent_tools(parent_tools, LocalToolPolicy::Normal)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(child_tools.iter().any(|name| name == "write_file"));
+        assert!(child_tools.iter().any(|name| name == "edit_file"));
+        assert!(child_tools.iter().any(|name| name == "apply_file_diff"));
     }
 
     #[test]
@@ -12185,5 +12694,128 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages.last().unwrap().content, "hello");
+    }
+
+    fn task_with_n_user_assistant_exchanges(n: usize) -> api::Task {
+        let mut messages = Vec::new();
+        for i in 0..n {
+            messages.push(api::Message {
+                id: format!("user-{i}"),
+                task_id: "root".to_string(),
+                request_id: format!("request-{i}"),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: format!("Question {i}"),
+                    context: None,
+                    referenced_attachments: Default::default(),
+                    mode: None,
+                    intended_agent: 0,
+                })),
+            });
+            messages.push(api::Message {
+                id: format!("assistant-{i}"),
+                task_id: "root".to_string(),
+                request_id: format!("request-{i}"),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::AgentOutput(
+                    api::message::AgentOutput {
+                        text: format!("Answer {i}"),
+                    },
+                )),
+            });
+        }
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
+    #[test]
+    fn history_summarization_not_needed_below_threshold() {
+        let task = task_with_n_user_assistant_exchanges(5);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn history_summarization_needed_at_threshold() {
+        let task = task_with_n_user_assistant_exchanges(LOCAL_DIRECT_SUMMARIZATION_THRESHOLD);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_some());
+        let older_messages = result.unwrap();
+        let expected_older = MAX_LOCAL_DIRECT_HISTORY_MESSAGES
+            .min(LOCAL_DIRECT_SUMMARIZATION_THRESHOLD * 2)
+            - LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES;
+        assert_eq!(older_messages.len(), expected_older);
+    }
+
+    #[test]
+    fn history_summarization_extracts_only_older_messages() {
+        let task = task_with_n_user_assistant_exchanges(10);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_some());
+        let older = result.unwrap();
+        assert_eq!(older.first().unwrap().content, "Question 0");
+    }
+
+    #[test]
+    fn append_history_with_summary_injects_summary_prefix() {
+        let task = task_with_n_user_assistant_exchanges(3);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(
+            &mut messages,
+            &tasks,
+            None,
+            Some("This is a summary of earlier conversation."),
+        );
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.as_str().contains("[Conversation summary]"));
+        assert!(messages[1]
+            .content
+            .as_str()
+            .contains("This is a summary of earlier conversation."));
+        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[2].content.as_str().contains("Understood"));
+    }
+
+    #[test]
+    fn append_history_with_summary_keeps_recent_messages() {
+        let task = task_with_n_user_assistant_exchanges(10);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(
+            &mut messages,
+            &tasks,
+            None,
+            Some("Summary of old messages."),
+        );
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user" && !m.content.as_str().contains("[Conversation summary]"))
+            .unwrap();
+        assert!(last_user.content.as_str().starts_with("Question "));
+    }
+
+    #[test]
+    fn append_history_without_summary_uses_all_messages() {
+        let task = task_with_n_user_assistant_exchanges(3);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(&mut messages, &tasks, None, None);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "Question 0");
     }
 }

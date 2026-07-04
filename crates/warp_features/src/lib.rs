@@ -606,6 +606,12 @@ pub enum FeatureFlag {
     /// Enables plan mode for local OpenAI-compatible agents.
     LocalAgentPlanMode,
 
+    /// Enables LLM-based history summarization for local OpenAI-compatible agents.
+    LocalAgentHistorySummarization,
+
+    /// Allows subagents to use mutating tools (write_file, edit_file, etc.) in local agent.
+    LocalAgentSubagentMutatingTools,
+
     /// Enables loading conversations in the Agent Management View.
     InteractiveConversationManagementView,
 
@@ -992,6 +998,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LocalAgentMcp,
     FeatureFlag::LocalAgentPlanMode,
     FeatureFlag::LocalAgentSubagent,
+    FeatureFlag::LocalAgentHistorySummarization,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
