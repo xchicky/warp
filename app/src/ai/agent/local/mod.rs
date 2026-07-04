@@ -468,10 +468,10 @@ const MAX_LOCAL_DIRECT_FILE_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 15;
 const MAX_LOCAL_DIRECT_RETRY_ATTEMPTS: usize = 2;
 const LOCAL_DIRECT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
-const MAX_LOCAL_DIRECT_SUBAGENT_ROUNDS: usize = 2;
+const MAX_LOCAL_DIRECT_SUBAGENT_ROUNDS: usize = 5;
 const MAX_LOCAL_DIRECT_SUBAGENT_DEPTH: usize = 1;
-const MAX_LOCAL_DIRECT_SUBAGENTS_PER_BATCH: usize = 1;
-const LOCAL_DIRECT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_LOCAL_DIRECT_SUBAGENTS_PER_BATCH: usize = 3;
+const LOCAL_DIRECT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOCAL_DIRECT_SUBAGENT_TASK_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_SUBAGENT_CONTEXT_CHARS: usize = 12 * 1024;
 const MAX_LOCAL_DIRECT_SUBAGENT_LABEL_CHARS: usize = 128;
@@ -3194,8 +3194,10 @@ fn child_allowed_subagent_tools(
 }
 
 fn is_subagent_forbidden_tool(name: &str) -> bool {
-    is_mutating_local_tool(name)
-        || name == "spawn_subagent"
+    if is_mutating_local_tool(name) {
+        return !FeatureFlag::LocalAgentSubagentMutatingTools.is_enabled();
+    }
+    name == "spawn_subagent"
         || name == "exit_plan_mode"
         || name.starts_with("mcp__")
 }
@@ -3207,7 +3209,7 @@ fn local_subagent_messages(
     let mode = if tool_policy.is_plan() {
         "Parent plan mode is active. You are a read-only planning/research child. Do not execute changes, call MCP tools, run shell commands, update todos, or call exit_plan_mode."
     } else {
-        "Use only the tools explicitly advertised to this child. Mutating and out-of-band approval tools are not advertised in M5.3 V0."
+        "Use only the tools explicitly advertised to this child. Do not call spawn_subagent, exit_plan_mode, or MCP tools."
     };
     let mut user = format!(
         "Child task:\n{}\n\nExplicit context from parent:\n{}",
@@ -9185,6 +9187,38 @@ mod tests {
 
         assert!(!child_tools.iter().any(|name| name == "spawn_subagent"));
         assert!(!child_tools.iter().any(|name| name == "exit_plan_mode"));
+    }
+
+    #[test]
+    fn local_subagent_child_excludes_mutating_tools_by_default() {
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+        let _file_writes_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _mutating_flag = FeatureFlag::LocalAgentSubagentMutatingTools.override_enabled(false);
+        let parent_tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Normal);
+        let child_tools = child_allowed_subagent_tools(parent_tools, LocalToolPolicy::Normal)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(!child_tools.iter().any(|name| name == "write_file"));
+        assert!(!child_tools.iter().any(|name| name == "edit_file"));
+        assert!(!child_tools.iter().any(|name| name == "apply_file_diff"));
+    }
+
+    #[test]
+    fn local_subagent_child_includes_mutating_tools_when_flag_enabled() {
+        let _subagent_flag = FeatureFlag::LocalAgentSubagent.override_enabled(true);
+        let _file_writes_flag = FeatureFlag::LocalAgentFileWrites.override_enabled(true);
+        let _mutating_flag = FeatureFlag::LocalAgentSubagentMutatingTools.override_enabled(true);
+        let parent_tools = local_tools_for_context_with_policy(None, LocalToolPolicy::Normal);
+        let child_tools = child_allowed_subagent_tools(parent_tools, LocalToolPolicy::Normal)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(child_tools.iter().any(|name| name == "write_file"));
+        assert!(child_tools.iter().any(|name| name == "edit_file"));
+        assert!(child_tools.iter().any(|name| name == "apply_file_diff"));
     }
 
     #[test]
