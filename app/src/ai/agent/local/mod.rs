@@ -461,6 +461,9 @@ const LOCAL_DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LOCAL_DIRECT_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOCAL_DIRECT_HISTORY_MESSAGES: usize = 20;
 const MAX_LOCAL_DIRECT_MESSAGE_CHARS: usize = 32 * 1024;
+const LOCAL_DIRECT_SUMMARIZATION_THRESHOLD: usize = 12;
+const LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES: usize = 6;
+const MAX_LOCAL_DIRECT_SUMMARY_CHARS: usize = 4 * 1024;
 const MAX_LOCAL_DIRECT_FILE_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 15;
 const MAX_LOCAL_DIRECT_RETRY_ATTEMPTS: usize = 2;
@@ -502,6 +505,7 @@ const LOCAL_DIRECT_CURRENT_TURN_PROMPT: &str =
 const LOCAL_DIRECT_TODO_WRITE_PROMPT: &str = "When todo_write is advertised and the user explicitly asks you to create, update, track, or maintain a todo list, checklist, task list, or multi-step plan with todos, call todo_write to replace the visible todo list instead of responding with only markdown. Keep the list complete and ordered, use at most one in_progress todo, and call todo_write again whenever todo status changes.";
 const LOCAL_DIRECT_CODEBASE_INDEX_PROMPT: &str = "When search_codebase is advertised and the user asks to search, inspect, find, locate, or verify code in the current workspace, call search_codebase for the current request instead of relying on previous code snippets, old search results, or legacy codebase context. If search_codebase returns Status: stale, tell the user the local in-memory index changed and call search_codebase again before answering from code search results.";
 const LOCAL_DIRECT_PLAN_MODE_PROMPT: &str = "You are in plan mode. Inspect the workspace using only read-only tools, search_codebase, web_search, web_fetch, suggest_shell_command, and read-only subagents. Do not modify files, execute commands, call MCP tools, or update todos. CRITICAL: Plan mode does NOT show your plan to the user via normal assistant messages. You MUST call the exit_plan_mode tool with your complete plan to present it for review. Inline plan text in normal assistant output will be invisible to the user. The user will only see your plan after you call exit_plan_mode. When ready, call exit_plan_mode with the complete plan. No changes will be executed in plan mode.";
+const LOCAL_DIRECT_SUMMARIZATION_PROMPT: &str = "Summarize the following conversation history concisely. Focus on: key decisions made, files modified or discussed, tasks completed, current goals, and any important context the assistant needs to continue helping effectively. Be factual and brief.";
 
 struct LocalPromptLayer {
     name: &'static str,
@@ -768,13 +772,24 @@ pub fn generate_openai_compatible_output(
             };
         }
 
-        let mut messages = match openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
+        let history_summary = if FeatureFlag::LocalAgentHistorySummarization.is_enabled() {
+            if let Some(older_messages) = history_messages_needing_summarization(&tasks) {
+                summarize_history_messages(&config, &older_messages).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut messages = match openai_messages_from_inputs_and_tasks_with_summary(
             &input,
             &tasks,
             mcp_context.as_ref(),
             config.vision_supported,
             tool_policy,
             &runtime_context,
+            history_summary.as_deref(),
         ) {
             Ok(messages) => messages,
             Err(error) => {
@@ -1537,6 +1552,26 @@ fn openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
     tool_policy: LocalToolPolicy,
     runtime_context: &LocalToolRuntimeContext,
 ) -> anyhow::Result<Vec<OpenAIChatMessage>> {
+    openai_messages_from_inputs_and_tasks_with_summary(
+        input,
+        tasks,
+        mcp_context,
+        vision_supported,
+        tool_policy,
+        runtime_context,
+        None,
+    )
+}
+
+fn openai_messages_from_inputs_and_tasks_with_summary(
+    input: &[AIAgentInput],
+    tasks: &[api::Task],
+    mcp_context: Option<&LocalMcpContext>,
+    vision_supported: bool,
+    tool_policy: LocalToolPolicy,
+    runtime_context: &LocalToolRuntimeContext,
+    history_summary: Option<&str>,
+) -> anyhow::Result<Vec<OpenAIChatMessage>> {
     let system_prompt = render_local_system_prompt(&local_system_prompt_layers(
         input,
         tasks,
@@ -1548,7 +1583,7 @@ fn openai_messages_from_inputs_and_tasks_with_policy_and_runtime(
     let mcp_tool_call_metadata_by_id =
         mcp_tool_call_metadata_by_id(tasks, mcp_tool_catalog.as_ref());
 
-    append_history_messages(&mut messages, tasks, mcp_tool_catalog.as_ref());
+    append_history_messages_with_summary(&mut messages, tasks, mcp_tool_catalog.as_ref(), history_summary);
     let mut appended_action_result = false;
     for input in input {
         if let AIAgentInput::ActionResult { result, .. } = input {
@@ -3301,6 +3336,88 @@ async fn drain_local_subagent_response(
     Ok((content, tool_call_accumulator.into_tool_calls()))
 }
 
+async fn summarize_history_messages(
+    config: &LocalDirectConfig,
+    messages_to_summarize: &[OpenAIChatMessage],
+) -> Option<String> {
+    if messages_to_summarize.is_empty() {
+        return None;
+    }
+
+    let mut conversation_text = String::new();
+    for message in messages_to_summarize {
+        let role_label = match message.role {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "tool" => "Tool result",
+            _ => message.role,
+        };
+        let content_text = message.content.as_str();
+        if !content_text.is_empty() {
+            conversation_text.push_str(role_label);
+            conversation_text.push_str(": ");
+            conversation_text.push_str(&truncate_message_content(content_text, 2048));
+            conversation_text.push('\n');
+        }
+    }
+
+    if conversation_text.is_empty() {
+        return None;
+    }
+
+    let summarization_messages = vec![
+        openai_message("system", LOCAL_DIRECT_SUMMARIZATION_PROMPT.to_string()),
+        openai_message("user", conversation_text),
+    ];
+
+    let request = OpenAIChatRequest {
+        model: config.model.clone(),
+        messages: summarization_messages,
+        stream: true,
+        stream_options: None,
+        tools: Vec::new(),
+        tool_choice: Some("none"),
+    };
+
+    let response = match send_openai_compatible_request(config, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            log::warn!("History summarization request failed: {}", error.into_anyhow());
+            return None;
+        }
+    };
+
+    let mut body = response.bytes_stream();
+    let mut pending = String::new();
+    let mut bytes_read = 0u64;
+    let mut content = String::new();
+
+    while let Some(chunk) = body.next().await {
+        let events = match sse_events_from_chunk(&mut pending, &mut bytes_read, chunk) {
+            Ok(events) => events,
+            Err(_) => break,
+        };
+        for event in events {
+            match event {
+                OpenAIStreamEvent::Delta(token) => {
+                    content.push_str(&token);
+                }
+                OpenAIStreamEvent::Done => {
+                    let summary = truncate_message_content(&content, MAX_LOCAL_DIRECT_SUMMARY_CHARS);
+                    return Some(summary);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(truncate_message_content(&content, MAX_LOCAL_DIRECT_SUMMARY_CHARS))
+    }
+}
+
 fn execute_mcp_tool_request(
     openai_name: &str,
     arguments: &str,
@@ -4416,6 +4533,15 @@ fn append_history_messages(
     tasks: &[api::Task],
     mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
 ) {
+    append_history_messages_with_summary(messages, tasks, mcp_tool_catalog, None);
+}
+
+fn append_history_messages_with_summary(
+    messages: &mut Vec<OpenAIChatMessage>,
+    tasks: &[api::Task],
+    mcp_tool_catalog: Option<&LocalMcpToolCatalog>,
+    summary: Option<&str>,
+) {
     let Some(root) = root_task(tasks) else {
         return;
     };
@@ -4427,6 +4553,21 @@ fn append_history_messages(
         .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
         .collect::<Vec<_>>();
     history.reverse();
+
+    if let Some(summary_text) = summary {
+        let recent_count = LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES.min(history.len());
+        let recent_start = history.len().saturating_sub(recent_count);
+        messages.push(openai_message(
+            "user",
+            format!("[Conversation summary]\n{summary_text}"),
+        ));
+        messages.push(openai_message(
+            "assistant",
+            "Understood. I have the conversation context from the summary above.".to_string(),
+        ));
+        history = history[recent_start..].to_vec();
+    }
+
     let mut mcp_tool_calls_by_id: HashMap<String, McpToolCallMetadata> = HashMap::new();
     for message in &history {
         let Some(api::message::Message::ToolCall(tool_call)) = &message.message else {
@@ -4470,6 +4611,56 @@ fn append_history_messages(
             _ => {}
         }
     }
+}
+
+fn history_messages_needing_summarization(
+    tasks: &[api::Task],
+) -> Option<Vec<OpenAIChatMessage>> {
+    let root = root_task(tasks)?;
+    let total_messages: Vec<_> = root
+        .messages
+        .iter()
+        .rev()
+        .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
+        .collect();
+
+    if total_messages.len() < LOCAL_DIRECT_SUMMARIZATION_THRESHOLD {
+        return None;
+    }
+
+    let recent_count = LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES.min(total_messages.len());
+    let older_count = total_messages.len() - recent_count;
+    let older_messages: Vec<_> = root
+        .messages
+        .iter()
+        .rev()
+        .take(MAX_LOCAL_DIRECT_HISTORY_MESSAGES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(older_count)
+        .collect();
+
+    let mut result = Vec::new();
+    for message in older_messages {
+        match &message.message {
+            Some(api::message::Message::UserQuery(query)) if !query.query.is_empty() => {
+                result.push(openai_message(
+                    "user",
+                    truncate_message_content(&query.query, 2048),
+                ));
+            }
+            Some(api::message::Message::AgentOutput(output)) if !output.text.is_empty() => {
+                result.push(openai_message(
+                    "assistant",
+                    truncate_message_content(&output.text, 2048),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if result.is_empty() { None } else { Some(result) }
 }
 
 fn history_tool_call_ids_with_results(
@@ -5982,6 +6173,8 @@ mod tests {
         is_transient_http_status, LocalProviderRequestError,
         ask_user_question_result_for_provider, execute_ask_user_question_tool,
         local_tools_without_mcp,
+        append_history_messages_with_summary, history_messages_needing_summarization,
+        LOCAL_DIRECT_SUMMARIZATION_THRESHOLD, LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES,
     };
     use anyhow::anyhow;
     use crate::ai::agent::{
@@ -12467,5 +12660,128 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages.last().unwrap().content, "hello");
+    }
+
+    fn task_with_n_user_assistant_exchanges(n: usize) -> api::Task {
+        let mut messages = Vec::new();
+        for i in 0..n {
+            messages.push(api::Message {
+                id: format!("user-{i}"),
+                task_id: "root".to_string(),
+                request_id: format!("request-{i}"),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: format!("Question {i}"),
+                    context: None,
+                    referenced_attachments: Default::default(),
+                    mode: None,
+                    intended_agent: 0,
+                })),
+            });
+            messages.push(api::Message {
+                id: format!("assistant-{i}"),
+                task_id: "root".to_string(),
+                request_id: format!("request-{i}"),
+                timestamp: None,
+                server_message_data: String::new(),
+                citations: vec![],
+                message: Some(api::message::Message::AgentOutput(
+                    api::message::AgentOutput {
+                        text: format!("Answer {i}"),
+                    },
+                )),
+            });
+        }
+        api::Task {
+            id: "root".to_string(),
+            description: String::new(),
+            dependencies: None,
+            messages,
+            summary: String::new(),
+            server_data: String::new(),
+        }
+    }
+
+    #[test]
+    fn history_summarization_not_needed_below_threshold() {
+        let task = task_with_n_user_assistant_exchanges(5);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn history_summarization_needed_at_threshold() {
+        let task = task_with_n_user_assistant_exchanges(LOCAL_DIRECT_SUMMARIZATION_THRESHOLD);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_some());
+        let older_messages = result.unwrap();
+        let expected_older = MAX_LOCAL_DIRECT_HISTORY_MESSAGES
+            .min(LOCAL_DIRECT_SUMMARIZATION_THRESHOLD * 2)
+            - LOCAL_DIRECT_SUMMARIZATION_RECENT_MESSAGES;
+        assert_eq!(older_messages.len(), expected_older);
+    }
+
+    #[test]
+    fn history_summarization_extracts_only_older_messages() {
+        let task = task_with_n_user_assistant_exchanges(10);
+        let tasks = vec![task];
+        let result = history_messages_needing_summarization(&tasks);
+        assert!(result.is_some());
+        let older = result.unwrap();
+        assert_eq!(older.first().unwrap().content, "Question 0");
+    }
+
+    #[test]
+    fn append_history_with_summary_injects_summary_prefix() {
+        let task = task_with_n_user_assistant_exchanges(3);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(
+            &mut messages,
+            &tasks,
+            None,
+            Some("This is a summary of earlier conversation."),
+        );
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.as_str().contains("[Conversation summary]"));
+        assert!(messages[1]
+            .content
+            .as_str()
+            .contains("This is a summary of earlier conversation."));
+        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[2].content.as_str().contains("Understood"));
+    }
+
+    #[test]
+    fn append_history_with_summary_keeps_recent_messages() {
+        let task = task_with_n_user_assistant_exchanges(10);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(
+            &mut messages,
+            &tasks,
+            None,
+            Some("Summary of old messages."),
+        );
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user" && !m.content.as_str().contains("[Conversation summary]"))
+            .unwrap();
+        assert!(last_user.content.as_str().starts_with("Question "));
+    }
+
+    #[test]
+    fn append_history_without_summary_uses_all_messages() {
+        let task = task_with_n_user_assistant_exchanges(3);
+        let tasks = vec![task];
+        let mut messages = vec![openai_message("system", "System prompt".to_string())];
+        append_history_messages_with_summary(&mut messages, &tasks, None, None);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "Question 0");
     }
 }
