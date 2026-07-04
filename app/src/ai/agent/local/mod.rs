@@ -73,6 +73,7 @@ pub struct LocalDirectConfig {
     pub model: String,
     pub vision_supported: bool,
     pub cost_telemetry: LocalAgentCostTelemetryConfig,
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -461,7 +462,9 @@ const MAX_LOCAL_DIRECT_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOCAL_DIRECT_HISTORY_MESSAGES: usize = 20;
 const MAX_LOCAL_DIRECT_MESSAGE_CHARS: usize = 32 * 1024;
 const MAX_LOCAL_DIRECT_FILE_ATTACHMENT_BYTES: u64 = 256 * 1024;
-const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 5;
+const MAX_LOCAL_DIRECT_TOOL_ROUNDS: usize = 15;
+const MAX_LOCAL_DIRECT_RETRY_ATTEMPTS: usize = 2;
+const LOCAL_DIRECT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_LOCAL_DIRECT_SUBAGENT_ROUNDS: usize = 2;
 const MAX_LOCAL_DIRECT_SUBAGENT_DEPTH: usize = 1;
 const MAX_LOCAL_DIRECT_SUBAGENTS_PER_BATCH: usize = 1;
@@ -1235,38 +1238,57 @@ async fn request_openai_compatible_completion(
     tool_policy: LocalToolPolicy,
 ) -> anyhow::Result<LocalProviderResponse> {
     let include_usage = FeatureFlag::LocalAgentCostTelemetry.is_enabled();
-    let request = openai_chat_request_with_policy(
-        config,
-        messages.clone(),
-        mode,
-        mcp_context,
-        include_usage,
-        tool_policy,
-    );
-    match send_openai_compatible_request(config, request).await {
-        Ok(response) => Ok(LocalProviderResponse {
-            response,
-            usage_available: include_usage,
-        }),
-        Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
-            let request = openai_chat_request_with_policy(
-                config,
-                messages,
-                mode,
-                mcp_context,
-                false,
-                tool_policy,
-            );
-            let response = send_openai_compatible_request(config, request)
-                .await
-                .map_err(LocalProviderRequestError::into_anyhow)?;
-            Ok(LocalProviderResponse {
-                response,
-                usage_available: false,
-            })
+
+    for attempt in 0..=MAX_LOCAL_DIRECT_RETRY_ATTEMPTS {
+        let request = openai_chat_request_with_policy(
+            config,
+            messages.clone(),
+            mode,
+            mcp_context,
+            include_usage,
+            tool_policy,
+        );
+        match send_openai_compatible_request(config, request).await {
+            Ok(response) => {
+                return Ok(LocalProviderResponse {
+                    response,
+                    usage_available: include_usage,
+                });
+            }
+            Err(LocalProviderRequestError::UnsupportedStreamOptions) if include_usage => {
+                let request = openai_chat_request_with_policy(
+                    config,
+                    messages,
+                    mode,
+                    mcp_context,
+                    false,
+                    tool_policy,
+                );
+                let response = send_openai_compatible_request(config, request)
+                    .await
+                    .map_err(LocalProviderRequestError::into_anyhow)?;
+                return Ok(LocalProviderResponse {
+                    response,
+                    usage_available: false,
+                });
+            }
+            Err(error) if error.is_transient() && attempt < MAX_LOCAL_DIRECT_RETRY_ATTEMPTS => {
+                let delay = LOCAL_DIRECT_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt as u32);
+                log::warn!(
+                    "Local direct provider transient error (attempt {}/{}), retrying in {:?}",
+                    attempt + 1,
+                    MAX_LOCAL_DIRECT_RETRY_ATTEMPTS + 1,
+                    delay,
+                );
+                async_io::Timer::after(delay).await;
+            }
+            Err(error) => {
+                return Err(error.into_anyhow());
+            }
         }
-        Err(error) => Err(error.into_anyhow()),
     }
+
+    unreachable!()
 }
 
 struct LocalProviderResponse {
@@ -1338,10 +1360,16 @@ async fn send_openai_compatible_request(
         .json(&request)
         .send()
         .await
-        .map_err(|_| {
-            LocalProviderRequestError::Other(anyhow!(
-                "Failed to send request to local direct provider"
-            ))
+        .map_err(|e| {
+            if e.is_timeout() || e.is_connect() {
+                LocalProviderRequestError::Transient(anyhow!(
+                    "Failed to send request to local direct provider (transient): {e}"
+                ))
+            } else {
+                LocalProviderRequestError::Other(anyhow!(
+                    "Failed to send request to local direct provider"
+                ))
+            }
         })?;
 
     let status = response.status();
@@ -1355,6 +1383,11 @@ async fn send_openai_compatible_request(
                 "Local provider rejected image input with status {status}. If you want a text-only answer, remove the image and resend."
             )));
         }
+        if is_transient_http_status(status) {
+            return Err(LocalProviderRequestError::Transient(anyhow!(
+                "Local direct provider request failed with transient status {status}"
+            )));
+        }
         return Err(LocalProviderRequestError::Other(anyhow!(
             "Local direct provider request failed with status {status}"
         )));
@@ -1363,18 +1396,30 @@ async fn send_openai_compatible_request(
     Ok(response)
 }
 
+fn is_transient_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 429 | 502 | 503 | 504
+    )
+}
+
 enum LocalProviderRequestError {
     UnsupportedStreamOptions,
+    Transient(anyhow::Error),
     Other(anyhow::Error),
 }
 
 impl LocalProviderRequestError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::UnsupportedStreamOptions => {
                 anyhow!("Local provider rejected stream usage options before streaming began")
             }
-            Self::Other(error) => error,
+            Self::Transient(error) | Self::Other(error) => error,
         }
     }
 }
@@ -5737,6 +5782,17 @@ fn stream_finished_done(
     usage_telemetry: &LocalUsageTelemetry,
 ) -> api::ResponseEvent {
     let usage_summary = usage_telemetry.summary(config);
+    let context_window_usage = usage_summary
+        .as_ref()
+        .and_then(|summary| {
+            config.context_window_tokens.map(|cw| {
+                if cw == 0 {
+                    return 0.;
+                }
+                (summary.counts.prompt_tokens as f32) / (cw as f32)
+            })
+        })
+        .unwrap_or(0.);
     let (token_usage, request_cost, credits_spent, byok_token_usage) = match usage_summary.as_ref()
     {
         Some(summary) => {
@@ -5787,7 +5843,7 @@ fn stream_finished_done(
                 request_cost,
                 conversation_usage_metadata: Some(
                     api::response_event::stream_finished::ConversationUsageMetadata {
-                        context_window_usage: 0.,
+                        context_window_usage,
                         summarized: false,
                         credits_spent,
                         #[allow(deprecated)]
@@ -5842,8 +5898,11 @@ mod tests {
         MAX_LOCAL_DIRECT_SUBAGENT_DEPTH, MAX_LOCAL_DIRECT_SUBAGENT_RESULT_CHARS,
         MAX_LOCAL_DIRECT_TODO_CONTENT_CHARS, MAX_LOCAL_DIRECT_TODO_SUMMARY_CHARS,
         MAX_LOCAL_DIRECT_TOOL_FILE_BYTES, MAX_LOCAL_DIRECT_TOOL_ROUNDS,
+        MAX_LOCAL_DIRECT_RETRY_ATTEMPTS, LOCAL_DIRECT_RETRY_BASE_DELAY,
         PLAN_READY_SERVER_MESSAGE_DATA_KIND, SSH_UNSUPPORTED_FS_TOOL_ERROR,
+        is_transient_http_status, LocalProviderRequestError,
     };
+    use anyhow::anyhow;
     use crate::ai::agent::{
         api::{
             ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
@@ -6048,6 +6107,7 @@ mod tests {
             model: "test-model".to_string(),
             vision_supported: true,
             cost_telemetry: Default::default(),
+            context_window_tokens: None,
         }
     }
 
@@ -6532,6 +6592,88 @@ mod tests {
             MAX_LOCAL_DIRECT_TOOL_ROUNDS
         );
         assert_eq!(local_direct_tool_round_limit(false, false), 0);
+    }
+
+    #[test]
+    fn transient_http_status_classification() {
+        use reqwest::StatusCode;
+
+        assert!(is_transient_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_transient_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_http_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_http_status(StatusCode::GATEWAY_TIMEOUT));
+
+        assert!(!is_transient_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_http_status(StatusCode::FORBIDDEN));
+        assert!(!is_transient_http_status(StatusCode::NOT_FOUND));
+        assert!(!is_transient_http_status(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn transient_error_is_retryable() {
+        let transient = LocalProviderRequestError::Transient(anyhow!("timeout"));
+        assert!(transient.is_transient());
+
+        let permanent = LocalProviderRequestError::Other(anyhow!("bad request"));
+        assert!(!permanent.is_transient());
+
+        let unsupported = LocalProviderRequestError::UnsupportedStreamOptions;
+        assert!(!unsupported.is_transient());
+    }
+
+    #[test]
+    fn retry_constants_are_sensible() {
+        assert_eq!(MAX_LOCAL_DIRECT_RETRY_ATTEMPTS, 2);
+        assert_eq!(LOCAL_DIRECT_RETRY_BASE_DELAY, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn context_window_usage_computed_from_prompt_tokens() {
+        let config = LocalDirectConfig {
+            context_window_tokens: Some(128_000),
+            ..local_direct_config()
+        };
+        let mut telemetry = LocalUsageTelemetry::new(true);
+        telemetry.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(64_000),
+            completion_tokens: Some(1_000),
+            total_tokens: Some(65_000),
+            prompt_tokens_details: None,
+        });
+
+        let event = stream_finished_done(&config, &telemetry);
+        let finished = match event.r#type {
+            Some(api::response_event::Type::Finished(f)) => f,
+            _ => panic!("expected finished event"),
+        };
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        let usage = metadata.context_window_usage;
+        assert!((usage - 0.5).abs() < 0.01, "expected ~0.5, got {usage}");
+    }
+
+    #[test]
+    fn context_window_usage_zero_when_not_configured() {
+        let config = LocalDirectConfig {
+            context_window_tokens: None,
+            ..local_direct_config()
+        };
+        let mut telemetry = LocalUsageTelemetry::new(true);
+        telemetry.add_usage(OpenAIStreamUsage {
+            prompt_tokens: Some(64_000),
+            completion_tokens: Some(1_000),
+            total_tokens: Some(65_000),
+            prompt_tokens_details: None,
+        });
+
+        let event = stream_finished_done(&config, &telemetry);
+        let finished = match event.r#type {
+            Some(api::response_event::Type::Finished(f)) => f,
+            _ => panic!("expected finished event"),
+        };
+        let metadata = finished.conversation_usage_metadata.unwrap();
+        assert_eq!(metadata.context_window_usage, 0.);
     }
 
     #[tokio::test]

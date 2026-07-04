@@ -185,6 +185,7 @@ fn local_openai_direct_config_for_model(
             model: model.to_string(),
             vision_supported,
             cost_telemetry: Default::default(),
+            context_window_tokens: None,
         }
     })
 }
