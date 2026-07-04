@@ -53,8 +53,8 @@ use crate::{
         api::{Event, ServerConversationToken},
         task::helper::TaskExt,
         AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, AIAgentTodo, AIAgentTodoId, CallMCPToolResult, ImageContext, MCPContext,
-        RequestCommandOutputResult, UserQueryMode,
+        AIAgentInput, AIAgentTodo, AIAgentTodoId, AskUserQuestionResult, CallMCPToolResult,
+        ImageContext, MCPContext, RequestCommandOutputResult, UserQueryMode,
     },
     features::FeatureFlag,
     persistence::model::PRIMARY_AGENT_CATEGORY,
@@ -1488,7 +1488,8 @@ fn local_shell_action_result(input: &AIAgentInput) -> bool {
         AIAgentInput::ActionResult {
             result: AIAgentActionResult {
                 result: AIAgentActionResultType::RequestCommandOutput(_)
-                    | AIAgentActionResultType::CallMCPTool(_),
+                    | AIAgentActionResultType::CallMCPTool(_)
+                    | AIAgentActionResultType::AskUserQuestion(_),
                 ..
             },
             ..
@@ -1946,6 +1947,10 @@ fn openai_tool_message_from_action_result(
                 mcp_result,
             ),
         )),
+        AIAgentActionResultType::AskUserQuestion(ask_result) => Some(openai_tool_message(
+            result.id.to_string(),
+            ask_user_question_result_for_provider(ask_result),
+        )),
         _ => None,
     }
 }
@@ -1978,6 +1983,14 @@ fn openai_tool_call_from_action_result(
                 name: mcp_metadata
                     .map(|metadata| metadata.openai_name.clone())
                     .unwrap_or_else(|| "mcp__unknown__tool".to_string()),
+                arguments: json!({}).to_string(),
+            },
+        }),
+        AIAgentActionResultType::AskUserQuestion(_) => Some(OpenAIChatToolCall {
+            id: result.id.to_string(),
+            r#type: "function",
+            function: OpenAIChatToolCallFunction {
+                name: "ask_user_question".to_string(),
                 arguments: json!({}).to_string(),
             },
         }),
@@ -2019,6 +2032,27 @@ fn shell_command_result_for_provider(result: &RequestCommandOutputResult) -> Str
         RequestCommandOutputResult::Denylisted { command } => format!(
             "run_shell_command result\nStatus: permission-denied/denylisted\nCommand: {command}\nOutput:\n"
         ),
+    }
+}
+
+fn ask_user_question_result_for_provider(result: &AskUserQuestionResult) -> String {
+    match result {
+        AskUserQuestionResult::Success { answers } => {
+            let mut parts = Vec::new();
+            for answer in answers {
+                parts.push(answer.display_text());
+            }
+            format!("User answered: {}", parts.join("; "))
+        }
+        AskUserQuestionResult::Error(msg) => {
+            format!("ask_user_question error: {msg}")
+        }
+        AskUserQuestionResult::Cancelled => {
+            "User cancelled the question.".to_string()
+        }
+        AskUserQuestionResult::SkippedByAutoApprove { .. } => {
+            "Question was auto-skipped (auto-approve mode is active).".to_string()
+        }
     }
 }
 
@@ -2168,6 +2202,9 @@ fn local_tools_without_mcp() -> Vec<OpenAIChatTool> {
     }
     if FeatureFlag::LocalAgentSubagent.is_enabled() {
         tools.push(spawn_subagent_tool_definition());
+    }
+    if FeatureFlag::AskUserQuestion.is_enabled() {
+        tools.push(ask_user_question_tool_definition());
     }
     tools
 }
@@ -2429,6 +2466,36 @@ fn exit_plan_mode_tool_definition() -> OpenAIChatTool {
                 },
                 "required": ["plan"],
                 "additionalProperties": false
+            }),
+        },
+    }
+}
+
+fn ask_user_question_tool_definition() -> OpenAIChatTool {
+    OpenAIChatTool {
+        r#type: "function",
+        function: OpenAIChatToolFunction {
+            name: "ask_user_question".to_string(),
+            description: "Ask the user a structured question when you need their input to proceed. Use this when you face a decision that requires user preference or clarification. The user will see options and can pick one or provide a custom answer.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to ask the user." },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string", "description": "Short display text for this option." },
+                                "recommended": { "type": "boolean", "description": "Whether this is the recommended option." }
+                            },
+                            "required": ["label"]
+                        },
+                        "description": "Optional multiple-choice options. If omitted, the user can provide a free-text answer."
+                    },
+                    "is_multiselect": { "type": "boolean", "description": "Whether the user can select multiple options. Defaults to false." }
+                },
+                "required": ["question"]
             }),
         },
     }
@@ -2815,6 +2882,8 @@ fn execute_local_tool_with_policy_with_runtime(
             .map(|text| (text, None, Vec::new(), None, false, None)),
             Err(_) => Err(anyhow!("Local shell suggestion state is unavailable")),
         },
+        "ask_user_question" => execute_ask_user_question_tool(&tool_call.function.arguments)
+            .map(|text| (text, None, Vec::new(), None, true, None)),
         name => execute_mcp_tool_request(name, &tool_call.function.arguments, mcp_tool_catalog)
             .map(|result| {
                 (
@@ -4008,6 +4077,16 @@ fn execute_suggest_shell_command_tool(
     Ok(format!(
         "Shell command suggestion was delivered to the user. The command was NOT executed.\nStop calling tools now. Reply with a short, natural-language final answer summarizing what you suggested and why; ask the user to run it and share the output if you need it to continue.\n\nCommand:\n```bash\n{command}\n```\nRationale: {rationale}\nRead-only: {is_read_only}\nRisky: {is_risky}\nExpected output: {expected_output}"
     ))
+}
+
+fn execute_ask_user_question_tool(arguments: &str) -> anyhow::Result<String> {
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|_| anyhow!("Invalid ask_user_question arguments"))?;
+    let question = required_string_arg(&args, "question")?.trim();
+    if question.is_empty() {
+        return Err(anyhow!("question cannot be empty"));
+    }
+    Ok("Question delivered to the user. Waiting for their response.".to_string())
 }
 
 fn execute_read_file_tool(arguments: &str, cwd: Option<&Path>) -> anyhow::Result<String> {
@@ -5901,6 +5980,8 @@ mod tests {
         MAX_LOCAL_DIRECT_RETRY_ATTEMPTS, LOCAL_DIRECT_RETRY_BASE_DELAY,
         PLAN_READY_SERVER_MESSAGE_DATA_KIND, SSH_UNSUPPORTED_FS_TOOL_ERROR,
         is_transient_http_status, LocalProviderRequestError,
+        ask_user_question_result_for_provider, execute_ask_user_question_tool,
+        local_tools_without_mcp,
     };
     use anyhow::anyhow;
     use crate::ai::agent::{
@@ -5913,7 +5994,8 @@ mod tests {
             tool_card::{structured_tool_card_events, test_tool_card_events},
         },
         AIAgentActionId, AIAgentActionResultType, AIAgentContext, AIAgentInput,
-        AIAgentOutputMessageType, CallMCPToolResult, InvokeSkillUserQuery, MCPContext, MCPServer,
+        AIAgentOutputMessageType, AskUserQuestionAnswerItem, AskUserQuestionResult,
+        CallMCPToolResult, InvokeSkillUserQuery, MCPContext, MCPServer,
         RequestCommandOutputResult, UserQueryMode,
     };
     use crate::features::FeatureFlag;
@@ -6674,6 +6756,64 @@ mod tests {
         };
         let metadata = finished.conversation_usage_metadata.unwrap();
         assert_eq!(metadata.context_window_usage, 0.);
+    }
+
+    #[test]
+    fn ask_user_question_tool_included_when_flag_enabled() {
+        let _flag = FeatureFlag::AskUserQuestion.override_enabled(true);
+        let tools = local_tools_without_mcp();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.function.name == "ask_user_question"),
+            "ask_user_question should be present when flag enabled"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_tool_excluded_when_flag_disabled() {
+        let _flag = FeatureFlag::AskUserQuestion.override_enabled(false);
+        let tools = local_tools_without_mcp();
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.function.name == "ask_user_question"),
+            "ask_user_question should not be present when flag disabled"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_execution_returns_pending() {
+        let args = json!({ "question": "Which approach?" }).to_string();
+        let result = execute_ask_user_question_tool(&args).unwrap();
+        assert!(result.contains("Waiting for their response"));
+    }
+
+    #[test]
+    fn ask_user_question_execution_rejects_empty_question() {
+        let args = json!({ "question": "" }).to_string();
+        assert!(execute_ask_user_question_tool(&args).is_err());
+    }
+
+    #[test]
+    fn ask_user_question_result_formats_success() {
+        use crate::ai::agent::AskUserQuestionAnswerItem;
+        let result = AskUserQuestionResult::Success {
+            answers: vec![AskUserQuestionAnswerItem::Answered {
+                question_id: "q1".to_string(),
+                selected_options: vec!["Option A".to_string()],
+                other_text: String::new(),
+            }],
+        };
+        let text = ask_user_question_result_for_provider(&result);
+        assert!(text.contains("Option A"));
+    }
+
+    #[test]
+    fn ask_user_question_result_formats_cancelled() {
+        let result = AskUserQuestionResult::Cancelled;
+        let text = ask_user_question_result_for_provider(&result);
+        assert!(text.contains("cancelled"));
     }
 
     #[tokio::test]
